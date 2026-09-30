@@ -268,6 +268,16 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     }
   };
 
+  const resolveAuthorizedPackageRoot = async (requestedPath: string, authorizedRoots: string[]): Promise<string | undefined> => {
+    const packageRoot = await canonicalDirectory(requestedPath);
+    if (!packageRoot) return undefined;
+    if (!authorizedRoots.some((allowedRoot) => isWithin(allowedRoot, packageRoot))) {
+      addWarning(warnings, "resource-outside-root", requestedPath, "A declared Pi package resolves outside the authorized home or project tree.");
+      return undefined;
+    }
+    return packageRoot;
+  };
+
   const packageRootFor = async (selection: PackageSelection, settingsDir: string, allowedRoots: string[], packageAgentDir: string): Promise<string | undefined> => {
     let selected = selection.source;
     if (selected.startsWith("npm:")) {
@@ -276,14 +286,14 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
         ? `${specifier.split("/")[0]}/${specifier.split("/")[1]?.split("@")[0] ?? ""}`
         : specifier.split("@")[0];
       if (!packageName) return undefined;
-      return await canonicalDirectory(path.join(packageAgentDir, "npm", "node_modules", ...packageName.split("/")));
+      return await resolveAuthorizedPackageRoot(path.join(packageAgentDir, "npm", "node_modules", ...packageName.split("/")), allowedRoots);
     }
     if (selected.startsWith("git:")) {
       selected = selected.slice(4).replace(/^https?:\/\//, "");
       selected = selected.replace(/\.git$/, "");
       const at = selected.lastIndexOf("@");
       if (at > selected.lastIndexOf("/")) selected = selected.slice(0, at);
-      return await canonicalDirectory(path.join(packageAgentDir, "git", ...selected.split("/")));
+      return await resolveAuthorizedPackageRoot(path.join(packageAgentDir, "git", ...selected.split("/")), allowedRoots);
     }
     if (selected.startsWith("file:")) selected = selected.slice(5);
     const resolved = path.resolve(settingsDir, selected);
@@ -291,14 +301,24 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
       addWarning(warnings, "resource-outside-root", resolved, "A declared local package is outside the authorized home or project tree.");
       return undefined;
     }
-    return await canonicalDirectory(resolved);
+    return await resolveAuthorizedPackageRoot(resolved, allowedRoots);
   };
 
-  const manifestResources = async (packageRoot: string, selection: PackageSelection, scope: ResourceScope, source: string): Promise<void> => {
-    const manifestPath = path.join(packageRoot, "package.json");
+  const manifestResources = async (packageRoot: string, selection: PackageSelection, scope: ResourceScope, source: string, authorizedRoots: string[]): Promise<void> => {
+    const canonicalPackageRoot = await canonicalDirectory(packageRoot);
+    if (!canonicalPackageRoot || !authorizedRoots.some((allowedRoot) => isWithin(allowedRoot, canonicalPackageRoot))) {
+      addWarning(warnings, "resource-outside-root", packageRoot, "The declared Pi package is outside the authorized home or project tree.");
+      return;
+    }
+    const manifestPath = path.join(canonicalPackageRoot, "package.json");
+    const canonicalManifest = await realpath(manifestPath).catch(() => undefined);
+    if (!canonicalManifest || !authorizedRoots.some((allowedRoot) => isWithin(allowedRoot, canonicalManifest))) {
+      addWarning(warnings, "resource-outside-root", manifestPath, "The declared package manifest resolves outside the authorized home or project tree.");
+      return;
+    }
     let manifest: Record<string, unknown> | undefined;
     try {
-      manifest = record(parseJson(await readFile(manifestPath, "utf8")));
+      manifest = record(parseJson(await readFile(canonicalManifest, "utf8")));
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       addWarning(warnings, code === "ENOENT" ? "missing-package-manifest" : "invalid-package-manifest", manifestPath, "The declared package manifest could not be read.");
@@ -318,14 +338,14 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     const skills = packagePaths(declaredSkills, selection.skills);
     const agents = packagePaths(declaredAgents, selection.agents);
     for (const entry of skills) {
-      await scanConfiguredResource(packageRoot, [packageRoot], entry, scope, "skill", source);
+      await scanConfiguredResource(canonicalPackageRoot, [canonicalPackageRoot], entry, scope, "skill", source);
     }
     for (const entry of agents) {
-      await scanConfiguredResource(packageRoot, [packageRoot], entry, scope, "subagent", source);
+      await scanConfiguredResource(canonicalPackageRoot, [canonicalPackageRoot], entry, scope, "subagent", source);
     }
   };
 
-  const scanPackageSelections = async (value: unknown, settingsPath: string, allowedRoots: string[], packageAgentDir: string, scope: ResourceScope): Promise<void> => {
+  const scanPackageSelections = async (value: unknown, settingsPath: string, allowedRoots: string[], packageAgentDir: string): Promise<void> => {
     for (const selection of packageSelections(value)) {
       const root = await packageRootFor(selection, path.dirname(settingsPath), allowedRoots, packageAgentDir);
       if (!root) {
@@ -333,7 +353,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
         continue;
       }
       const source = `package:${selection.source}`;
-      await manifestResources(root, selection, scope === "project" ? "package" : "package", source);
+      await manifestResources(root, selection, "package", source, allowedRoots);
     }
   };
 
@@ -386,14 +406,24 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     }
     const packageManifest = path.join(project, "package.json");
     if (await lstat(packageManifest).then((stat) => stat.isFile()).catch(() => false)) {
-      await manifestResources(project, { source: path.basename(project) }, "project", `package:${path.basename(project)}`);
+      await manifestResources(project, { source: path.basename(project) }, "project", `package:${path.basename(project)}`, [project]);
     }
   }
 
   const scanSettings = async (settingsPath: string, scope: ResourceScope, authorized: string[], packageAgentDir: string): Promise<void> => {
+    const settingsStat = await lstat(settingsPath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") addWarning(warnings, error.code === "EACCES" ? "permission-denied" : "settings-unavailable", settingsPath, "Unable to access Pi settings.");
+      return undefined;
+    });
+    if (!settingsStat) return;
+    const canonicalSettingsPath = await realpath(settingsPath).catch(() => undefined);
+    if (!canonicalSettingsPath || !authorized.some((allowedRoot) => isWithin(allowedRoot, canonicalSettingsPath))) {
+      addWarning(warnings, "resource-outside-root", settingsPath, "Settings resolve outside the authorized home or project tree and were not read.");
+      return;
+    }
     let settings: Record<string, unknown>;
     try {
-      const parsed = parseJson(await readFile(settingsPath, "utf8"));
+      const parsed = parseJson(await readFile(canonicalSettingsPath, "utf8"));
       if (!parsed) {
         addWarning(warnings, "invalid-settings", settingsPath, "Settings are not valid readable JSON; configured resources were not expanded.");
         return;
@@ -401,14 +431,14 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
       settings = parsed;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT") addWarning(warnings, "invalid-settings", settingsPath, "Settings are not valid readable JSON; configured resources were not expanded.");
+      if (code !== "ENOENT") addWarning(warnings, code === "EACCES" ? "permission-denied" : "invalid-settings", settingsPath, "Settings are not valid readable JSON; configured resources were not expanded.");
       return;
     }
     const settingDir = path.dirname(settingsPath);
     for (const entry of strings(settings.skills)) await scanConfiguredResource(settingDir, authorized, entry, scope, "skill", "settings-resource");
     const subagents = record(settings.subagents);
     for (const entry of strings(subagents?.agentScanDirs)) await scanConfiguredResource(settingDir, authorized, entry, scope, "subagent", "settings-agent-scan-root");
-    await scanPackageSelections(settings.packages, settingsPath, authorized, packageAgentDir, scope);
+    await scanPackageSelections(settings.packages, settingsPath, authorized, packageAgentDir);
   };
 
   const homeProjects = new Set<string>();
@@ -489,7 +519,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
       await scanSettings(path.join(projectRoot, ".pi", "settings.json"), "project", [projectRoot], agent ?? projectRoot);
       const manifestPath = path.join(projectRoot, "package.json");
       if (await lstat(manifestPath).then((stat) => stat.isFile()).catch(() => false)) {
-        await manifestResources(projectRoot, { source: path.basename(projectRoot) }, "project", `package:${path.basename(projectRoot)}`);
+        await manifestResources(projectRoot, { source: path.basename(projectRoot) }, "project", `package:${path.basename(projectRoot)}`, [projectRoot]);
       }
     }
   }

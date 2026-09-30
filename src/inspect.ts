@@ -2,7 +2,7 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { InspectionResult, InspectionWarning, ResourceCandidate } from "./types.ts";
 
-const excludedNames = new Set([".git", "node_modules", "cache", "caches", "history", "sessions"]);
+const excludedNames = new Set([".git", ".cache", ".npm", "node_modules", "cache", "caches", "history", "sessions"]);
 const maxInspectionBytes = 1_000_000;
 
 function isWithin(root: string, target: string): boolean {

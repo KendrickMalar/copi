@@ -29,6 +29,10 @@ test("stores an owner-only, byte-for-byte skill bundle snapshot and preserves sh
   await mkdir(path.join(sourcePath, "references"), { recursive: true });
   await writeFile(path.join(sourcePath, "SKILL.md"), "Read references/guide.md and run scripts/tool.sh");
   await writeFile(path.join(sourcePath, "references", "guide.md"), "reference payload");
+  await mkdir(path.join(sourcePath, ".cache"), { recursive: true });
+  await mkdir(path.join(sourcePath, ".npm"), { recursive: true });
+  await writeFile(path.join(sourcePath, ".cache", "private.txt"), "cached content");
+  await writeFile(path.join(sourcePath, ".npm", "private.txt"), "package cache content");
   const binary = Buffer.from([0, 1, 2, 127, 128, 255]);
   await writeFile(path.join(sourcePath, "assets.bin"), binary);
   await writeFile(path.join(sourcePath, "scripts", "tool.sh"), "#!/bin/sh\nprintf bundled\n");
@@ -49,6 +53,10 @@ test("stores an owner-only, byte-for-byte skill bundle snapshot and preserves sh
   assert.ok(saved);
   assert.equal(saved.destination.kind, "project");
   assert.ok(saved.files.some((file) => file.path === "scripts/tool.sh" && file.mode === 0o755));
+  for (const relative of [".cache/private.txt", ".npm/private.txt"]) {
+    assert.ok(!saved.files.some((file) => file.path === relative));
+    await assert.rejects(lstat(path.join(libraryDir, "items", saved.id, "files", ...relative.split("/"))), { code: "ENOENT" });
+  }
   assert.deepEqual(await readFile(path.join(sourcePath, "SKILL.md")), originalText);
   assert.equal((await lstat(path.join(sourcePath, "scripts", "tool.sh"))).mode & 0o777, originalMode);
 
