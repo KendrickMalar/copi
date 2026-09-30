@@ -3,3 +3,4 @@ dist/
 .worktrees/
 *.tgz
 .DS_Store
+.pi/subagents/
