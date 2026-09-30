@@ -347,13 +347,16 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
 
   const scanPackageSelections = async (value: unknown, settingsPath: string, allowedRoots: string[], packageAgentDir: string): Promise<void> => {
     for (const selection of packageSelections(value)) {
-      const root = await packageRootFor(selection, path.dirname(settingsPath), allowedRoots, packageAgentDir);
+      const packageAuthorizedRoots = selection.source.startsWith("npm:") || selection.source.startsWith("git:")
+        ? [...new Set([...allowedRoots, packageAgentDir])]
+        : allowedRoots;
+      const root = await packageRootFor(selection, path.dirname(settingsPath), packageAuthorizedRoots, packageAgentDir);
       if (!root) {
         addWarning(warnings, "package-unavailable", selection.source, "The declared Pi package is unavailable in the explicitly selected search roots.");
         continue;
       }
       const source = `package:${selection.source}`;
-      await manifestResources(root, selection, "package", source, allowedRoots);
+      await manifestResources(root, selection, "package", source, packageAuthorizedRoots);
     }
   };
 

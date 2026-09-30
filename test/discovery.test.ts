@@ -239,3 +239,26 @@ test("does not read or expand settings symlinks that resolve outside their autho
   assert.ok(!names.has("via-project-settings"));
   assert.ok(result.warnings.filter((warning) => warning.code === "resource-outside-root").length >= 2);
 });
+
+test("discovers npm and git packages declared by project settings from the explicitly selected Pi agent directory", async (t) => {
+  const homeDir = await mkdtemp(path.join(os.tmpdir(), "copi-project-package-cache-"));
+  t.after(() => rm(homeDir, { recursive: true, force: true }));
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(homeDir, "project");
+  await mkdir(agentDir, { recursive: true });
+  await mkdir(path.join(projectDir, ".pi"), { recursive: true });
+
+  const manifest = (name: string): string => JSON.stringify({ name, pi: { skills: ["skills"] } });
+  await put(agentDir, "npm/node_modules/@sample/pkg/package.json", manifest("npm-cache-package"));
+  await put(agentDir, "npm/node_modules/@sample/pkg/skills/from-npm-cache/SKILL.md", "selected managed npm package");
+  await put(agentDir, "git/github.com/sample/pkg/package.json", manifest("git-cache-package"));
+  await put(agentDir, "git/github.com/sample/pkg/skills/from-git-cache/SKILL.md", "selected managed git package");
+  await put(projectDir, ".pi/settings.json", JSON.stringify({
+    packages: ["npm:@sample/pkg@1.0.0", "git:github.com/sample/pkg"],
+  }));
+
+  const result = await discoverResources({ homeDir, agentDir, projectDir });
+  const names = new Set(result.candidates.map((candidate) => candidate.name));
+  assert.ok(names.has("from-npm-cache"));
+  assert.ok(names.has("from-git-cache"));
+});
