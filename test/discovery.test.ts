@@ -163,3 +163,79 @@ test("searches the approved synthetic home for other Pi projects and profiles wh
   assert.deepEqual(system?.destination, { kind: "project", path: ".pi/SYSTEM.md" });
   assert.deepEqual(appended?.destination, { kind: "project", path: ".pi/APPEND_SYSTEM.md" });
 });
+
+test("rejects package and package-manifest symlinks that resolve outside authorized roots while retaining in-root links", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-package-links-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(homeDir, "project");
+  const outside = path.join(root, "outside");
+  await Promise.all([mkdir(agentDir, { recursive: true }), mkdir(projectDir, { recursive: true }), mkdir(outside)]);
+
+  const manifest = (name: string): string => JSON.stringify({ name, pi: { skills: ["skills"] } });
+  await put(outside, "local/package.json", manifest("outside-local"));
+  await put(outside, "local/skills/outside-local-skill/SKILL.md", "outside local");
+  await put(outside, "npm/package.json", manifest("outside-npm"));
+  await put(outside, "npm/skills/outside-npm-skill/SKILL.md", "outside npm");
+  await put(outside, "git/package.json", manifest("outside-git"));
+  await put(outside, "git/skills/outside-git-skill/SKILL.md", "outside git");
+  await put(outside, "linked-manifest.json", manifest("outside-manifest"));
+
+  await put(agentDir, "inside-target/package.json", manifest("inside-target"));
+  await put(agentDir, "inside-target/skills/inside-link-skill/SKILL.md", "in-root linked package");
+  await mkdir(path.join(agentDir, "npm", "node_modules", "@sample"), { recursive: true });
+  await mkdir(path.join(agentDir, "git", "github.com", "sample"), { recursive: true });
+  await symlink(path.join(outside, "local"), path.join(agentDir, "linked-local"), "dir");
+  await symlink(path.join(outside, "npm"), path.join(agentDir, "npm", "node_modules", "@sample", "pkg"), "dir");
+  await symlink(path.join(outside, "git"), path.join(agentDir, "git", "github.com", "sample", "pkg"), "dir");
+  await symlink(path.join(agentDir, "inside-target"), path.join(agentDir, "linked-inside"), "dir");
+  await mkdir(path.join(agentDir, "manifest-link", "skills", "manifest-link-skill"), { recursive: true });
+  await writeFile(path.join(agentDir, "manifest-link", "skills", "manifest-link-skill", "SKILL.md"), "internal file declared only by external manifest");
+  await symlink(path.join(outside, "linked-manifest.json"), path.join(agentDir, "manifest-link", "package.json"));
+  await put(agentDir, "git/github.com/sample/inside/package.json", manifest("inside-git"));
+  await put(agentDir, "git/github.com/sample/inside/skills/inside-git-skill/SKILL.md", "in-root git package");
+  await put(agentDir, "settings.json", JSON.stringify({
+    packages: [
+      "./linked-local",
+      "npm:@sample/pkg@1.0.0",
+      "git:github.com/sample/pkg",
+      "./linked-inside",
+      "./manifest-link",
+      "git:github.com/sample/inside",
+    ],
+  }));
+
+  const result = await discoverResources({ homeDir, agentDir, projectDir });
+  const names = new Set(result.candidates.map((candidate) => candidate.name));
+  assert.ok(!names.has("outside-local-skill"));
+  assert.ok(!names.has("outside-npm-skill"));
+  assert.ok(!names.has("outside-git-skill"));
+  assert.ok(!names.has("manifest-link-skill"));
+  assert.ok(names.has("inside-link-skill"));
+  assert.ok(names.has("inside-git-skill"));
+  assert.ok(result.warnings.some((warning) => warning.code === "resource-outside-root" || warning.code === "package-unavailable"));
+});
+
+test("does not read or expand settings symlinks that resolve outside their authorized roots", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-settings-links-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(homeDir, "project");
+  const outside = path.join(root, "outside");
+  await Promise.all([mkdir(agentDir, { recursive: true }), mkdir(path.join(projectDir, ".pi"), { recursive: true }), mkdir(outside)]);
+
+  await put(agentDir, "custom/via-user-settings/SKILL.md", "must not discover through external settings");
+  await put(projectDir, "project-custom/via-project-settings/SKILL.md", "must not discover through external settings");
+  await writeFile(path.join(outside, "user-settings.json"), JSON.stringify({ skills: ["./custom"] }));
+  await writeFile(path.join(outside, "project-settings.json"), JSON.stringify({ skills: ["../project-custom"] }));
+  await symlink(path.join(outside, "user-settings.json"), path.join(agentDir, "settings.json"));
+  await symlink(path.join(outside, "project-settings.json"), path.join(projectDir, ".pi", "settings.json"));
+
+  const result = await discoverResources({ homeDir, agentDir, projectDir });
+  const names = new Set(result.candidates.map((candidate) => candidate.name));
+  assert.ok(!names.has("via-user-settings"));
+  assert.ok(!names.has("via-project-settings"));
+  assert.ok(result.warnings.filter((warning) => warning.code === "resource-outside-root").length >= 2);
+});
