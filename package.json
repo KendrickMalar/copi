@@ -1,0 +1,34 @@
+{
+  "name": "@papillon6814/copi",
+  "version": "0.1.0",
+  "description": "Collect and organize reusable Pi coding-agent resources",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "copi": "dist/src/cli.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "os": [
+    "darwin"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check": "npm run build && npm test && npm pack --dry-run"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.8.1",
+    "diff": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "typescript": "^5.9.2"
+  }
+}
