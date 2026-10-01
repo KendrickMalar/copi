@@ -265,3 +265,51 @@ test("discovers npm and git packages declared by project settings from the expli
   assert.ok(names.has("from-npm-cache"));
   assert.ok(names.has("from-git-cache"));
 });
+
+test("honors home-only, project-only, both, and none discovery scopes", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-discovery-scopes-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(root, "project");
+  await mkdir(agentDir, { recursive: true });
+  await mkdir(path.join(projectDir, ".pi"), { recursive: true });
+
+  await put(agentDir, "skills/home-profile-skill/SKILL.md", "home profile");
+  await put(homeDir, "Code/other/.pi/skills/other-home-project-skill/SKILL.md", "other home project");
+  await put(projectDir, ".pi/skills/current-project-skill/SKILL.md", "current project");
+  await put(projectDir, ".pi/settings.json", JSON.stringify({}));
+  await put(projectDir, "settings.json", JSON.stringify({ skills: ["./legacy-user-skills"] }));
+  await put(projectDir, "legacy-user-skills/leaked-as-user/SKILL.md", "must not treat project root settings as user settings");
+
+  const homeOnly = await discoverResources({ homeDir, agentDir, projectDir, scopes: { home: true, project: false } });
+  const homeNames = new Set(homeOnly.candidates.map((candidate) => candidate.name));
+  assert.ok(homeNames.has("home-profile-skill"));
+  assert.ok(homeNames.has("other-home-project-skill"));
+  assert.ok(!homeNames.has("current-project-skill"));
+
+  const projectOnly = await discoverResources({ homeDir, agentDir, projectDir, scopes: { home: false, project: true } });
+  const projectNames = new Set(projectOnly.candidates.map((candidate) => candidate.name));
+  assert.ok(projectNames.has("current-project-skill"));
+  assert.ok(!projectNames.has("home-profile-skill"));
+  assert.ok(!projectNames.has("other-home-project-skill"));
+
+  const both = await discoverResources({ homeDir, agentDir, projectDir, scopes: { home: true, project: true } });
+  const bothNames = new Set(both.candidates.map((candidate) => candidate.name));
+  assert.ok(bothNames.has("home-profile-skill"));
+  assert.ok(bothNames.has("other-home-project-skill"));
+  assert.ok(bothNames.has("current-project-skill"));
+
+  const none = await discoverResources({
+    homeDir: path.join(root, "missing-home"),
+    agentDir: path.join(root, "missing-agent"),
+    projectDir: path.join(root, "missing-project"),
+    scopes: { home: false, project: false },
+  });
+  assert.deepEqual(none, { candidates: [], warnings: [], excludedPaths: [] });
+
+  const projectOnlyAliases = await discoverResources({ homeDir: projectDir, agentDir: projectDir, projectDir });
+  const aliasNames = new Set(projectOnlyAliases.candidates.map((candidate) => candidate.name));
+  assert.ok(aliasNames.has("current-project-skill"));
+  assert.ok(!aliasNames.has("leaked-as-user"));
+});

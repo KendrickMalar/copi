@@ -3,10 +3,25 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { DiscoveryResult, DiscoveryWarning, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope } from "./types.ts";
 
+export interface DiscoveryScopes {
+  home: boolean;
+  project: boolean;
+}
+
 export interface DiscoveryOptions {
   homeDir: string;
   agentDir: string;
   projectDir: string;
+  scopes?: DiscoveryScopes;
+}
+
+function inferSearchScopes(options: DiscoveryOptions): DiscoveryScopes {
+  const homeDir = path.resolve(options.homeDir);
+  const agentDir = path.resolve(options.agentDir);
+  const projectDir = path.resolve(options.projectDir);
+  if (homeDir === projectDir && agentDir === projectDir) return { home: false, project: true };
+  if (homeDir === projectDir) return { home: true, project: false };
+  return { home: true, project: true };
 }
 
 interface SearchRoot {
@@ -131,16 +146,19 @@ async function canonicalDirectory(directory: string): Promise<string | undefined
 }
 
 export async function discoverResources(options: DiscoveryOptions): Promise<DiscoveryResult> {
+  const scopes = options.scopes ?? inferSearchScopes(options);
+  if (!scopes.home && !scopes.project) return { candidates: [], warnings: [], excludedPaths: [] };
   const warnings: DiscoveryWarning[] = [];
   const excludedPaths = new Set<string>();
   const candidates: ResourceCandidate[] = [];
   const candidateKeys = new Set<string>();
-  const home = await canonicalDirectory(options.homeDir);
-  const agent = await canonicalDirectory(options.agentDir);
-  const project = await canonicalDirectory(options.projectDir);
-  if (!home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
-  if (!agent) addWarning(warnings, "unavailable-root", options.agentDir, "The explicitly selected Pi agent directory is unavailable.");
-  if (!project) addWarning(warnings, "unavailable-root", options.projectDir, "The explicitly selected project directory is unavailable.");
+  const home = scopes.home ? await canonicalDirectory(options.homeDir) : undefined;
+  const agent = scopes.home ? await canonicalDirectory(options.agentDir) : undefined;
+  const project = scopes.project ? await canonicalDirectory(options.projectDir) : undefined;
+  const packageAgentDir = agent ?? (scopes.project ? await canonicalDirectory(options.agentDir) : undefined);
+  if (scopes.home && !home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
+  if (scopes.home && !agent) addWarning(warnings, "unavailable-root", options.agentDir, "The explicitly selected Pi agent directory is unavailable.");
+  if (scopes.project && !project) addWarning(warnings, "unavailable-root", options.projectDir, "The explicitly selected project directory is unavailable.");
 
   const roots: SearchRoot[] = [];
   if (home) roots.push({ path: home, scope: "shared", source: "shared-agent-skills", destinationRoot: ".pi/skills", destinationKind: "project" });
@@ -530,7 +548,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
       await scanSettings(path.join(profileRoot, "settings.json"), "user", [profileRoot, home], profileRoot);
     }
     for (const projectRoot of homeProjects) {
-      await scanSettings(path.join(projectRoot, ".pi", "settings.json"), "project", [projectRoot], agent ?? projectRoot);
+      await scanSettings(path.join(projectRoot, ".pi", "settings.json"), "project", [projectRoot], packageAgentDir ?? projectRoot);
       const manifestPath = path.join(projectRoot, "package.json");
       if (await lstat(manifestPath).then((stat) => stat.isFile()).catch(() => false)) {
         await manifestResources(projectRoot, { source: path.basename(projectRoot) }, "project", `package:${path.basename(projectRoot)}`, [projectRoot]);
@@ -542,7 +560,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     await scanSettings(path.join(agent, "settings.json"), "user", [agent, ...(home ? [home] : [])], agent);
   }
   if (project) {
-    await scanSettings(path.join(project, ".pi", "settings.json"), "project", [project], agent ?? project);
+    await scanSettings(path.join(project, ".pi", "settings.json"), "project", [project], packageAgentDir ?? project);
   }
 
   candidates.sort((left, right) => left.name.localeCompare(right.name) || left.sourcePath.localeCompare(right.sourcePath));
