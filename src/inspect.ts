@@ -1,21 +1,9 @@
-import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
+import { prepareResource, readPreparedResource, type PreparedResource, type PreparedInspection } from "./catalog.ts";
 import type { InspectionResult, InspectionWarning, ResourceCandidate } from "./types.ts";
 
-const excludedNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions"]);
 const maxInspectionBytes = 1_000_000;
-
-function isWithin(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
-}
-
-function isExcluded(relative: string): boolean {
-  return relative.split(path.sep).some((part) => {
-    const lower = part.toLowerCase();
-    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.");
-  });
-}
+const relativePathReference = /(?:^|[\s"'`])(?:\.{1,2}\/)?[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+(?:$|[\s"'`),;!?])/m;
 
 function addWarning(warnings: InspectionWarning[], code: string, message: string, relativePath?: string): void {
   const warning = relativePath === undefined ? { code, message } : { code, message, path: relativePath };
@@ -29,114 +17,65 @@ function containsInlineSecret(text: string): boolean {
   return namedValue.test(text) || recognizableToken.test(text) || bearer.test(text);
 }
 
-async function inspectFiles(candidate: ResourceCandidate): Promise<{ files: Array<{ relative: string; text?: string }>; excluded: string[]; warnings: InspectionWarning[] }> {
-  const files: Array<{ relative: string; text?: string }> = [];
-  const excluded: string[] = [];
+export async function inspectPreparedResource(prepared: PreparedResource): Promise<PreparedInspection> {
+  const { candidate, files, excludedPaths } = readPreparedResource(prepared);
   const warnings: InspectionWarning[] = [];
-  const rootInput = path.resolve(candidate.sourceRoot);
-  const sourceInput = path.resolve(candidate.sourcePath);
-  if (!isWithin(rootInput, sourceInput)) {
-    addWarning(warnings, "resource-outside-root", "The resource is outside its declared search root.");
-    return { files, excluded, warnings };
+  const sensitivePaths: string[] = [];
+  addWarning(warnings, "secret-detection-limited", "Secret detection is heuristic and cannot guarantee completeness.");
+  for (const relativePath of excludedPaths) {
+    if (relativePath.split("/").some((part) => part.toLowerCase() === "auth")) {
+      addWarning(warnings, "auth-directory-excluded", "An auth path was excluded; copied resources may be missing authentication-specific code.", relativePath);
+    }
   }
-  const canonicalRoot = await realpath(rootInput).catch(() => undefined);
-  const canonicalSource = await realpath(sourceInput).catch(() => undefined);
-  if (!canonicalRoot || !canonicalSource || !isWithin(canonicalRoot, canonicalSource)) {
-    addWarning(warnings, "resource-outside-root", "The resource could not be resolved inside its declared search root.");
-    return { files, excluded, warnings };
-  }
-  const sourceStat = await lstat(sourceInput).catch(() => undefined);
-  if (!sourceStat || sourceStat.isSymbolicLink()) {
-    addWarning(warnings, "symlink-skipped", "The resource is unavailable or is a symbolic link.");
-    return { files, excluded, warnings };
-  }
-  const sourceIsDirectory = sourceStat.isDirectory();
-  const visit = async (target: string): Promise<void> => {
-    const relativeToSource = sourceIsDirectory ? path.relative(sourceInput, target) : path.basename(target);
-    if (isExcluded(relativeToSource)) {
-      excluded.push(relativeToSource);
-      if (relativeToSource.split(path.sep).some((part) => part.toLowerCase() === "auth")) {
-        addWarning(warnings, "auth-directory-excluded", "An auth path was excluded; copied resources may be missing authentication-specific code.", relativeToSource);
-      }
-      return;
+  for (const file of files) {
+    if (file.bytes.length > maxInspectionBytes) {
+      addWarning(warnings, "large-file-skipped", "Content inspection is limited to files no larger than 1 MB.", file.path);
+      continue;
     }
-    const stat = await lstat(target).catch((error: NodeJS.ErrnoException) => {
-      addWarning(warnings, error.code === "EACCES" ? "permission-denied" : "read-error", error.code === "EACCES" ? "Permission denied while inspecting this resource." : "Unable to inspect this resource.", relativeToSource);
-      return undefined;
-    });
-    if (!stat) return;
-    if (stat.isSymbolicLink()) {
-      addWarning(warnings, "symlink-skipped", "Symbolic links are not followed while inspecting resources.", relativeToSource);
-      return;
-    }
-    if (stat.isDirectory()) {
-      let entries;
-      try {
-        entries = await readdir(target, { withFileTypes: true });
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        addWarning(warnings, code === "EACCES" ? "permission-denied" : "read-error", code === "EACCES" ? "Permission denied while inspecting this resource." : "Unable to inspect this directory.", relativeToSource);
-        return;
-      }
-      for (const entry of entries) await visit(path.join(target, entry.name));
-      return;
-    }
-    if (!stat.isFile()) return;
-    if (stat.size > maxInspectionBytes) {
-      addWarning(warnings, "large-file-skipped", "Content inspection is limited to files no larger than 1 MB.", relativeToSource);
-      files.push({ relative: relativeToSource });
-      return;
-    }
-    let bytes: Buffer;
-    try {
-      bytes = await readFile(target);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      addWarning(warnings, code === "EACCES" ? "permission-denied" : "read-error", code === "EACCES" ? "Permission denied while inspecting this file." : "Unable to read this file.", relativeToSource);
-      return;
-    }
-    if (bytes.includes(0)) {
-      files.push({ relative: relativeToSource });
-      return;
-    }
+    if (file.bytes.includes(0)) continue;
     let text: string;
     try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      text = new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
     } catch {
-      files.push({ relative: relativeToSource });
-      return;
+      continue;
     }
-    files.push({ relative: relativeToSource, text });
-  };
-  await visit(sourceInput);
-  return { files, excluded, warnings };
-}
-
-export async function inspectResource(candidate: ResourceCandidate): Promise<InspectionResult> {
-  const scanned = await inspectFiles(candidate);
-  const warnings = [...scanned.warnings];
-  addWarning(warnings, "secret-detection-limited", "Secret detection is heuristic and cannot guarantee completeness.");
-  const sensitivePaths: string[] = [];
-  for (const file of scanned.files) {
-    if (file.text === undefined) continue;
-    if (containsInlineSecret(file.text)) {
-      sensitivePaths.push(file.relative);
-      addWarning(warnings, "sensitive-content", "This file may contain a secret; detection is heuristic and cannot guarantee completeness.", file.relative);
+    if (containsInlineSecret(text)) {
+      sensitivePaths.push(file.path);
+      addWarning(warnings, "sensitive-content", "This file may contain a secret; detection is heuristic and cannot guarantee completeness.", file.path);
     }
-    if (/\$\{?[A-Z_][A-Z0-9_]*\}?/.test(file.text)) addWarning(warnings, "environment-reference", "This resource refers to environment variables that may need to be configured separately.", file.relative);
-    if (/(?:\/Users\/|\/home\/|[A-Za-z]:\\\\|~\/)[^\s"']+/.test(file.text)) addWarning(warnings, "absolute-path", "This resource contains a path that may not exist in another project.", file.relative);
-    if (path.basename(file.relative) === "package.json") {
+    if (/\$\{?[A-Z_][A-Z0-9_]*\}?/.test(text)) addWarning(warnings, "environment-reference", "This resource refers to environment variables that may need to be configured separately.", file.path);
+    if (/(?:\/Users\/|\/home\/|[A-Za-z]:\\\\|~\/)[^\s"']+/.test(text)) addWarning(warnings, "absolute-path", "This resource contains a path that may not exist in another project.", file.path);
+    if (relativePathReference.test(text)) addWarning(warnings, "relative-path-portability", "This resource contains relative paths that may resolve differently after it is copied to another project.", file.path);
+    if (candidate.kind === "pi-settings" && ["defaultProjectTrust", "httpProxy", "cacheWarming"].some((key) => text.includes(`\"${key}\"`))) {
+      addWarning(warnings, "project-setting-restricted", "This Pi setting is user-only and may not work in a project; copi preserves its bytes without rewriting it.", file.path);
+    }
+    if (path.basename(file.path) === "package.json") {
       try {
-        const manifest = JSON.parse(file.text) as Record<string, unknown>;
+        const manifest = JSON.parse(text) as Record<string, unknown>;
         const dependencies = [manifest.dependencies, manifest.devDependencies, manifest.peerDependencies].some((value) => typeof value === "object" && value !== null && Object.keys(value).length > 0);
-        if (dependencies) addWarning(warnings, "dependency-requirement", "This resource declares dependencies; copi does not install them automatically.", file.relative);
+        if (dependencies) addWarning(warnings, "dependency-requirement", "This resource declares dependencies; copi does not install them automatically.", file.path);
       } catch {
-        addWarning(warnings, "invalid-package-manifest", "This package manifest could not be parsed for dependency warnings.", file.relative);
+        addWarning(warnings, "invalid-package-manifest", "This package manifest could not be parsed for dependency warnings.", file.path);
       }
     }
   }
   if (candidate.destination.kind === "global-only") addWarning(warnings, "global-only", "This resource is saved for reference and cannot be applied to a project.");
-  return { warnings, sensitivePaths: [...new Set(sensitivePaths)].sort(), excludedPaths: [...new Set(scanned.excluded)].sort() };
+  return Object.freeze({
+    warnings: Object.freeze(warnings.map((warning) => Object.freeze({ ...warning }))),
+    sensitivePaths: Object.freeze([...new Set(sensitivePaths)].sort((left, right) => left.localeCompare(right))),
+    excludedPaths: Object.freeze([...new Set(excludedPaths)].sort((left, right) => left.localeCompare(right))),
+    preparedResource: prepared,
+  });
+}
+
+export async function inspectResource(candidate: ResourceCandidate): Promise<InspectionResult> {
+  const prepared = await prepareResource(candidate);
+  const inspection = await inspectPreparedResource(prepared);
+  return {
+    warnings: [...inspection.warnings],
+    sensitivePaths: [...inspection.sensitivePaths],
+    excludedPaths: [...inspection.excludedPaths],
+  };
 }
 
 export function maskSensitiveText(value: string): string {

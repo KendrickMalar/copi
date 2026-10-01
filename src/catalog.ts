@@ -1,11 +1,41 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
-import type { Catalog, Group, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents } from "./types.ts";
+import type { Catalog, Group, InspectionResult, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents } from "./types.ts";
 
 export interface ImportOptions {
   confirmed: boolean;
   groupIds: string[];
+}
+
+declare const preparedResourceBrand: unique symbol;
+
+export interface PreparedResource {
+  readonly [preparedResourceBrand]: true;
+}
+
+export interface PreparedFile {
+  readonly path: string;
+  readonly mode: number;
+  readonly bytes: Buffer;
+}
+
+export interface PreparedResourceContents {
+  readonly candidate: ResourceCandidate;
+  readonly files: readonly PreparedFile[];
+  readonly excludedPaths: readonly string[];
+}
+
+export interface PreparedInspection {
+  readonly warnings: Readonly<InspectionResult["warnings"]>;
+  readonly sensitivePaths: readonly string[];
+  readonly excludedPaths: readonly string[];
+  readonly preparedResource: PreparedResource;
+}
+
+export interface PreparedImportOptions extends ImportOptions {
+  inspection: PreparedInspection;
+  approvedSensitivePaths: readonly string[];
 }
 
 interface SourceFile {
@@ -13,6 +43,14 @@ interface SourceFile {
   mode: number;
   bytes: Buffer;
 }
+
+interface PreparedSnapshot {
+  candidate: ResourceCandidate;
+  files: SourceFile[];
+  excludedPaths: string[];
+}
+
+const preparedSnapshots = new WeakMap<PreparedResource, PreparedSnapshot>();
 
 const kinds = new Set<ResourceKind>(["instruction", "skill", "subagent", "pi-settings", "mcp-config", "model-config", "keybindings"]);
 const scopes = new Set<ResourceScope>(["user", "project", "shared", "package"]);
@@ -158,7 +196,7 @@ async function existingStoreRoot(libraryDir: string): Promise<string | undefined
 function excludedRelative(relative: string): boolean {
   return relative.split("/").some((part) => {
     const lower = part.toLowerCase();
-    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.");
+    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env");
   });
 }
 
@@ -184,24 +222,22 @@ async function checkedSourceRoot(candidate: ResourceCandidate): Promise<{ root: 
   return { root, source };
 }
 
-async function readSourceFiles(candidate: ResourceCandidate): Promise<SourceFile[]> {
+async function readSourceFiles(candidate: ResourceCandidate, excludedPaths: string[]): Promise<SourceFile[]> {
   const { root, source } = await checkedSourceRoot(candidate);
   const sourceStat = await lstat(source);
   const directory = sourceStat.isDirectory();
   const files: SourceFile[] = [];
   const visit = async (target: string): Promise<void> => {
     const relative = directory ? path.relative(source, target).split(path.sep).join("/") : path.basename(target);
-    if (relative && excludedRelative(relative)) return;
+    if (relative && excludedRelative(relative)) {
+      excludedPaths.push(relative);
+      return;
+    }
     const stat = await lstat(target);
     if (stat.isSymbolicLink()) throw new Error("Symbolic links are not copied as resource content.");
     if (stat.isDirectory()) {
       const entries = await readdir(target, { withFileTypes: true });
-      for (const entry of entries) {
-        const child = path.join(target, entry.name);
-        const childRelative = path.relative(source, child).split(path.sep).join("/");
-        if (excludedRelative(childRelative)) continue;
-        await visit(child);
-      }
+      for (const entry of entries) await visit(path.join(target, entry.name));
       return;
     }
     if (!stat.isFile()) return;
@@ -214,6 +250,45 @@ async function readSourceFiles(candidate: ResourceCandidate): Promise<SourceFile
   files.sort((left, right) => left.path.localeCompare(right.path));
   if (!isWithin(root, source)) throw new Error("Resource source path escapes its declared boundary.");
   return files;
+}
+
+function copyCandidate(candidate: ResourceCandidate): ResourceCandidate {
+  return { ...candidate, destination: { ...candidate.destination } };
+}
+
+function getPreparedSnapshot(prepared: PreparedResource): PreparedSnapshot {
+  if (typeof prepared !== "object" || prepared === null) throw new Error("Invalid prepared resource.");
+  const snapshot = preparedSnapshots.get(prepared);
+  if (!snapshot) throw new Error("Prepared resource is unavailable.");
+  return snapshot;
+}
+
+export async function prepareResource(candidate: ResourceCandidate): Promise<PreparedResource> {
+  validateCandidate(candidate);
+  const capturedCandidate = copyCandidate(candidate);
+  const excludedPaths: string[] = [];
+  const files = await readSourceFiles(capturedCandidate, excludedPaths);
+  const prepared = Object.freeze({}) as PreparedResource;
+  preparedSnapshots.set(prepared, {
+    candidate: capturedCandidate,
+    files,
+    excludedPaths: [...new Set(excludedPaths)].sort((left, right) => left.localeCompare(right)),
+  });
+  return prepared;
+}
+
+export function readPreparedResource(prepared: PreparedResource): PreparedResourceContents {
+  const snapshot = getPreparedSnapshot(prepared);
+  const files = snapshot.files.map((file) => Object.freeze({
+    path: file.path,
+    mode: file.mode,
+    bytes: Buffer.from(file.bytes),
+  }));
+  return Object.freeze({
+    candidate: copyCandidate(snapshot.candidate),
+    files: Object.freeze(files),
+    excludedPaths: Object.freeze([...snapshot.excludedPaths]),
+  });
 }
 
 function validateCandidate(candidate: ResourceCandidate): void {
@@ -281,11 +356,8 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
   await chmod(destination, 0o600);
 }
 
-export async function importResource(libraryDir: string, candidate: ResourceCandidate, options: ImportOptions): Promise<SavedItem | null> {
-  if (!options.confirmed) return null;
-  validateCandidate(candidate);
-  const groupIds = [...new Set(options.groupIds)];
-  const sourceFiles = await readSourceFiles(candidate);
+async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[]): Promise<SavedItem> {
+  const groupIds = [...new Set(requestedGroupIds)];
   const catalog = await loadCatalog(libraryDir);
   const groups = new Map(catalog.groups.map((group) => [group.id, group]));
   if (groupIds.some((id) => !groups.has(id))) throw new Error("Cannot import a resource into an unknown group.");
@@ -313,6 +385,28 @@ export async function importResource(libraryDir: string, candidate: ResourceCand
     throw error;
   }
   return item;
+}
+
+export async function importPreparedResource(libraryDir: string, prepared: PreparedResource, options: PreparedImportOptions): Promise<SavedItem | null> {
+  if (!options.confirmed) return null;
+  const snapshot = getPreparedSnapshot(prepared);
+  if (options.inspection.preparedResource !== prepared) throw new Error("Inspection does not match the prepared resource.");
+  const inspectedPaths = new Set(options.inspection.sensitivePaths);
+  const approvedPaths = new Set(options.approvedSensitivePaths);
+  const availablePaths = new Set(snapshot.files.map((file) => file.path));
+  if (inspectedPaths.size !== options.inspection.sensitivePaths.length || approvedPaths.size !== options.approvedSensitivePaths.length ||
+      [...inspectedPaths].some((filePath) => !availablePaths.has(filePath)) || inspectedPaths.size !== approvedPaths.size ||
+      [...inspectedPaths].some((filePath) => !approvedPaths.has(filePath))) {
+    throw new Error("Prepared import requires approval for every suspected sensitive file in its inspection.");
+  }
+  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, options.groupIds);
+}
+
+export async function importResource(libraryDir: string, candidate: ResourceCandidate, options: ImportOptions): Promise<SavedItem | null> {
+  if (!options.confirmed) return null;
+  const prepared = await prepareResource(candidate);
+  const snapshot = getPreparedSnapshot(prepared);
+  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, options.groupIds);
 }
 
 export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Promise<SnapshotFileContents[]> {
