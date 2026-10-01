@@ -8,7 +8,7 @@ import { maskSensitiveText } from "./inspect.ts";
 import type { InspectionWarning, SavedItem, SnapshotFileContents } from "./types.ts";
 
 const maxInspectionBytes = 1_000_000;
-const excludedNames = new Set([".git", "node_modules", "cache", "caches", "history", "sessions", "auth"]);
+const excludedNames = new Set([".git", ".cache", ".npm", "node_modules", "cache", "caches", "history", "sessions", "auth"]);
 const planState = new WeakMap<ApplyPlan, InternalPlan>();
 
 export type ApplyPreview = { kind: "text"; diff: string } | { kind: "binary"; summary: string };

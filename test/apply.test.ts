@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -234,4 +235,28 @@ test("skips a destination whose bytes and mode already match the snapshot", asyn
   const result = await executeApply(box.libraryDir, plan, {});
   assert.deepEqual(result.written, []);
   assert.equal(await readFile(target, "utf8"), "same content");
+});
+
+test("does not apply cached private paths even when present in a stored snapshot", async (t) => {
+  const box = await sandbox(t);
+  const item = await addSkill(box, { name: "cached", content: "supported content\n" });
+  const catalog = await loadCatalog(box.libraryDir);
+  const saved = catalog.items.find((entry) => entry.id === item.id)!;
+  const excludedPaths = [".cache/private.txt", "nested/.npm/private.txt"];
+  for (const relative of excludedPaths) {
+    const bytes = Buffer.from("private cache content\n");
+    const filePath = path.join(box.libraryDir, "items", item.id, "files", ...relative.split("/"));
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, bytes);
+    saved.files.push({ path: relative, mode: 0o600, sha256: createHash("sha256").update(bytes).digest("hex") });
+  }
+  await saveCatalog(box.libraryDir, catalog);
+
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  assert.deepEqual(plan.files.map((file) => file.path), [".pi/skills/cached/SKILL.md"]);
+  assert.ok(excludedPaths.every((relative) => plan.warnings.some((warning) => warning.code === "private-path-skipped" && warning.path === relative)));
+  await executeApply(box.libraryDir, plan, {});
+  for (const relative of excludedPaths) {
+    await assert.rejects(readFile(path.join(box.projectDir, ".pi/skills/cached", relative)), { code: "ENOENT" });
+  }
 });
