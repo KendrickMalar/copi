@@ -49,7 +49,7 @@ function isWithin(root: string, target: string): boolean {
 function shouldExclude(relativePath: string): boolean {
   return relativePath.split(path.sep).some((part) => {
     const lower = part.toLowerCase();
-    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.");
+    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower.startsWith(".env");
   });
 }
 
