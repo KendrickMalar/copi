@@ -33,6 +33,9 @@ test("stores an owner-only, byte-for-byte skill bundle snapshot and preserves sh
   await mkdir(path.join(sourcePath, ".npm"), { recursive: true });
   await writeFile(path.join(sourcePath, ".cache", "private.txt"), "cached content");
   await writeFile(path.join(sourcePath, ".npm", "private.txt"), "package cache content");
+  await mkdir(path.join(sourcePath, "auth", "nested"), { recursive: true });
+  await writeFile(path.join(sourcePath, "auth", "private.ts"), "export const authenticate = true;");
+  await writeFile(path.join(sourcePath, "auth", "nested", "tokens.json"), "{\"token\":\"private\"}");
   const binary = Buffer.from([0, 1, 2, 127, 128, 255]);
   await writeFile(path.join(sourcePath, "assets.bin"), binary);
   await writeFile(path.join(sourcePath, "scripts", "tool.sh"), "#!/bin/sh\nprintf bundled\n");
@@ -53,7 +56,7 @@ test("stores an owner-only, byte-for-byte skill bundle snapshot and preserves sh
   assert.ok(saved);
   assert.equal(saved.destination.kind, "project");
   assert.ok(saved.files.some((file) => file.path === "scripts/tool.sh" && file.mode === 0o755));
-  for (const relative of [".cache/private.txt", ".npm/private.txt"]) {
+  for (const relative of [".cache/private.txt", ".npm/private.txt", "auth/private.ts", "auth/nested/tokens.json"]) {
     assert.ok(!saved.files.some((file) => file.path === relative));
     await assert.rejects(lstat(path.join(libraryDir, "items", saved.id, "files", ...relative.split("/"))), { code: "ENOENT" });
   }

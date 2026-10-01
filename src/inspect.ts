@@ -2,7 +2,7 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { InspectionResult, InspectionWarning, ResourceCandidate } from "./types.ts";
 
-const excludedNames = new Set([".git", ".cache", ".npm", "node_modules", "cache", "caches", "history", "sessions"]);
+const excludedNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions"]);
 const maxInspectionBytes = 1_000_000;
 
 function isWithin(root: string, target: string): boolean {
@@ -55,6 +55,9 @@ async function inspectFiles(candidate: ResourceCandidate): Promise<{ files: Arra
     const relativeToSource = sourceIsDirectory ? path.relative(sourceInput, target) : path.basename(target);
     if (isExcluded(relativeToSource)) {
       excluded.push(relativeToSource);
+      if (relativeToSource.split(path.sep).some((part) => part.toLowerCase() === "auth")) {
+        addWarning(warnings, "auth-directory-excluded", "An auth path was excluded; copied resources may be missing authentication-specific code.", relativeToSource);
+      }
       return;
     }
     const stat = await lstat(target).catch((error: NodeJS.ErrnoException) => {
