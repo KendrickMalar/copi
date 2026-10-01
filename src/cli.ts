@@ -24,8 +24,10 @@ Commands:
   help               Show this help
 
 Interactive changes require a TTY. Setup searches only locations explicitly selected
-and confirmed in the wizard. Named authentication files, .env* files, and history/cache
-paths are filtered; secret detection is heuristic and cannot guarantee completeness.`);
+and confirmed in the wizard. Directories named auth are excluded entirely; copied
+authentication-specific code may be missing from copied resources. Named authentication files, .env* files,
+and history/cache paths are filtered; secret detection is heuristic and cannot guarantee
+completeness.`);
 }
 
 function requireHome(environment: NodeJS.ProcessEnv): string {

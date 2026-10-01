@@ -40,6 +40,7 @@ test("help and list are read-only commands under a synthetic home", async (t) =>
   assert.equal(help.status, 0, help.stderr);
   assert.match(help.stdout, /setup/);
   assert.match(help.stdout, /apply/);
+  assert.match(help.stdout, /directories named auth[\s\S]*authentication-specific code may be missing/i);
 
   const list = runCli(box, ["list"]);
   assert.equal(list.status, 0, list.stderr);

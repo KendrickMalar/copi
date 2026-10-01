@@ -9,7 +9,7 @@ import type { ApplyDecisions, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
 import type { Catalog, Group, ResourceCandidate, SavedItem } from "./types.ts";
 
-const excludedNames = new Set([".git", ".cache", ".npm", "node_modules", "cache", "caches", "history", "sessions"]);
+const excludedNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions"]);
 const previewMaxBytes = 1_000_000;
 const previewMaxFiles = 12;
 const previewMaxLines = 24;
@@ -55,7 +55,7 @@ function isExcludedPreviewPath(relative: string): boolean {
   });
 }
 
-async function readPreview(candidate: ResourceCandidate): Promise<string[]> {
+export async function readPreview(candidate: ResourceCandidate): Promise<string[]> {
   const requestedRoot = path.resolve(candidate.sourceRoot);
   const requestedSource = path.resolve(candidate.sourcePath);
   if (!path.isAbsolute(candidate.sourceRoot) || !path.isAbsolute(candidate.sourcePath) || !isWithin(requestedRoot, requestedSource)) {
@@ -154,7 +154,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       `HOME: ${scopes.home ? roots.homeDir : "not selected"}`,
       `Pi agent directory: ${scopes.home ? roots.agentDir : "not selected"}`,
       `Project: ${scopes.project ? roots.projectDir : "not selected"}`,
-      "Always excluded: auth.json, mcp-auth.json, oauth.json, .env*, history, cache/caches, .cache, .npm, node_modules, and .git.",
+      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env*, history, cache/caches, .cache, .npm, node_modules, and .git.",
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
     "Search scope and exclusions",
