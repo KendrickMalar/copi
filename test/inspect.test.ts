@@ -31,6 +31,8 @@ test("flags inline credential candidates, distinguishes environment references, 
   await writeFile(path.join(sourcePath, ".env.local"), "TOKEN=sk_live_another_secret");
   await writeFile(path.join(sourcePath, "auth.json"), JSON.stringify({ token: "private" }));
   await writeFile(path.join(sourcePath, "history", "session.jsonl"), "private history");
+  await mkdir(path.join(sourcePath, "auth", "scripts"), { recursive: true });
+  await writeFile(path.join(sourcePath, "auth", "scripts", "authenticate.ts"), "export const auth = true;");
   await mkdir(path.join(sourcePath, ".cache"), { recursive: true });
   await mkdir(path.join(sourcePath, ".npm"), { recursive: true });
   await writeFile(path.join(sourcePath, ".cache", "private.txt"), "cached content");
@@ -44,6 +46,8 @@ test("flags inline credential candidates, distinguishes environment references, 
   assert.ok(!inspection.sensitivePaths.includes("SKILL.md"));
   assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith(".env.local")));
   assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith("auth.json")));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith(path.join("auth"))));
+  assert.ok(inspection.warnings.some((warning) => warning.code === "auth-directory-excluded"));
   assert.ok(inspection.excludedPaths.some((entry) => entry.includes("history")));
   assert.ok(inspection.excludedPaths.some((entry) => entry.includes(".cache")));
   assert.ok(inspection.excludedPaths.some((entry) => entry.includes(".npm")));

@@ -23,7 +23,7 @@ interface PackageSelection {
   agents?: string[];
 }
 
-const excludedNames = new Set([".git", ".cache", ".npm", "node_modules", "cache", "caches", "history", "sessions"]);
+const excludedNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions"]);
 const contextFiles = ["AGENTS.md", "AGENTS.MD", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.MD"];
 
 function isWithin(root: string, target: string): boolean {
@@ -193,6 +193,9 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
         const relative = path.relative(canonicalRoot, child);
         if (shouldExclude(relative)) {
           excludedPaths.add(child);
+          if (relative.split(path.sep).some((part) => part.toLowerCase() === "auth")) {
+            addWarning(warnings, "auth-directory-excluded", child, "An auth directory was excluded; copied resources may be missing authentication-specific code.");
+          }
           continue;
         }
         if (entry.isSymbolicLink()) {
@@ -207,6 +210,14 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     const canonicalStart = await realpath(startPath).catch(() => undefined);
     if (!canonicalStart || !isWithin(canonicalRoot, canonicalStart)) {
       addWarning(warnings, "resource-outside-root", startPath, "A configured resource root resolves outside its allowed search root.");
+      return;
+    }
+    const startRelative = path.relative(canonicalRoot, canonicalStart);
+    if (shouldExclude(startRelative)) {
+      excludedPaths.add(canonicalStart);
+      if (startRelative.split(path.sep).some((part) => part.toLowerCase() === "auth")) {
+        addWarning(warnings, "auth-directory-excluded", canonicalStart, "An auth directory was excluded; copied resources may be missing authentication-specific code.");
+      }
       return;
     }
     const stat = await lstat(canonicalStart).catch(() => undefined);

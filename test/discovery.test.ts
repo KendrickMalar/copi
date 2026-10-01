@@ -22,6 +22,7 @@ test("discovers Pi and shared/project skill bundles and declared package resourc
   await put(homeDir, ".agents/skills/shared/SKILL.md", "shared guidance");
   await put(agentDir, "skills/portable/SKILL.md", "portable guidance");
   await put(agentDir, "skills/portable/scripts/run.mjs", "export default 1;");
+  await put(agentDir, "skills/portable/auth/private.ts", "export const authenticationHelper = true;");
   await put(agentDir, "skills/portable/.env", "TOKEN=do-not-copy");
   await put(agentDir, "agents/scout.md", "---\nname: scout\n---\nScout instructions");
   await put(agentDir, "shared-skills/custom/SKILL.md", "configured shared guidance");
@@ -73,6 +74,8 @@ test("discovers Pi and shared/project skill bundles and declared package resourc
   assert.ok(!names.has("not-a-candidate"));
   assert.ok(!result.candidates.some((candidate) => candidate.sourcePath.includes("auth.json")));
   assert.ok(result.excludedPaths.some((entry) => entry.endsWith(".env")));
+  assert.ok(result.excludedPaths.some((entry) => entry.endsWith(path.join("auth"))));
+  assert.ok(result.warnings.some((warning) => warning.code === "auth-directory-excluded"));
   assert.ok(result.excludedPaths.some((entry) => entry.includes("node_modules")));
   assert.ok(result.candidates.some((candidate) => candidate.destination.kind === "project" && candidate.destination.path === ".pi/skills/portable"));
   assert.ok(result.candidates.some((candidate) => candidate.kind === "pi-settings" && candidate.destination.kind === "project" && candidate.destination.path === ".pi/settings.json"));
