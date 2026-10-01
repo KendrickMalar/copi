@@ -105,7 +105,7 @@ function safeRelativePath(value: string): boolean {
 function isExcludedSnapshotPath(value: string): boolean {
   return value.split("/").some((part) => {
     const lower = part.toLowerCase();
-    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.") || lower.startsWith("env");
+    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower.startsWith(".env");
   });
 }
 

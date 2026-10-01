@@ -269,15 +269,22 @@ test("does not apply cached private paths even when present in a stored snapshot
   }
 });
 
-test("skips env-prefixed, authentication, history, and cache snapshot files while applying supported files", async (t) => {
+test("skips dot-env, authentication, history, and cache files while preserving environment helper code", async (t) => {
   const box = await sandbox(t);
-  const item = await addSkill(box, { name: "env-boundary", files: { "SKILL.md": "portable instructions", "README.md": "keep this support file" } });
+  const supportedFiles = {
+    "SKILL.md": "portable instructions",
+    "README.md": "keep this support file",
+    "env_helper.py": "print('environment helper')",
+    "envrc": "ordinary support file",
+    "env-production": "ordinary environment documentation",
+  };
+  const item = await addSkill(box, { name: "env-boundary", files: supportedFiles });
   const catalog = await loadCatalog(box.libraryDir);
   const saved = catalog.items.find((entry) => entry.id === item.id);
   assert.ok(saved);
   const excludedPaths = [
-    "envrc",
-    "env-production",
+    ".envrc",
+    ".env-production",
     "nested/.env.local",
     "auth/token.json",
     "auth.json",
@@ -297,10 +304,18 @@ test("skips env-prefixed, authentication, history, and cache snapshot files whil
   await saveCatalog(box.libraryDir, catalog);
 
   const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
-  assert.deepEqual(plan.files.map((file) => file.path), [".pi/skills/env-boundary/README.md", ".pi/skills/env-boundary/SKILL.md"]);
+  assert.deepEqual(new Set(plan.files.map((file) => file.path)), new Set([
+    ".pi/skills/env-boundary/SKILL.md",
+    ".pi/skills/env-boundary/README.md",
+    ".pi/skills/env-boundary/env_helper.py",
+    ".pi/skills/env-boundary/envrc",
+    ".pi/skills/env-boundary/env-production",
+  ]));
   assert.ok(excludedPaths.every((relative) => plan.warnings.some((warning) => warning.code === "private-path-skipped" && warning.path === relative)));
   await executeApply(box.libraryDir, plan, {});
-  assert.equal(await readFile(path.join(box.projectDir, ".pi/skills/env-boundary/README.md"), "utf8"), "keep this support file");
+  for (const [relative, content] of Object.entries(supportedFiles)) {
+    assert.equal(await readFile(path.join(box.projectDir, ".pi/skills/env-boundary", relative), "utf8"), content);
+  }
   for (const relative of excludedPaths) {
     await assert.rejects(readFile(path.join(box.projectDir, ".pi/skills/env-boundary", relative)), { code: "ENOENT" });
   }
