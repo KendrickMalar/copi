@@ -155,7 +155,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
   const home = scopes.home ? await canonicalDirectory(options.homeDir) : undefined;
   const agent = scopes.home ? await canonicalDirectory(options.agentDir) : undefined;
   const project = scopes.project ? await canonicalDirectory(options.projectDir) : undefined;
-  const packageAgentDir = agent ?? (scopes.project ? await canonicalDirectory(options.agentDir) : undefined);
+  const packageAgentDir = agent;
   if (scopes.home && !home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
   if (scopes.home && !agent) addWarning(warnings, "unavailable-root", options.agentDir, "The explicitly selected Pi agent directory is unavailable.");
   if (scopes.project && !project) addWarning(warnings, "unavailable-root", options.projectDir, "The explicitly selected project directory is unavailable.");
@@ -297,11 +297,22 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     }
   };
 
+  const isExcludedPackagePath = (target: string, authorizedRoots: string[]): boolean => {
+    return authorizedRoots.some((root) => isWithin(root, target) && path.relative(root, target).split(path.sep).some((part) => {
+      return part.toLowerCase() !== "node_modules" && shouldExclude(part);
+    }));
+  };
+
   const resolveAuthorizedPackageRoot = async (requestedPath: string, authorizedRoots: string[]): Promise<string | undefined> => {
     const packageRoot = await canonicalDirectory(requestedPath);
     if (!packageRoot) return undefined;
     if (!authorizedRoots.some((allowedRoot) => isWithin(allowedRoot, packageRoot))) {
       addWarning(warnings, "resource-outside-root", requestedPath, "A declared Pi package resolves outside the authorized home or project tree.");
+      return undefined;
+    }
+    if (isExcludedPackagePath(requestedPath, authorizedRoots) || isExcludedPackagePath(packageRoot, authorizedRoots)) {
+      excludedPaths.add(packageRoot);
+      addWarning(warnings, "excluded-package", requestedPath, "A declared package is inside an excluded authentication, environment, history, or cache path.");
       return undefined;
     }
     return packageRoot;
@@ -343,6 +354,11 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     const canonicalManifest = await realpath(manifestPath).catch(() => undefined);
     if (!canonicalManifest || !authorizedRoots.some((allowedRoot) => isWithin(allowedRoot, canonicalManifest))) {
       addWarning(warnings, "resource-outside-root", manifestPath, "The declared package manifest resolves outside the authorized home or project tree.");
+      return;
+    }
+    if (isExcludedPackagePath(canonicalPackageRoot, authorizedRoots) || isExcludedPackagePath(canonicalManifest, authorizedRoots)) {
+      excludedPaths.add(canonicalPackageRoot);
+      addWarning(warnings, "excluded-package", manifestPath, "An excluded package or manifest was not inspected.");
       return;
     }
     let manifest: Record<string, unknown> | undefined;

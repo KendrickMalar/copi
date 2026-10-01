@@ -319,3 +319,49 @@ test("honors home-only, project-only, both, and none discovery scopes", async (t
   assert.ok(aliasNames.has("current-project-skill"));
   assert.ok(!aliasNames.has("leaked-as-user"));
 });
+
+test("configured packages cannot hide excluded ancestors by becoming new roots", async (t) => {
+  const homeDir = await mkdtemp(path.join(os.tmpdir(), "copi-excluded-package-ancestors-"));
+  t.after(() => rm(homeDir, { recursive: true, force: true }));
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(homeDir, "project");
+  await mkdir(agentDir, { recursive: true });
+  await mkdir(projectDir, { recursive: true });
+  const packages = ["auth/pkg", ".cache/pkg", ".npm/pkg", "normal/pkg"];
+  for (const [index, relative] of packages.entries()) {
+    await put(agentDir, `${relative}/package.json`, JSON.stringify({ pi: { skills: ["skills"] } }));
+    await put(agentDir, `${relative}/skills/ancestor-${index}/SKILL.md`, "synthetic package guidance");
+  }
+  await put(agentDir, "settings.json", JSON.stringify({ packages: packages.map((relative) => `./${relative}`) }));
+  const result = await discoverResources({ homeDir, agentDir, projectDir, scopes: { home: true, project: true } });
+  const names = new Set(result.candidates.map((candidate) => candidate.name));
+  assert.ok(!names.has("ancestor-0"));
+  assert.ok(!names.has("ancestor-1"));
+  assert.ok(!names.has("ancestor-2"));
+  assert.ok(names.has("ancestor-3"));
+  assert.ok(result.excludedPaths.some((entry) => entry.includes(path.join("auth", "pkg"))));
+});
+
+test("project-only discovery never reads an unselected agent package cache", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-unselected-package-cache-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(root, "project");
+  await mkdir(agentDir, { recursive: true });
+  await mkdir(path.join(projectDir, ".pi"), { recursive: true });
+  await put(agentDir, "npm/node_modules/@sample/pkg/package.json", JSON.stringify({ pi: { skills: ["skills"] } }));
+  await put(agentDir, "npm/node_modules/@sample/pkg/skills/unselected-npm/SKILL.md", "must not read this agent asset");
+  await put(agentDir, "git/github.com/sample/pkg/package.json", JSON.stringify({ pi: { skills: ["skills"] } }));
+  await put(agentDir, "git/github.com/sample/pkg/skills/unselected-git/SKILL.md", "must not read this agent asset");
+  await put(projectDir, ".pi/settings.json", JSON.stringify({ packages: ["npm:@sample/pkg@1.0.0", "git:github.com/sample/pkg"] }));
+  const result = await discoverResources({ homeDir, agentDir, projectDir, scopes: { home: false, project: true } });
+  const names = new Set(result.candidates.map((candidate) => candidate.name));
+  assert.ok(!names.has("unselected-npm"));
+  assert.ok(!names.has("unselected-git"));
+  assert.ok(result.warnings.some((warning) => warning.code === "package-unavailable"));
+  const approved = await discoverResources({ homeDir, agentDir, projectDir, scopes: { home: true, project: true } });
+  const approvedNames = new Set(approved.candidates.map((candidate) => candidate.name));
+  assert.ok(approvedNames.has("unselected-npm"));
+  assert.ok(approvedNames.has("unselected-git"));
+});
