@@ -3,7 +3,8 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { importResource, listSnapshots, loadCatalog, newCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { importPreparedResource, importResource, listSnapshots, loadCatalog, newCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { inspectPreparedResource, maskSensitiveText } from "../src/inspect.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
 function skillCandidate(sourceRoot: string, sourcePath: string): ResourceCandidate {
@@ -130,4 +131,70 @@ test("rejects a symlinked item directory before reading snapshot bytes outside t
   await symlink(outside, path.join(libraryDir, "items", saved.id), "dir");
 
   await assert.rejects(readSnapshotFiles(libraryDir, saved), /unsafe|symbolic|outside/i);
+});
+
+test("inspects and imports the exact prepared bytes after source changes, excluding every env-prefixed secret file", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-prepared-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceRoot = path.join(root, "auth", "cache", "source");
+  const sourcePath = path.join(sourceRoot, "skill");
+  const libraryDir = path.join(root, "home", ".copi");
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "apiKey=sk_live_approvedsecret123");
+  await writeFile(path.join(sourcePath, ".envrc"), "TOKEN=sk_live_envrcsecret123");
+  await writeFile(path.join(sourcePath, ".env-production"), "TOKEN=sk_live_envprodsecret123");
+  await writeFile(path.join(sourcePath, "auth.json"), "{\"token\":\"private\"}");
+  await writeFile(path.join(sourcePath, "OAuth.json"), "{\"token\":\"private\"}");
+  await mkdir(path.join(sourcePath, "auth", "nested"), { recursive: true });
+  await writeFile(path.join(sourcePath, "auth", "nested", "token.json"), "private");
+
+  const prepared = await prepareResource(skillCandidate(sourceRoot, sourcePath));
+  const inspection = await inspectPreparedResource(prepared);
+  assert.ok(inspection.sensitivePaths.includes("SKILL.md"));
+  assert.ok(Object.isFrozen(inspection.sensitivePaths));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith(".envrc")));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith(".env-production")));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith("auth.json")));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith("OAuth.json")));
+  assert.ok(inspection.excludedPaths.some((entry) => entry === "auth"));
+  await assert.rejects(lstat(libraryDir), { code: "ENOENT" });
+  const previewFiles = readPreparedResource(prepared).files;
+  const preview = previewFiles.find((file) => file.path === "SKILL.md");
+  assert.ok(preview);
+  assert.equal(preview.bytes.toString("utf8"), "apiKey=sk_live_approvedsecret123");
+  assert.ok(!maskSensitiveText(preview.bytes.toString("utf8")).includes("sk_live_approvedsecret123"));
+  preview.bytes.fill(0);
+  await assert.rejects(importPreparedResource(libraryDir, prepared, {
+    confirmed: true,
+    groupIds: [],
+    inspection,
+    approvedSensitivePaths: [],
+  }), /approval/i);
+  await assert.rejects(lstat(libraryDir), { code: "ENOENT" });
+
+  await rm(sourcePath, { recursive: true });
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "apiKey=sk_live_unapprovedsecret456");
+  await writeFile(path.join(sourcePath, "new-secret.txt"), "sk_live_addedlatersecret789");
+  const changedPrepared = await prepareResource(skillCandidate(sourceRoot, sourcePath));
+  await assert.rejects(importPreparedResource(libraryDir, changedPrepared, {
+    confirmed: true,
+    groupIds: [],
+    inspection,
+    approvedSensitivePaths: inspection.sensitivePaths,
+  }), /inspection does not match/i);
+  await assert.rejects(lstat(libraryDir), { code: "ENOENT" });
+  const saved = await importPreparedResource(libraryDir, prepared, {
+    confirmed: true,
+    groupIds: [],
+    inspection,
+    approvedSensitivePaths: inspection.sensitivePaths,
+  });
+  assert.ok(saved);
+  assert.deepEqual(saved.files.map((file) => file.path), ["SKILL.md"]);
+  const stored = await readSnapshotFiles(libraryDir, saved);
+  const storedText = stored.find((file) => file.path === "SKILL.md")?.bytes.toString("utf8");
+  assert.equal(storedText, "apiKey=sk_live_approvedsecret123");
+  assert.ok(!storedText?.includes("unapprovedsecret456"));
+  assert.ok(!stored.some((file) => file.path === "new-secret.txt"));
 });

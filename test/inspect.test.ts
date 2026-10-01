@@ -3,7 +3,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { inspectResource, maskSensitiveText } from "../src/inspect.ts";
+import { inspectPreparedResource, inspectResource, maskSensitiveText } from "../src/inspect.ts";
+import { prepareResource, readPreparedResource } from "../src/catalog.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
 function candidate(sourceRoot: string, sourcePath: string): ResourceCandidate {
@@ -76,4 +77,34 @@ test("inspects bundled binary files without decoding them as text and warns abou
   const inspection = await inspectResource(candidate(sourceRoot, sourcePath));
   assert.ok(inspection.warnings.some((warning) => warning.code === "dependency-requirement"));
   assert.deepEqual(inspection.sensitivePaths, []);
+});
+
+test("warns about user-only Pi settings and relative paths from the exact prepared resource, excluding .env-prefixed files", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-inspect-prepared-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const sourceRoot = path.join(root, "source");
+  const sourcePath = path.join(sourceRoot, "pi-settings");
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "settings.json"), JSON.stringify({
+    httpProxy: "http://proxy.example",
+    defaultProjectTrust: "trusted",
+    cacheWarming: true,
+    include: "./shared/prompts.json",
+  }));
+  await writeFile(path.join(sourcePath, ".envrc"), "TOKEN=private");
+  await writeFile(path.join(sourcePath, ".env-production"), "TOKEN=private");
+  const piCandidate = {
+    ...candidate(sourceRoot, sourcePath),
+    kind: "pi-settings" as const,
+    destination: { kind: "project" as const, path: ".pi/settings.json" },
+  };
+  const prepared = await prepareResource(piCandidate);
+  const inspection = await inspectPreparedResource(prepared);
+  assert.ok(inspection.warnings.some((warning) => warning.code === "project-setting-restricted"));
+  assert.ok(inspection.warnings.some((warning) => warning.code === "relative-path-portability"));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith(".envrc")));
+  assert.ok(inspection.excludedPaths.some((entry) => entry.endsWith(".env-production")));
+  const content = readPreparedResource(prepared).files[0]?.bytes.toString("utf8");
+  assert.ok(content?.includes("./shared/prompts.json"));
+  assert.ok(!JSON.stringify(inspection).includes("http://proxy.example"));
 });
