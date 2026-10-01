@@ -105,8 +105,36 @@ function safeRelativePath(value: string): boolean {
 function isExcludedSnapshotPath(value: string): boolean {
   return value.split("/").some((part) => {
     const lower = part.toLowerCase();
-    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.");
+    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.") || lower.startsWith("env");
   });
+}
+
+function hasRelativeResourceReferences(text: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return false;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  const settings = parsed as Record<string, unknown>;
+  const subagentsValue = settings.subagents;
+  const subagents = typeof subagentsValue === "object" && subagentsValue !== null && !Array.isArray(subagentsValue)
+    ? subagentsValue as Record<string, unknown>
+    : undefined;
+  const hasRelativeSelections = (value: unknown): boolean => Array.isArray(value) && value.some((entry) =>
+    typeof entry === "string" && entry.trim().length > 0 && !path.isAbsolute(entry.trim()) && !entry.startsWith("$") && !entry.startsWith("~/"),
+  );
+  const packageSelections = Array.isArray(settings.packages) ? settings.packages : [];
+  const hasRelativePackage = packageSelections.some((entry) => {
+    const selection = typeof entry === "object" && entry !== null && !Array.isArray(entry)
+      ? entry as Record<string, unknown>
+      : undefined;
+    const source = typeof entry === "string" ? entry : selection?.source;
+    return typeof source === "string" && (source.startsWith("./") || source.startsWith("../") || source.startsWith("file:"));
+  });
+  return hasRelativeSelections(settings.skills) || hasRelativeSelections(settings.agentScanDirs) ||
+    hasRelativeSelections(subagents?.agentScanDirs) || hasRelativePackage;
 }
 
 function sha256(bytes: Buffer): string {
@@ -178,6 +206,9 @@ function inspectSnapshotText(
   }
   if (item.kind === "pi-settings" && ["\"defaultProjectTrust\"", "\"httpProxy\"", "\"cacheWarming\""].some((key) => text.includes(key))) {
     addWarning(warnings, "project-setting-restricted", "This Pi setting is user-only and may not work in a project; copi preserves its bytes without rewriting it.", destination);
+  }
+  if (item.kind === "pi-settings" && hasRelativeResourceReferences(text)) {
+    addWarning(warnings, "relative-resource-reference", "Pi resource references are relative to the settings file and may resolve differently when applied to a project.", destination);
   }
   return sensitive;
 }
@@ -371,7 +402,7 @@ async function createBackupSet(storeRoot: string, operations: WriteOperation[]):
     }
     const manifestHandle = await open(path.join(transactionRoot, "manifest.json"), "wx", 0o600);
     try {
-      await manifestHandle.writeFile(`${JSON.stringify(manifest, null, 2)}\\n`, "utf8");
+      await manifestHandle.writeFile(`${JSON.stringify(manifest, null, 2)}${String.fromCharCode(10)}`, "utf8");
       await manifestHandle.sync();
     } finally {
       await manifestHandle.close();
