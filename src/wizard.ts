@@ -1,15 +1,14 @@
 import { autocompleteMultiselect, cancel, confirm, intro, isCancel, log, note, outro, select, text } from "@clack/prompts";
-import { lstat, readFile, readdir, realpath } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
 import path from "node:path";
-import { loadCatalog, saveCatalog, importResource } from "./catalog.ts";
+import { importPreparedResource, loadCatalog, prepareResource, readPreparedResource, saveCatalog, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { inspectResource, maskSensitiveText } from "./inspect.ts";
-import type { ApplyDecisions, ApplyPlan } from "./apply.ts";
+import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
+import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
 import type { Catalog, Group, ResourceCandidate, SavedItem } from "./types.ts";
 
-const excludedNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions"]);
 const previewMaxBytes = 1_000_000;
 const previewMaxFiles = 12;
 const previewMaxLines = 24;
@@ -27,11 +26,9 @@ export interface SearchScopes {
 
 export function buildSearchOptions(roots: SearchRoots, scopes: SearchScopes): DiscoveryOptions | undefined {
   if (!scopes.home && !scopes.project) return undefined;
-  const fallbackRoot = scopes.project ? roots.projectDir : roots.homeDir;
   return {
-    homeDir: scopes.home ? roots.homeDir : fallbackRoot,
-    agentDir: scopes.home ? roots.agentDir : fallbackRoot,
-    projectDir: scopes.project ? roots.projectDir : fallbackRoot,
+    ...roots,
+    scopes: { home: scopes.home, project: scopes.project },
   };
 }
 
@@ -43,69 +40,51 @@ export function formatMaskedPreview(relativePath: string, content: string): stri
   return `${relativePath}:\n${snippet}${omitted}`;
 }
 
-function isWithin(root: string, target: string): boolean {
-  const relative = path.relative(root, target);
-  return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
-}
-
-function isExcludedPreviewPath(relative: string): boolean {
-  return relative.split("/").some((part) => {
-    const lower = part.toLowerCase();
-    return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower === ".env" || lower.startsWith(".env.");
+function formatPreparedFiles(files: readonly PreparedFile[]): string[] {
+  return files.slice(0, previewMaxFiles).map((file) => {
+    if (file.bytes.length > previewMaxBytes || file.bytes.includes(0)) {
+      return `${file.path}: [binary or large file, ${file.bytes.length} bytes]`;
+    }
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
+      return formatMaskedPreview(file.path, text);
+    } catch {
+      return `${file.path}: [binary or large file, ${file.bytes.length} bytes]`;
+    }
   });
 }
 
-export async function readPreview(candidate: ResourceCandidate): Promise<string[]> {
-  const requestedRoot = path.resolve(candidate.sourceRoot);
-  const requestedSource = path.resolve(candidate.sourcePath);
-  if (!path.isAbsolute(candidate.sourceRoot) || !path.isAbsolute(candidate.sourcePath) || !isWithin(requestedRoot, requestedSource)) {
-    throw new Error("The selected resource is outside its declared search root.");
-  }
-  const rootStat = await lstat(requestedRoot);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("The selected resource search root is unavailable.");
-  const root = await realpath(requestedRoot);
-  const source = await realpath(requestedSource);
-  if (!isWithin(root, source)) throw new Error("The selected resource resolves outside its declared search root.");
-  const sourceStat = await lstat(requestedSource);
-  if (sourceStat.isSymbolicLink() || (!sourceStat.isDirectory() && !sourceStat.isFile())) throw new Error("The selected resource is not a regular file or directory.");
-  const files: Array<{ relative: string; text?: string; size: number }> = [];
-  const visit = async (target: string, directorySource: boolean): Promise<void> => {
-    const relative = directorySource ? path.relative(source, target).split(path.sep).join("/") : path.basename(target);
-    if (relative && isExcludedPreviewPath(relative)) return;
-    const stat = await lstat(target);
-    if (stat.isSymbolicLink()) return;
-    if (stat.isDirectory()) {
-      for (const entry of await readdir(target, { withFileTypes: true })) {
-        const child = path.join(target, entry.name);
-        const childRelative = path.relative(source, child).split(path.sep).join("/");
-        if (!isExcludedPreviewPath(childRelative)) await visit(child, true);
-      }
-      return;
-    }
-    if (!stat.isFile()) return;
-    if (stat.size > previewMaxBytes) {
-      files.push({ relative, size: stat.size });
-      return;
-    }
-    const bytes = await readFile(target);
-    if (bytes.includes(0)) {
-      files.push({ relative, size: bytes.length });
-      return;
-    }
-    try {
-      files.push({ relative, text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), size: bytes.length });
-    } catch {
-      files.push({ relative, size: bytes.length });
-    }
-  };
-  await visit(source, sourceStat.isDirectory());
-  files.sort((left, right) => left.relative.localeCompare(right.relative));
-  return files.slice(0, previewMaxFiles).map((file) =>
-    file.text === undefined ? `${file.relative}: [binary or large file, ${file.size} bytes]` : formatMaskedPreview(file.relative, file.text),
-  );
+export interface CandidateReview {
+  candidate: ResourceCandidate;
+  prepared: PreparedResource;
+  inspection: PreparedInspection;
+  preview: string[];
 }
 
-function showWarnings(warnings: Array<{ code: string; path?: string; message: string }>, title: string): void {
+export async function prepareCandidateForReview(candidate: ResourceCandidate): Promise<CandidateReview> {
+  const prepared = await prepareResource(candidate);
+  const inspection = await inspectPreparedResource(prepared);
+  const snapshot = readPreparedResource(prepared);
+  return { candidate: snapshot.candidate, prepared, inspection, preview: formatPreparedFiles(snapshot.files) };
+}
+
+export async function saveReviewedCandidate(
+  libraryDir: string,
+  review: CandidateReview,
+  groupIds: string[],
+  approvedSensitivePaths: string[],
+  confirmed: boolean,
+): Promise<SavedItem | null> {
+  if (!confirmed) return null;
+  return importPreparedResource(libraryDir, review.prepared, {
+    confirmed,
+    groupIds,
+    inspection: review.inspection,
+    approvedSensitivePaths,
+  });
+}
+
+function showWarnings(warnings: readonly { code: string; path?: string; message: string }[], title: string): void {
   if (warnings.length === 0) return;
   note(warnings.map((warning) => `${warning.path ? `${warning.path}: ` : ""}${warning.message}`).join("\n"), title);
 }
@@ -154,7 +133,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       `HOME: ${scopes.home ? roots.homeDir : "not selected"}`,
       `Pi agent directory: ${scopes.home ? roots.agentDir : "not selected"}`,
       `Project: ${scopes.project ? roots.projectDir : "not selected"}`,
-      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env*, history, cache/caches, .cache, .npm, node_modules, and .git.",
+      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git.",
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
     "Search scope and exclusions",
@@ -220,30 +199,34 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
 
   const selectedCandidates = discovery.candidates.filter((candidate) => selectedIds.includes(candidate.id));
-  const approvedCandidates: Array<{ candidate: ResourceCandidate; groupIds: string[] }> = [];
+  const approvedCandidates: Array<{ review: CandidateReview; groupIds: string[]; approvedSensitivePaths: string[] }> = [];
   for (const candidate of selectedCandidates) {
-    const inspection = await inspectResource(candidate);
-    const preview = await readPreview(candidate);
-    note(preview.length > 0 ? preview.join("\n\n") : "No previewable files.", `Masked preview: ${candidate.name}`);
-    showWarnings(inspection.warnings, `${candidate.name} inspection warnings`);
+    const review = await prepareCandidateForReview(candidate);
+    note(review.preview.length > 0 ? review.preview.join("\n\n") : "No previewable files.", `Masked preview: ${review.candidate.name}`);
+    showWarnings(review.inspection.warnings, `${review.candidate.name} inspection warnings`);
+    if (review.inspection.excludedPaths.length > 0) {
+      note(review.inspection.excludedPaths.join("\n"), `${review.candidate.name} excluded paths`);
+    }
     let allSuspectedFilesApproved = true;
-    for (const relativePath of inspection.sensitivePaths) {
+    const approvedSensitivePaths: string[] = [];
+    for (const relativePath of review.inspection.sensitivePaths) {
       const approval = await confirm({
-        message: `Save suspected sensitive file ${relativePath} from ${candidate.name}? Detection is heuristic; the file content remains masked in previews.`,
+        message: `Save suspected sensitive file ${relativePath} from ${review.candidate.name}? Detection is heuristic; the file content remains masked in previews.`,
         initialValue: false,
       });
       if (isCancel(approval)) {
         cancel("Setup cancelled; nothing was saved.");
         return;
       }
-      if (!approval) allSuspectedFilesApproved = false;
+      if (approval) approvedSensitivePaths.push(relativePath);
+      else allSuspectedFilesApproved = false;
     }
     if (!allSuspectedFilesApproved) {
-      log.warn(`${candidate.name} was not selected for saving because a suspected sensitive file was not approved.`);
+      log.warn(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`);
       continue;
     }
     const groupIds = await autocompleteMultiselect({
-      message: `Assign ${candidate.name} to one or more groups`,
+      message: `Assign ${review.candidate.name} to one or more groups`,
       options: groupOptions(catalog.groups),
       required: true,
       placeholder: "Filter groups...",
@@ -252,16 +235,16 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       cancel("Setup cancelled; nothing was saved.");
       return;
     }
-    approvedCandidates.push({ candidate, groupIds });
+    approvedCandidates.push({ review, groupIds, approvedSensitivePaths });
   }
 
   if (approvedCandidates.length === 0) {
     outro("No resources were approved; nothing was saved.");
     return;
   }
-  const summary = approvedCandidates.map(({ candidate, groupIds }) => {
+  const summary = approvedCandidates.map(({ review, groupIds }) => {
     const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? id).join(", ");
-    return `${candidate.name} → ${names}`;
+    return `${review.candidate.name} → ${names}`;
   }).join("\n");
   note(summary, "Resources ready to copy");
   const save = await confirm({
@@ -274,8 +257,8 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
 
   await saveCatalog(libraryDir, catalog);
-  for (const { candidate, groupIds } of approvedCandidates) {
-    await importResource(libraryDir, candidate, { confirmed: true, groupIds });
+  for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
+    await saveReviewedCandidate(libraryDir, review, groupIds, approvedSensitivePaths, true);
   }
   outro(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryDir}.`);
 }
@@ -403,6 +386,11 @@ function formatPlan(plan: ApplyPlan, catalog: Catalog): string {
   return [...lines, ...warnings, ...skipped].join("\n\n") || "No project files need changes.";
 }
 
+export function formatApplyOptionPreview(filePath: string, resourceName: string, option: ApplyFileOption): string {
+  const preview = option.preview.kind === "text" ? option.preview.diff : option.preview.summary;
+  return `${resourceName} → ${filePath}\n${preview}`;
+}
+
 export async function runApplyDryRun(libraryDir: string, groupValue: string, projectDir: string): Promise<void> {
   const catalog = await loadCatalog(libraryDir);
   const group = resolveGroup(catalog, groupValue);
@@ -439,8 +427,12 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
         cancel("Apply cancelled; project files were not changed.");
         return;
       }
+      const selectedOption = file.alternatives.find((option) => option.itemId === selectedItem);
+      if (!selectedOption) throw new Error(`Selected resource is unavailable for ${file.path}.`);
       collisionDecisions[file.path] = selectedItem;
-      sensitive = file.alternatives.find((option) => option.itemId === selectedItem)?.sensitive ?? sensitive;
+      sensitive = selectedOption.sensitive;
+      const selectedName = catalog.items.find((item) => item.id === selectedItem)?.name ?? selectedItem;
+      note(formatApplyOptionPreview(file.path, selectedName, selectedOption), "Selected colliding resource preview");
     }
     let hasExistingFile = file.status === "different";
     if (file.status === "collision") {

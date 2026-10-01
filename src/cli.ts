@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { listSnapshots, loadCatalog } from "./catalog.ts";
@@ -25,7 +26,7 @@ Commands:
 
 Interactive changes require a TTY. Setup searches only locations explicitly selected
 and confirmed in the wizard. Directories named auth are excluded entirely; copied
-authentication-specific code may be missing from copied resources. Named authentication files, .env* files,
+authentication-specific code may be missing from copied resources. Named authentication files and .env* paths,
 and history/cache paths are filtered; secret detection is heuristic and cannot guarantee
 completeness.`);
 }
@@ -92,7 +93,7 @@ export async function main(args = process.argv.slice(2), environment = process.e
   throw new Error(`Unknown command: ${command}. Run copi help for usage.`);
 }
 
-const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : "";
+const invokedPath = process.argv[1] ? pathToFileURL(realpathSync(path.resolve(process.argv[1]))).href : "";
 if (import.meta.url === invokedPath) {
   try {
     process.exitCode = await main();

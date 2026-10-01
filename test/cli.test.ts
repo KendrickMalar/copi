@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -25,8 +25,8 @@ async function sandbox(t: test.TestContext): Promise<Sandbox> {
   return { root, home, agent, project, library: path.join(home, ".copi") };
 }
 
-function runCli(box: Sandbox, args: string[]) {
-  return spawnSync(process.execPath, [path.resolve("dist/src/cli.js"), ...args], {
+function runCli(box: Sandbox, args: string[], entryPoint = path.resolve("dist/src/cli.js")) {
+  return spawnSync(process.execPath, [entryPoint, ...args], {
     cwd: box.project,
     env: { HOME: box.home, PI_CODING_AGENT_DIR: box.agent },
     encoding: "utf8",
@@ -45,6 +45,27 @@ test("help and list are read-only commands under a synthetic home", async (t) =>
   const list = runCli(box, ["list"]);
   assert.equal(list.status, 0, list.stderr);
   assert.match(list.stdout, /no saved snapshots/i);
+  await assert.rejects(readFile(path.join(box.library, "catalog.json")), { code: "ENOENT" });
+});
+
+test("npm-style command symlink starts help, readonly list, and non-TTY guards", async (t) => {
+  const box = await sandbox(t);
+  const binDir = path.join(box.root, "npm-bin");
+  const linkedCommand = path.join(binDir, "copi");
+  await mkdir(binDir);
+  await symlink(path.resolve("dist/src/cli.js"), linkedCommand);
+
+  const help = runCli(box, ["--help"], linkedCommand);
+  assert.equal(help.status, 0, help.stderr);
+  assert.ok(help.stdout.includes("copi — copy and organize"));
+
+  const list = runCli(box, ["list"], linkedCommand);
+  assert.equal(list.status, 0, list.stderr);
+  assert.match(list.stdout, /no saved snapshots/i);
+
+  const setup = runCli(box, ["setup"], linkedCommand);
+  assert.notEqual(setup.status, 0);
+  assert.match(setup.stderr, /interactive|terminal|tty/i);
   await assert.rejects(readFile(path.join(box.library, "catalog.json")), { code: "ENOENT" });
 });
 
