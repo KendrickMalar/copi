@@ -101,9 +101,12 @@ test("backs up replaced bytes and mode privately before applying snapshot bytes 
   assert.equal(await readFile(target, "utf8"), "new executable\n");
   assert.equal((await stat(target)).mode & 0o777, 0o755);
   assert.equal(result.backups.length, 1);
-  assert.equal(await readFile(result.backups[0]!.backupPath, "utf8"), "old content\n");
-  assert.equal((await stat(result.backups[0]!.backupPath)).mode & 0o777, 0o600);
-  assert.equal(result.backups[0]!.mode, 0o640);
+  const backup = result.backups[0]!;
+  assert.equal(await readFile(backup.backupPath, "utf8"), "old content\n");
+  const manifest = JSON.parse(await readFile(path.join(path.dirname(backup.backupPath), "manifest.json"), "utf8")) as Array<{ path: string; backupFile: string; mode: number }>;
+  assert.deepEqual(manifest, [{ path: relative, backupFile: path.basename(backup.backupPath), mode: 0o640 }]);
+  assert.equal((await stat(backup.backupPath)).mode & 0o777, 0o600);
+  assert.equal(backup.mode, 0o640);
 });
 
 test("requires a choice for conflicting group content and applies only the selected snapshot", async (t) => {
@@ -128,13 +131,18 @@ test("requires a choice for conflicting group content and applies only the selec
 test("requires per-file secret approval before writing any selected file", async (t) => {
   const box = await sandbox(t);
   await addSkill(box, { name: "keys", files: { "SKILL.md": "safe\n", "keys.json": '{"apiKey":"sk_live_1234567890abcdef"}\n' } });
+  await rm(path.join(box.sourceRoot, "keys"), { recursive: true });
   const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  const secretFile = plan.files.find((file) => file.path === ".pi/skills/keys/keys.json");
+  assert.ok(secretFile?.preview.kind === "text");
+  assert.ok(!secretFile.preview.diff.includes("sk_live_1234567890abcdef"));
+  assert.ok(secretFile.preview.diff.includes("[REDACTED]"));
   await assert.rejects(executeApply(box.libraryDir, plan, {}), /approval|sensitive|secret/i);
   await assert.rejects(readFile(path.join(box.projectDir, ".pi/skills/keys/SKILL.md")), { code: "ENOENT" });
 
   await executeApply(box.libraryDir, plan, { secretApprovals: [".pi/skills/keys/keys.json"] });
   assert.equal(await readFile(path.join(box.projectDir, ".pi/skills/keys/SKILL.md"), "utf8"), "safe\n");
-  assert.ok((await readFile(path.join(box.projectDir, ".pi/skills/keys/keys.json"), "utf8")).includes("sk_live_1234567890abcdef"));
+  assert.equal(await readFile(path.join(box.projectDir, ".pi/skills/keys/keys.json"), "utf8"), '{"apiKey":"sk_live_1234567890abcdef"}\n');
 });
 
 test("does not apply a global-only item and warns about project-disabled Pi settings without rewriting", async (t) => {
@@ -259,4 +267,53 @@ test("does not apply cached private paths even when present in a stored snapshot
   for (const relative of excludedPaths) {
     await assert.rejects(readFile(path.join(box.projectDir, ".pi/skills/cached", relative)), { code: "ENOENT" });
   }
+});
+
+test("skips env-prefixed, authentication, history, and cache snapshot files while applying supported files", async (t) => {
+  const box = await sandbox(t);
+  const item = await addSkill(box, { name: "env-boundary", files: { "SKILL.md": "portable instructions", "README.md": "keep this support file" } });
+  const catalog = await loadCatalog(box.libraryDir);
+  const saved = catalog.items.find((entry) => entry.id === item.id);
+  assert.ok(saved);
+  const excludedPaths = [
+    "envrc",
+    "env-production",
+    "nested/.env.local",
+    "auth/token.json",
+    "auth.json",
+    "mcp-auth.json",
+    "oauth.json",
+    "history/session.jsonl",
+    ".cache/private.txt",
+    ".npm/cache.json",
+  ];
+  for (const relative of excludedPaths) {
+    const bytes = Buffer.from(`synthetic private data for ${relative}`);
+    const filePath = path.join(box.libraryDir, "items", item.id, "files", ...relative.split("/"));
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, bytes);
+    saved.files.push({ path: relative, mode: 0o600, sha256: createHash("sha256").update(bytes).digest("hex") });
+  }
+  await saveCatalog(box.libraryDir, catalog);
+
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  assert.deepEqual(plan.files.map((file) => file.path), [".pi/skills/env-boundary/README.md", ".pi/skills/env-boundary/SKILL.md"]);
+  assert.ok(excludedPaths.every((relative) => plan.warnings.some((warning) => warning.code === "private-path-skipped" && warning.path === relative)));
+  await executeApply(box.libraryDir, plan, {});
+  assert.equal(await readFile(path.join(box.projectDir, ".pi/skills/env-boundary/README.md"), "utf8"), "keep this support file");
+  for (const relative of excludedPaths) {
+    await assert.rejects(readFile(path.join(box.projectDir, ".pi/skills/env-boundary", relative)), { code: "ENOENT" });
+  }
+});
+
+test("warns when Pi settings contain relative resource references without rewriting their saved bytes", async (t) => {
+  const box = await sandbox(t);
+  const content = '{"skills":["skills/review"],"subagents":{"agentScanDirs":["../agents"]},"packages":[{"source":"./local-package"}],"defaultProjectTrust":"trusted"}';
+  await addSkill(box, { name: "relative-settings", kind: "pi-settings", destination: ".pi/settings.json", files: { "settings.json": content } });
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  assert.ok(plan.warnings.some((warning) => warning.code === "relative-resource-reference" && warning.path === ".pi/settings.json"));
+  assert.ok(plan.warnings.some((warning) => warning.code === "project-setting-restricted"));
+
+  await executeApply(box.libraryDir, plan, {});
+  assert.equal(await readFile(path.join(box.projectDir, ".pi/settings.json"), "utf8"), content);
 });
