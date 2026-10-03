@@ -339,8 +339,11 @@ export async function loadCatalog(libraryDir: string): Promise<Catalog> {
 }
 
 export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
-  assertNoNameConflicts(await loadCatalog(libraryDir));
+  const current = await loadCatalog(libraryDir);
+  assertNoNameConflicts(current);
   assertNoNameConflicts(catalog);
+  // Ordinary group edits must not bypass the snapshot checks used by name-only changes.
+  for (const item of current.items) await readSnapshotFiles(libraryDir, item);
   await writeCatalog(libraryDir, catalog);
 }
 
