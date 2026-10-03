@@ -5,6 +5,7 @@ import path from "node:path";
 import { createTwoFilesPatch } from "diff";
 import { loadCatalog, readSnapshotFiles } from "./catalog.ts";
 import { maskSensitiveText } from "./inspect.ts";
+import { assertNoNameConflicts } from "./names.ts";
 import type { InspectionWarning, SavedItem, SnapshotFileContents } from "./types.ts";
 
 const maxInspectionBytes = 1_000_000;
@@ -261,6 +262,7 @@ function candidateKey(candidate: SnapshotCandidate): string {
 
 export async function planApply(libraryDir: string, groupId: string, projectDir: string): Promise<ApplyPlan> {
   const catalog = await loadCatalog(libraryDir);
+  assertNoNameConflicts(catalog);
   const group = catalog.groups.find((item) => item.id === groupId);
   if (!group) throw new Error(`Unknown group: ${groupId}`);
   const storeRoot = await realpath(libraryDir);
@@ -442,6 +444,7 @@ export async function executeApply(libraryDir: string, plan: ApplyPlan, decision
   const internal = planState.get(plan);
   if (!internal) throw new Error("Apply plan is not a verified plan created by planApply.");
   if (await realpath(libraryDir) !== internal.libraryRoot) throw new Error("Apply plan belongs to a different copi library.");
+  assertNoNameConflicts(await loadCatalog(libraryDir));
   if (await realpath(internal.requestedProjectDir) !== internal.projectRoot) throw new Error("Project destination changed after planning.");
   const operations: WriteOperation[] = [];
   const kept: string[] = [];

@@ -7,6 +7,7 @@ import test from "node:test";
 import { importResource, loadCatalog, saveCatalog } from "../src/catalog.ts";
 import { executeApply, planApply } from "../src/apply.ts";
 import type { ResourceCandidate, ResourceKind } from "../src/types.ts";
+import { addItem, duplicateFixture, sandbox as nameSandbox } from "./helpers/sandbox.ts";
 
 interface Sandbox {
   root: string;
@@ -40,7 +41,7 @@ async function addSkill(box: Sandbox, options: { name: string; content?: string;
   }
   const catalog = await loadCatalog(box.libraryDir);
   if (!catalog.groups.some((group) => group.id === (options.groupId ?? "bundle"))) {
-    catalog.groups.push({ id: options.groupId ?? "bundle", name: "Bundle", itemIds: [] });
+    catalog.groups.push({ id: options.groupId ?? "bundle", name: options.groupId === "second" ? "Second bundle" : "Bundle", itemIds: [] });
   }
   await saveCatalog(box.libraryDir, catalog);
   const candidate: ResourceCandidate = {
@@ -57,6 +58,23 @@ async function addSkill(box: Sandbox, options: { name: string; content?: string;
   assert.ok(item);
   return item;
 }
+
+test("blocks apply for library-wide duplicates and rechecks after planning before any destination write", async (t) => {
+  const box = await nameSandbox(t);
+  const { second } = await duplicateFixture(box);
+  await assert.rejects(planApply(box.libraryDir, "daily", box.projectDir), /duplicate|conflict/i);
+  const catalog = await loadCatalog(box.libraryDir);
+  catalog.items.find((item) => item.id === second.id)!.name = "Separate";
+  catalog.groups[1]!.name = "Review";
+  await writeFile(path.join(box.libraryDir, "catalog.json"), JSON.stringify(catalog));
+  const plan = await planApply(box.libraryDir, "daily", box.projectDir);
+  const third = await addItem(box, "Third");
+  const changed = await loadCatalog(box.libraryDir);
+  changed.items.find((item) => item.id === third.id)!.name = "STRASSE";
+  await writeFile(path.join(box.libraryDir, "catalog.json"), JSON.stringify(changed));
+  await assert.rejects(executeApply(box.libraryDir, plan, { secretApprovals: plan.files.map((file) => file.path) }), /duplicate|conflict/i);
+  for (const file of plan.files) await assert.rejects(readFile(path.join(box.projectDir, file.path)), { code: "ENOENT" });
+});
 
 test("plans from verified snapshots after the source is deleted and masks credential text", async (t) => {
   const box = await sandbox(t);

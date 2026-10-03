@@ -3,9 +3,10 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { importPreparedResource, importResource, listSnapshots, loadCatalog, newCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { importPreparedResource, importResource, listSnapshots, loadCatalog, newCatalog, prepareResource, readPreparedResource, readSnapshotFiles, renameSavedItem, saveCatalog } from "../src/catalog.ts";
 import { inspectPreparedResource, maskSensitiveText } from "../src/inspect.ts";
 import type { ResourceCandidate } from "../src/types.ts";
+import { addItem, duplicateFixture, sandbox } from "./helpers/sandbox.ts";
 
 function skillCandidate(sourceRoot: string, sourcePath: string): ResourceCandidate {
   return {
@@ -19,6 +20,59 @@ function skillCandidate(sourceRoot: string, sourcePath: string): ResourceCandida
     destination: { kind: "project", path: ".pi/skills/portable" },
   };
 }
+
+test("rejects new normalized duplicates across kinds but allows separate item and group namespaces", async (t) => {
+  const box = await sandbox(t);
+  const first = await addItem(box, "Straße");
+  const catalog = await loadCatalog(box.libraryDir);
+  catalog.groups.push({ id: "same", name: " STRASSE ", itemIds: [first.id] });
+  await saveCatalog(box.libraryDir, catalog);
+  const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const sourcePath = path.join(box.sourceRoot, "other.md");
+  await writeFile(sourcePath, "other");
+  await assert.rejects(importResource(box.libraryDir, {
+    ...skillCandidate(box.sourceRoot, sourcePath), kind: "subagent", name: "ＳＴＲＡＳＳＥ",
+  }, { confirmed: true, groupIds: [] }), /duplicate|conflict/i);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+  const second = await addItem(box, " Separate ");
+  assert.equal(second.name, "Separate");
+  await assert.rejects(renameSavedItem(box.libraryDir, second.id, "strasse"), /duplicate|conflict/i);
+});
+
+test("loads existing duplicates, blocks generic saves/imports, and renames only conflict members without changing bytes or identity", async (t) => {
+  const box = await sandbox(t);
+  const unrelated = await addItem(box, "Unrelated");
+  const { first, second } = await duplicateFixture(box);
+  const catalog = await loadCatalog(box.libraryDir);
+  const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+  await assert.rejects(saveCatalog(box.libraryDir, catalog), /duplicate|conflict/i);
+  await assert.rejects(addItem(box, "Third"), /duplicate|conflict/i);
+  await assert.rejects(renameSavedItem(box.libraryDir, unrelated.id, "Changed"), /duplicate|conflict/i);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+  const bytes = await readSnapshotFiles(box.libraryDir, second);
+  const renamed = await renameSavedItem(box.libraryDir, second.id, " Separate ");
+  assert.deepEqual(renamed, { ...second, name: "Separate" });
+  const after = await loadCatalog(box.libraryDir);
+  assert.deepEqual(after.groups, catalog.groups);
+  assert.deepEqual(after.items.find((item) => item.id === first.id), catalog.items.find((item) => item.id === first.id));
+  assert.deepEqual(await readSnapshotFiles(box.libraryDir, renamed), bytes);
+  assert.equal((await listSnapshots(box.libraryDir)).length, 3);
+});
+
+test("rename refuses checksum mismatch and symlinked saved bytes without changing catalog", async (t) => {
+  const box = await sandbox(t);
+  const item = await addItem(box, "Original");
+  const manifest = path.join(box.libraryDir, "catalog.json");
+  const before = await readFile(manifest);
+  const file = path.join(box.libraryDir, "items", item.id, "files", "SKILL.md");
+  await writeFile(file, "tampered");
+  await assert.rejects(renameSavedItem(box.libraryDir, item.id, "New"), /checksum/i);
+  assert.deepEqual(await readFile(manifest), before);
+  await rm(file);
+  await symlink(path.join(item.sourcePath, "SKILL.md"), file);
+  await assert.rejects(renameSavedItem(box.libraryDir, item.id, "New"), /symbolic|unsafe/i);
+  assert.deepEqual(await readFile(manifest), before);
+});
 
 test("stores an owner-only, byte-for-byte skill bundle snapshot and preserves shared group membership after its source is removed", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "copi-catalog-"));

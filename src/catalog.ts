@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { Catalog, Group, InspectionResult, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents } from "./types.ts";
 
 export interface ImportOptions {
@@ -338,6 +339,13 @@ export async function loadCatalog(libraryDir: string): Promise<Catalog> {
 }
 
 export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
+  assertNoNameConflicts(await loadCatalog(libraryDir));
+  assertNoNameConflicts(catalog);
+  await writeCatalog(libraryDir, catalog);
+}
+
+// Only the checked name-only path below can persist conflict resolution.
+async function writeCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
   const validated = parseCatalog(catalog);
   const root = await ensurePrivateDirectory(libraryDir, 0o700);
   const destination = path.join(root, "catalog.json");
@@ -359,6 +367,8 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
 async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[]): Promise<SavedItem> {
   const groupIds = [...new Set(requestedGroupIds)];
   const catalog = await loadCatalog(libraryDir);
+  assertNoNameConflicts(catalog);
+  assertNameAvailable(catalog, "item", candidate.name);
   const groups = new Map(catalog.groups.map((group) => [group.id, group]));
   if (groupIds.some((id) => !groups.has(id))) throw new Error("Cannot import a resource into an unknown group.");
   const root = await ensurePrivateDirectory(libraryDir, 0o700);
@@ -370,7 +380,7 @@ async function storePreparedResource(libraryDir: string, candidate: ResourceCand
     scope: candidate.scope,
     sourcePath: candidate.sourcePath,
     destination: candidate.destination,
-    name: candidate.name,
+    name: candidate.name.trim(),
     savedAt: new Date().toISOString(),
     files: [],
   };
@@ -435,6 +445,50 @@ export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Pr
     results.push({ ...file, bytes });
   }
   return results;
+}
+
+/** Persist staged, explicit name-only changes together, so cancellation never partially resolves names. */
+export async function saveNameChanges(libraryDir: string, before: Catalog, after: Catalog): Promise<void> {
+  const validated = parseCatalog(after);
+  const current = await loadCatalog(libraryDir);
+  if (JSON.stringify(current) !== JSON.stringify(before)) throw new Error("Catalog changed while renaming; reload before trying again.");
+  const restored = structuredClone(validated);
+  const conflicts = findNameConflicts(before);
+  for (const namespace of ["item", "group"] as const) {
+    const previousEntries = namespace === "item" ? before.items : before.groups;
+    const nextEntries = namespace === "item" ? restored.items : restored.groups;
+    if (previousEntries.length !== nextEntries.length) throw new Error("Renaming must preserve catalog entries.");
+    for (const [index, entry] of nextEntries.entries()) {
+      const previous = previousEntries[index];
+      if (!previous || previous.id !== entry.id) throw new Error("Renaming must preserve catalog identifiers and order.");
+      if (entry.name !== previous.name) {
+        if (conflicts.length > 0 && !conflicts.some((conflict) => conflict.namespace === namespace && conflict.ids.includes(entry.id))) {
+          throw new Error("Only conflicting names may change until duplicate names are resolved.");
+        }
+        nameKey(entry.name);
+        const finalEntries = namespace === "item" ? validated.items : validated.groups;
+        if (finalEntries.some((other) => other.id !== entry.id && nameKey(other.name) === nameKey(entry.name))) {
+          throw new Error("Duplicate name; choose a unique display name.");
+        }
+      }
+      entry.name = previous.name;
+    }
+  }
+  if (JSON.stringify(restored) !== JSON.stringify(before)) throw new Error("Renaming must preserve metadata, files, destinations, and group references.");
+  for (const item of before.items) await readSnapshotFiles(libraryDir, item);
+  if (JSON.stringify(await loadCatalog(libraryDir)) !== JSON.stringify(before)) throw new Error("Catalog changed while renaming; reload before trying again.");
+  await writeCatalog(libraryDir, validated);
+}
+
+export async function renameSavedItem(libraryDir: string, itemId: string, name: string): Promise<SavedItem> {
+  const before = await loadCatalog(libraryDir);
+  const after = structuredClone(before);
+  const item = after.items.find((entry) => entry.id === itemId);
+  if (!item) throw new Error("Unknown saved item.");
+  assertNameAvailable(before, "item", name, itemId);
+  item.name = name.trim();
+  await saveNameChanges(libraryDir, before, after);
+  return item;
 }
 
 export async function listSnapshots(libraryDir: string): Promise<SavedItem[]> {

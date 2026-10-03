@@ -1,12 +1,134 @@
-import { chmod, lstat, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildSearchOptions, formatApplyOptionPreview, formatMaskedPreview, prepareCandidateForReview, saveReviewedCandidate } from "../src/wizard.ts";
-import { readSnapshotFiles } from "../src/catalog.ts";
+import { loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
+import { addItem, duplicateFixture, runPty, sandbox } from "./helpers/sandbox.ts";
 import { discoverResources } from "../src/discovery.ts";
 import type { ResourceCandidate } from "../src/types.ts";
+
+function wizardCall(name: string, libraryDir: string, extra = "") {
+  const moduleUrl = new URL("../src/wizard.js", import.meta.url).href;
+  return [process.execPath, "--input-type=module", "-e", `import { ${name} } from ${JSON.stringify(moduleUrl)}; await ${name}(${JSON.stringify(libraryDir)}${extra});`];
+}
+
+test("real conflict resolver stages multiple namespaces and commits only explicit names with identity and bytes preserved", async (t) => {
+  const box = await sandbox(t);
+  const { first, second, catalog } = await duplicateFixture(box);
+  const bytes = await readSnapshotFiles(box.libraryDir, first);
+  const result = await runPty(box, wizardCall("resolveNameConflicts", box.libraryDir), [
+    { waitFor: "Select a conflicting name", send: "\r" },
+    { waitFor: "New name", send: "Distinct item\r" },
+    { waitFor: "Select a conflicting name", send: "\r" },
+    { waitFor: "New name", send: "Distinct group\r" },
+    { waitFor: "Save these name changes", send: "y\r" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  const after = await loadCatalog(box.libraryDir);
+  assert.deepEqual(after.items, catalog.items.map((item) => item.id === first.id ? { ...item, name: "Distinct item" } : item));
+  assert.deepEqual(after.groups, catalog.groups.map((group) => group.id === "daily" ? { ...group, name: "Distinct group" } : group));
+  assert.deepEqual(await readSnapshotFiles(box.libraryDir, first), bytes);
+  assert.equal(after.items.find((item) => item.id === second.id)?.name, " STRASSE ");
+  assert.ok(!result.output.includes(first.id));
+  assert.ok(!result.output.includes("sk_live_syntheticsecret12345"));
+});
+
+for (const stage of ["before", "after one", "confirmation"] as const) {
+  test(`real resolver cancellation ${stage} leaves catalog and bytes unchanged`, async (t) => {
+    const box = await sandbox(t);
+    const { first } = await duplicateFixture(box);
+    const manifest = path.join(box.libraryDir, "catalog.json");
+    const before = await readFile(manifest);
+    const bytes = await readSnapshotFiles(box.libraryDir, first);
+    const actions = stage === "before" ? [{ waitFor: "Select a conflicting name", send: "\u0003" }] : [
+      { waitFor: "Select a conflicting name", send: "\r" },
+      { waitFor: "New name", send: "Distinct item\r" },
+      ...(stage === "after one" ? [{ waitFor: "Select a conflicting name", send: "\u0003" }] : [
+        { waitFor: "Select a conflicting name", send: "\r" },
+        { waitFor: "New name", send: "Distinct group\r" },
+        { waitFor: "Save these name changes", send: "n\r" },
+      ]),
+    ];
+    const result = await runPty(box, wizardCall("resolveNameConflicts", box.libraryDir), actions);
+    assert.equal(result.code, 0, result.output);
+    assert.deepEqual(await readFile(manifest), before);
+    assert.deepEqual(await readSnapshotFiles(box.libraryDir, first), bytes);
+  });
+}
+
+for (const entry of ["runSetup", "runGroupManager"] as const) {
+  test(`${entry} allows masked viewing but not ordinary mutations with unresolved names`, async (t) => {
+    const box = await sandbox(t);
+    const { first } = await duplicateFixture(box);
+    const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+    const extra = entry === "runSetup" ? `, ${JSON.stringify({ homeDir: box.homeDir, agentDir: box.agentDir, projectDir: box.projectDir })}` : "";
+    const result = await runPty(box, wizardCall(entry, box.libraryDir, extra), [
+      { waitFor: "Unresolved names", send: "\r" },
+      { waitFor: "Select saved resource or group", send: "\r" },
+      { waitFor: "Unresolved names", send: "\u001b[B\u001b[B\r" },
+    ]);
+    assert.equal(result.code, 0, result.output);
+    assert.match(result.output, /REDACTED/);
+    assert.ok(!result.output.includes("sk_live_syntheticsecret12345"));
+    assert.ok(!result.output.includes(first.id));
+    assert.ok(!result.output.includes("Create group"));
+    assert.ok(!result.output.includes("Choose the locations"));
+    assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+  });
+}
+
+test("CLI groups connects resolution and rejects an occupied name before staging any change", async (t) => {
+  const box = await sandbox(t);
+  await duplicateFixture(box);
+  const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const result = await runPty(box, [process.execPath, cli, "groups"], [
+    { waitFor: "Unresolved names", send: "\u001b[B\r" },
+    { waitFor: "Select a conflicting name", send: "\r" },
+    { waitFor: "New name", send: "STRASSE\r" },
+    { waitFor: "Duplicate item name", send: "\u0003" },
+    { waitFor: "Unresolved names", send: "\u001b[B\u001b[B\r" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+});
+
+test("CLI groups persists explicit resolution and CLI list/help remain read-only", async (t) => {
+  const box = await sandbox(t);
+  await duplicateFixture(box);
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const resolved = await runPty(box, [process.execPath, cli, "groups"], [
+    { waitFor: "Unresolved names", send: "\u001b[B\r" },
+    { waitFor: "Select a conflicting name", send: "\r" },
+    { waitFor: "New name", send: "Distinct item\r" },
+    { waitFor: "Select a conflicting name", send: "\r" },
+    { waitFor: "New name", send: "Distinct group\r" },
+    { waitFor: "Save these name changes", send: "y\r" },
+  ]);
+  assert.equal(resolved.code, 0, resolved.output);
+  const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+  for (const args of [["list"], []]) {
+    const result = await runPty(box, [process.execPath, cli, ...args], []);
+    assert.equal(result.code, 0, result.output);
+    assert.match(result.output, args.length ? /Distinct item/ : /Usage:/);
+    assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+  }
+});
+
+test("reviewed save path rejects duplicates without mutating catalog", async (t) => {
+  const box = await sandbox(t);
+  const item = await addItem(box, "Original");
+  const candidate: ResourceCandidate = {
+    id: "candidate", kind: "skill", source: "synthetic", scope: "project",
+    sourceRoot: box.sourceRoot, sourcePath: item.sourcePath, name: " ORIGINAL ", destination: item.destination,
+  };
+  const review = await prepareCandidateForReview(candidate);
+  const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+  await assert.rejects(saveReviewedCandidate(box.libraryDir, review, [], ["SKILL.md"], true), /duplicate|conflict/i);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+});
 
 test("project-only setup scopes every discovery root to the explicitly selected project", () => {
   const options = buildSearchOptions(
