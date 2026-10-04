@@ -134,6 +134,7 @@ for(const operation of ["commit","discovery denied"] as const) {
       {waitFor:"Select origin search scope",send:`${down}\r`},{waitFor:"Authorize origin discovery",send:operation==="commit"?"y\r":"n\r"}];
     if(operation==="commit")actions.push({waitFor:"Authorize reading only",send:"y\r"},{waitFor:"Approve this refresh diff",send:"y\r"},{waitFor:"Replace saved copy",send:"y\r"});
     actions.push(finish);const run=await manage(box,actions);assert.equal(run.code,0,run.output);assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+    assert.match(run.output,/Physical HOME:/);assert.ok(run.output.indexOf("Physical HOME:")<run.output.indexOf("Authorize origin discovery"));
     assert.equal(await readFile(box.sourceFile,"utf8"),"npm replacement\n");assert.ok(!run.output.includes(box.item.id));
     if(operation==="commit"){assert.equal(await readFile(box.file,"utf8"),"npm replacement\n");const saved=(await loadCatalog(box.libraryDir)).items[0]!;assert.equal(saved.id,box.item.id);assert.equal(saved.name,box.item.name);assert.deepEqual(saved.destination,box.item.destination);}
     else assert.deepEqual(await refreshCustody(box),before);

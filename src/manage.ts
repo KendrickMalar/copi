@@ -119,11 +119,11 @@ async function refresh(libraryDir: string, catalog: Catalog, item: SavedItem, ro
     if(route==="discover") {
       const scopes = await choose("Select origin search scope",[{value:"project",label:`Current project: ${roots.projectDir}`},{value:"home",label:`HOME and Pi agent directory: ${roots.homeDir} · ${roots.agentDir}`},{value:"both",label:"HOME, Pi agent directory and current project"}],signal);
       const home = scopes!=="project", project = scopes!=="home";
-      show(`Original path: ${requested}\nHOME: ${home?roots.homeDir:"not selected"}\nPi agent: ${home?roots.agentDir:"not selected"}\nProject: ${project?roots.projectDir:"not selected"}\nDiscovery uses existing declarations, exclusions and package checks; no arbitrary node_modules exception is granted.`,"Explicit origin discovery");
-      if(!await yes("Authorize origin discovery only in these selected locations?",signal)) {outro("Origin discovery not authorized; nothing was saved.");return;}
       const options = {...roots,scopes:{home,project}};
       if(home) {options.homeDir=await resolveRefreshPath(roots.homeDir);options.agentDir=await resolveRefreshPath(roots.agentDir);}
       if(project) options.projectDir=await resolveRefreshPath(roots.projectDir);
+      show(`Original path: ${requested}\nHOME: ${home?roots.homeDir:"not selected"}\nPhysical HOME: ${home?options.homeDir:"not selected"}\nPi agent: ${home?roots.agentDir:"not selected"}\nPhysical Pi agent: ${home?options.agentDir:"not selected"}\nProject: ${project?roots.projectDir:"not selected"}\nPhysical project: ${project?options.projectDir:"not selected"}\nDiscovery uses existing declarations, exclusions and package checks; no arbitrary node_modules exception is granted.`,"Explicit origin discovery");
+      if(!await yes("Authorize origin discovery only in these selected locations?",signal)) {outro("Origin discovery not authorized; nothing was saved.");return;}
       source = await discoverRefreshOrigin(item,options);
       if(!source) show("Declared origin is no longer available in the approved locations. Choose another non-excluded source explicitly, or cancel; the saved copy remains available.","Origin unavailable");
     }
