@@ -9,7 +9,7 @@ import { inspectPreparedResource } from "../src/inspect.ts";
 import { findNameConflicts, nameKey } from "../src/names.ts";
 import { foldCaseUnicode17 } from "../src/unicode-case-folding.ts";
 import type { Catalog } from "../src/types.ts";
-import { acceptanceBox, add, assertOnlyNames, candidate, choose, cli, cliPipe, legacy, realPty, renameSteps, secret, treeBytes, wizardArgv, type AcceptanceBox, type Action } from "./helpers/issue2-acceptance.ts";
+import { acceptanceBox, add, assertOnlyNames, candidate, choose, cli, cliPipe, fixtureImportOptions, legacy, realPty, renameSteps, secret, treeBytes, wizardArgv, type AcceptanceBox, type Action } from "./helpers/issue2-acceptance.ts";
 
 // Approved supplement, not expectations computed by the product implementation.
 const boundaries: readonly [string, string, boolean][] = [
@@ -24,17 +24,20 @@ for (const [left, right, same] of boundaries) {
     const box = await acceptanceBox();
     await add(box, left);
     const input = await candidate(box, right, "subagent");
+    const prepared = await prepareResource(input);
+    const inspection = await inspectPreparedResource(prepared);
+    const options = fixtureImportOptions(inspection);
     const before = await treeBytes(box.library);
     const catalog = await loadCatalog(box.library);
     createGroup(catalog, left);
     const inMemory = structuredClone(catalog);
     if (same) {
-      await assert.rejects(importResource(box.library, input, { confirmed: true, groupIds: [] }), /duplicate/i);
+      await assert.rejects(importResource(box.library, input, options), /duplicate/i);
       assert.deepEqual(await treeBytes(box.library), before);
       assert.throws(() => createGroup(catalog, right), /duplicate/i);
       assert.deepEqual(catalog, inMemory);
     } else {
-      assert.ok(await importResource(box.library, input, { confirmed: true, groupIds: [] }));
+      assert.ok(await importResource(box.library, input, options));
       assert.ok(createGroup(catalog, right));
     }
   });
@@ -83,9 +86,10 @@ test("N1 every registration entry rejects collisions across kinds and membership
   const input = await candidate(box, " STRASSE ", "instruction");
   const prepared = await prepareResource(input);
   const inspection = await inspectPreparedResource(prepared);
+  const options = fixtureImportOptions(inspection, [other.id]);
   const before = await treeBytes(box.library);
   const sourceBefore = await treeBytes(box.source);
-  await assert.rejects(importResource(box.library, input, { confirmed: true, groupIds: [other.id] }), /duplicate/i);
+  await assert.rejects(importResource(box.library, input, options), /duplicate/i);
   await assert.rejects(importPreparedResource(box.library, prepared, { confirmed: true, groupIds: [other.id], inspection, approvedSensitivePaths: [...inspection.sensitivePaths] }), /duplicate/i);
   const invalid = structuredClone(catalog);
   invalid.items.push({ ...item, id: "10000000-0000-4000-8000-000000000001", name: "STRASSE" });
@@ -103,7 +107,8 @@ test("N1 rejected empty import and duplicate save do not create a previously abs
   const input = await candidate(box, " \u3000 ");
   const prepared = await prepareResource(input);
   const inspection = await inspectPreparedResource(prepared);
-  await assert.rejects(importResource(box.library, input, { confirmed: true, groupIds: [] }), /empty/i);
+  const options = fixtureImportOptions(inspection);
+  await assert.rejects(importResource(box.library, input, options), /empty/i);
   await assert.rejects(importPreparedResource(box.library, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: [...inspection.sensitivePaths] }), /empty/i);
   const catalog = newCatalog();
   catalog.groups = [{ id: "one", name: "ﬃ", itemIds: [] }, { id: "two", name: "FFI", itemIds: [] }];
@@ -233,7 +238,8 @@ test("N4 unresolved library rejects public mutation APIs including nonconflictin
   const input = await candidate(box, "new unique");
   const prepared = await prepareResource(input);
   const inspection = await inspectPreparedResource(prepared);
-  await expectUnchanged(box, () => importResource(box.library, input, { confirmed: true, groupIds: [] }));
+  const options = fixtureImportOptions(inspection);
+  await expectUnchanged(box, () => importResource(box.library, input, options));
   await expectUnchanged(box, () => importPreparedResource(box.library, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: [...inspection.sensitivePaths] }));
   await expectUnchanged(box, () => renameSavedItem(box.library, safeId, "safe renamed"));
   const changed = structuredClone(before);

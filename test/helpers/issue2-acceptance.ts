@@ -5,7 +5,8 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, writeFile } from "n
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { importResource, loadCatalog, saveCatalog } from "../../src/catalog.ts";
+import { importResource, loadCatalog, prepareResource, saveCatalog, type PreparedInspection } from "../../src/catalog.ts";
+import { inspectPreparedResource } from "../../src/inspect.ts";
 import type { ResourceCandidate, ResourceKind } from "../../src/types.ts";
 
 // No developer HOME, installed CLI, shared prompt mocks, or /tmp planning files.
@@ -33,9 +34,19 @@ export async function candidate(box: AcceptanceBox, name: string, kind: Resource
   return { id: token, name, kind, source: "independent-acceptance", scope: "project", sourceRoot: box.source,
     sourcePath, destination: { kind: "project", path: `.pi/skills/${token}` } };
 }
+export function fixtureImportOptions(inspection: PreparedInspection, groupIds: string[] = []) {
+  // Only this fixture's known, fictional secret is approved, at its concrete file path.
+  // Fail rather than silently approving any newly detected sensitive file.
+  assert.deepEqual(inspection.sensitivePaths, ["SKILL.md"]);
+  return { confirmed: true, groupIds, inspection, approvedSensitivePaths: ["SKILL.md"] };
+}
 export async function add(box: AcceptanceBox, name: string, kind: ResourceKind = "skill") {
   const input = await candidate(box, name, kind);
-  const item = await importResource(box.library, input, { confirmed: true, groupIds: [] });
+  const prepared = await prepareResource(input);
+  const inspection = await inspectPreparedResource(prepared);
+  // A structural variable also compiles against the older ImportOptions contract.
+  const options = fixtureImportOptions(inspection);
+  const item = await importResource(box.library, input, options);
   assert.ok(item);
   return item;
 }
