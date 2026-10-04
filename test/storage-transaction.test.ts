@@ -491,6 +491,71 @@ test("S2 SIGKILL while rollback holds the catalog resumes the checked old state"
   assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "items"]);
 });
 
+test("S2 a forged session with the real nonce still has no issued lease", async (t) => {
+  const box = await transactionFixture(t);
+  const before = await readFile(path.join(box.libraryDir, "catalog.json"));
+  await new StorageTransactions().run(box.libraryDir, false, async (session) => {
+    assert.ok(session);
+    const lock = path.join(session.root, ".copi-transaction");
+    const owner = JSON.parse(await readFile(path.join(lock, "owner.json"), "utf8")) as { token: string };
+    const { StorageSession } = await import("../src/storage-transaction.ts");
+    const forged = new StorageSession(session.root, lock, owner.token);
+    await assert.rejects(forged.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }]), /invalid|session|lease/i);
+  });
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
+  assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
+});
+
+for (const boundary of ["stage-sync", "journal", "before-swap"] as const) {
+  test(`S2 owner nonce changed at ${boundary} is detected before any live rename`, async (t) => {
+    const box = await transactionFixture(t);
+    const catalog = await readFile(path.join(box.libraryDir, "catalog.json"));
+    let changed = false; let live = false;
+    await assert.rejects(kernelCommit(box, async (point, root) => {
+      if (point === "old-renamed") live = true;
+      if (point === boundary && !changed) {
+        changed = true;
+        const file = path.join(root, ".copi-transaction", "owner.json");
+        const owner = JSON.parse(await readFile(file, "utf8")) as Record<string, unknown>;
+        owner.token = randomUUID();
+        await writeFile(file, JSON.stringify(owner));
+      }
+    }), /owner|session|lease/i);
+    assert.ok(changed); assert.equal(live, false);
+    assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalog);
+    assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
+  });
+}
+
+test("S2 an externally recreated lock with identical owner fields is not the issued lock", async (t) => {
+  const box = await transactionFixture(t);
+  let live = false;
+  await assert.rejects(kernelCommit(box, async (point, root) => {
+    if (point === "old-renamed") live = true;
+    if (point === "journal") {
+      const lock = path.join(root, ".copi-transaction");
+      const owner = await readFile(path.join(lock, "owner.json"));
+      const { rename } = await import("node:fs/promises");
+      await rename(lock, path.join(box.root, "held-issued-lock"));
+      await mkdir(lock, { mode: 0o700 });
+      await writeFile(path.join(lock, "owner.json"), owner, { mode: 0o600 });
+    }
+  }), /lock|directory|changed|lease/i);
+  assert.equal(live, false);
+  assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
+  assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction")));
+  assert.ok(await lstat(path.join(box.root, "held-issued-lock")));
+});
+
+test("S2 callback expiry also revokes capture and recovery entry points", async (t) => {
+  const box = await transactionFixture(t);
+  const session = await new StorageTransactions().run(box.libraryDir, false, async (issued) => { assert.ok(issued); return issued; });
+  await assert.rejects(session.capture(), /expired|session|lease/i);
+  await assert.rejects(session.recover(true), /expired|session|lease/i);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+  assert.equal((await readSnapshotFiles(box.libraryDir, box.item))[0]!.bytes.toString(), "old snapshot\n");
+});
+
 test("S5 raw storage approval requires boolean true as well as the authenticated review", async (t) => {
   const box = await transactionFixture(t);
   box.files[0]!.bytes = Buffer.from("apiKey=sk_live_kernelapproved123456\n");

@@ -25,6 +25,14 @@ export interface StorageRevision { readonly root: string; readonly catalog: stri
 export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-held" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "rollback-catalog-held" | "finalized" | "rollback-finalized";
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
 interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean }
+interface DirectoryIdentity { dev: number; ino: number }
+interface SessionLease {
+  root: string; lock: string; owner: Owner;
+  rootIdentity: DirectoryIdentity; lockIdentity: DirectoryIdentity;
+  recoveryClaim?: { path: string; identity: DirectoryIdentity };
+}
+// Only run/recoverDead issue leases. Public constructor calls cannot register themselves.
+const sessionLeases = new WeakMap<StorageSession, SessionLease>();
 interface JournalOperation { itemId: string; oldTree: string | null; newTree: string }
 interface Journal { version: 1; root: string; token: string; oldCatalog: string | null; newCatalog: string; operations: JournalOperation[] }
 
@@ -207,16 +215,53 @@ function alive(owner: Owner): boolean {
   }
 }
 async function readOwner(lock: string): Promise<Owner> {
-  await checkedDirectory(lock);
+  await directoryIdentity(lock);
   const bytes = await checkedFile(path.join(lock, "owner.json"));
   try { return ownerFrom(bytes ? JSON.parse(bytes.toString("utf8")) as unknown : null); } catch (error) { throw new Error("Copi transaction lock owner is missing or malformed; inspect the lock before recovery.", { cause: error }); }
 }
 
+async function directoryIdentity(target: string): Promise<DirectoryIdentity> {
+  const stat = await statMaybe(target);
+  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Copi session directory is missing, unsafe, or a symbolic link; refusing mutation or cleanup.");
+  return { dev: stat.dev, ino: stat.ino };
+}
 async function storageDirectories(root: string, lock: string, checkItems = true): Promise<void> {
-  await checkedDirectory(root);
+  await directoryIdentity(root);
   if (await realpath(root) !== root) throw new Error("Copi storage root changed through a symbolic link.");
-  await checkedDirectory(lock);
+  await directoryIdentity(lock);
   if (checkItems) await checkedDirectory(path.join(root, "items"));
+}
+function sameDirectory(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+async function issueSessionLease(session: StorageSession, root: string, lock: string, owner: Owner, claim?: string): Promise<SessionLease> {
+  const lease: SessionLease = {
+    root, lock, owner: { ...owner },
+    rootIdentity: await directoryIdentity(root), lockIdentity: await directoryIdentity(lock),
+    ...(claim ? { recoveryClaim: { path: claim, identity: await directoryIdentity(claim) } } : {}),
+  };
+  await assertLeaseOwner(lease);
+  sessionLeases.set(session, lease);
+  return lease;
+}
+async function assertLeaseOwner(lease: SessionLease): Promise<void> {
+  await storageDirectories(lease.root, lease.lock, false);
+  if (!sameDirectory(await directoryIdentity(lease.root), lease.rootIdentity) || !sameDirectory(await directoryIdentity(lease.lock), lease.lockIdentity)) throw new Error("Copi session root or lock directory changed; refusing mutation or cleanup.");
+  const actual = await readOwner(lease.lock);
+  if (actual.pid !== lease.owner.pid || actual.host !== lease.owner.host || actual.token !== lease.owner.token || actual.blocked !== lease.owner.blocked) throw new Error("Copi session lock owner changed; refusing mutation or cleanup.");
+  if (lease.recoveryClaim) {
+    if (!sameDirectory(await directoryIdentity(lease.recoveryClaim.path), lease.recoveryClaim.identity) || alive(actual)) throw new Error("Copi recovery lease changed or its previous owner is active; refusing recovery.");
+  } else if (actual.pid !== process.pid || actual.host !== os.hostname()) throw new Error("Copi session does not belong to this process and host.");
+}
+async function stageParent(filesRoot: string, filePath: string): Promise<string> {
+  await directoryIdentity(filesRoot);
+  let parent = filesRoot;
+  for (const segment of filePath.split("/").slice(0, -1)) {
+    const next = path.join(parent, segment);
+    if (!await checkedDirectory(next)) await mkdir(next, { mode: 0o700 });
+    parent = next;
+  }
+  return parent;
 }
 
 /** @internal Generalized fixed-byte persistence adapter. Inspection/approval are enforced here too; instance-bound faults cannot disable checks. */
@@ -256,10 +301,10 @@ export class StorageTransactions {
       }
     }
     const session = new StorageSession(root, lock, owner.token, this.options.checkpoint);
+    const lease = await issueSessionLease(session, root, lock, owner);
     try { return await operation(session); } finally {
-      await storageDirectories(root, lock, false);
-      const actual = await readOwner(lock);
-      if (actual.token !== owner.token) throw new Error("Copi transaction lock owner changed; refusing cleanup.");
+      sessionLeases.delete(session); // Revoke before releasing or inspecting the lock for cleanup.
+      await assertLeaseOwner(lease);
       if (await statMaybe(path.join(lock, "journal.json"))) {
         // A failed recovery deliberately retains all evidence, and prevents readers seeing mixed state.
         const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
@@ -270,32 +315,53 @@ export class StorageTransactions {
   private async recoverDead(root: string, expected: Owner): Promise<void> {
     const claim = path.join(root, `${lockName}-recovery`);
     try { await mkdir(claim, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return; throw error; }
+    const rootIdentity = await directoryIdentity(root);
+    const claimIdentity = await directoryIdentity(claim);
     try {
       const lock = path.join(root, lockName);
       const current = await readOwner(lock);
       if (current.token !== expected.token || alive(current)) return;
       const session = new StorageSession(root, lock, current.token);
-      await session.recover(false);
-      await rm(lock, { recursive: true });
-      await syncDirectory(root);
-    } finally { await rm(claim, { recursive: true }); }
+      const lease = await issueSessionLease(session, root, lock, current, claim);
+      try {
+        await session.recover(false);
+        await assertLeaseOwner(lease);
+        await rm(lock, { recursive: true });
+        await syncDirectory(root);
+      } finally { sessionLeases.delete(session); }
+    } finally {
+      if (await realpath(root) !== root || !sameDirectory(await directoryIdentity(root), rootIdentity) || !sameDirectory(await directoryIdentity(claim), claimIdentity)) throw new Error("Copi recovery claim or root changed; refusing cleanup.");
+      await rm(claim, { recursive: true });
+    }
   }
 }
 
 export class StorageSession {
   constructor(readonly root: string, private readonly lock: string, private readonly token: string, private readonly checkpoint?: StorageOptions["checkpoint"]) {}
+  private async assertLease(checkItems = true): Promise<void> {
+    const lease = sessionLeases.get(this);
+    if (!lease) throw new Error("Invalid or expired copi storage session; use the issued session inside its run callback.");
+    if (this.root !== lease.root || this.lock !== lease.lock || this.token !== lease.owner.token) throw new Error("Copi session identity changed; refusing mutation.");
+    await assertLeaseOwner(lease);
+    if (checkItems) await checkedDirectory(path.join(this.root, "items"));
+    if (sessionLeases.get(this) !== lease) throw new Error("Copi storage session expired while checking its lease.");
+  }
   async capture(): Promise<StorageRevision> {
+    await this.assertLease(false);
     const catalog = await checkedFile(path.join(this.root, "catalog.json"));
-    return Object.freeze({ root: this.root, catalog: catalog?.toString("base64") ?? null, tree: await tree(path.join(this.root, "items")) ?? "absent" });
+    const revision = Object.freeze({ root: this.root, catalog: catalog?.toString("base64") ?? null, tree: await tree(path.join(this.root, "items")) ?? "absent" });
+    await this.assertLease(false);
+    return revision;
   }
   async assertRevision(expected: StorageRevision): Promise<void> {
     if (JSON.stringify(await this.capture()) !== JSON.stringify(expected)) throw new Error("Copi library changed after preparation (catalog or saved bytes); reload and review before retrying. A manual checksum mismatch must not be repaired automatically.");
   }
   async commit(expected: StorageRevision, catalog: Buffer, replacements: readonly StorageReplacement[] = [], authorization?: StorageAuthorization): Promise<void> {
+    await this.assertLease();
     const prepared = approvedStorage(catalog, replacements, authorization);
     catalog = prepared.catalog;
     replacements = prepared.replacements;
-    await storageDirectories(this.root, this.lock);
+    await this.assertLease();
     await this.assertRevision(expected);
     const previous = expected.catalog === null ? { version: 1 as const, items: [], groups: [] } : parseStoredCatalog(JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown);
     const next = parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown);
@@ -307,17 +373,21 @@ export class StorageSession {
       const target = path.join(this.root, "items", replacement.itemId);
       if (await statMaybe(target)) await checkedDirectory(target);
       const stage = path.join(this.lock, `next-${index}`);
-      await mkdir(path.join(stage, "files"), { recursive: true, mode: 0o700 });
+      await this.assertLease();
+      await mkdir(stage, { mode: 0o700 });
+      await mkdir(path.join(stage, "files"), { mode: 0o700 });
       for (const file of replacement.files) {
-        await storageDirectories(this.root, this.lock);
+        await this.assertLease();
         if (!safeStoragePath(file.path)) throw new Error("Unsafe relative snapshot path.");
-        const parent = path.join(stage, "files", path.posix.dirname(file.path));
-        await mkdir(parent, { recursive: true, mode: 0o700 });
+        const parent = await stageParent(path.join(stage, "files"), file.path);
+        await this.assertLease();
         const handle = await open(path.join(parent, path.posix.basename(file.path)), "wx", 0o600);
         try {
           await handle.writeFile(file.bytes);
           await this.checkpoint?.("stage-write", this.root);
+          await this.assertLease();
           await this.checkpoint?.("stage-sync", this.root);
+          await this.assertLease();
           await handle.sync();
         } finally { await handle.close(); }
         const stored = await checkedFile(path.join(parent, path.posix.basename(file.path)));
@@ -325,15 +395,19 @@ export class StorageSession {
       }
       operations.push({ itemId: replacement.itemId, oldTree: await tree(target), newTree: (await tree(stage))! });
     }
+    await this.assertLease();
     const catalogHandle = await open(path.join(this.lock, "next-catalog"), "wx", 0o600);
     try {
       await catalogHandle.writeFile(catalog);
       await this.checkpoint?.("stage-write", this.root);
+      await this.assertLease();
       await this.checkpoint?.("stage-sync", this.root);
+      await this.assertLease();
       await catalogHandle.sync();
     } finally { await catalogHandle.close(); }
     const stagedCatalog = await checkedFile(path.join(this.lock, "next-catalog"));
     if (!stagedCatalog || !stagedCatalog.equals(catalog)) throw new Error("Staged catalog changed before commit; refusing live snapshot renames.");
+    await this.assertLease();
     if (expected.catalog !== null) await writePrivate(path.join(this.lock, "old-catalog"), Buffer.from(expected.catalog, "base64"));
     const journal: Journal = { version: 1, root: this.root, token: this.token, oldCatalog: expected.catalog === null ? null : hash(Buffer.from(expected.catalog, "base64")), newCatalog: hash(catalog), operations };
     await writePrivate(path.join(this.lock, "journal.tmp"), JSON.stringify(journal));
@@ -342,7 +416,7 @@ export class StorageSession {
     await syncDirectory(this.lock);
     try {
       await this.checkpoint?.("journal", this.root);
-      await storageDirectories(this.root, this.lock);
+      await this.assertLease();
       const writtenJournal = await checkedFile(path.join(this.lock, "journal.json"));
       const writtenDigest = await checkedFile(path.join(this.lock, "journal.digest"));
       if (!writtenJournal || hash(writtenJournal) !== hash(JSON.stringify(journal)) || writtenDigest?.toString("utf8") !== hash(writtenJournal)) throw new Error("Transaction journal changed before commit; refusing snapshot renames.");
@@ -352,19 +426,20 @@ export class StorageSession {
       for (const [index, operation] of operations.entries()) {
         const target = path.join(this.root, "items", operation.itemId);
         await this.checkpoint?.("before-swap", this.root);
-        await storageDirectories(this.root, this.lock);
+        await this.assertLease();
         if (await tree(target) !== operation.oldTree) throw new Error("Saved snapshot changed during commit; refusing overwrite.");
         if (operation.oldTree !== null) await rename(target, path.join(this.lock, `old-${index}`));
         await this.checkpoint?.("old-renamed", this.root);
-        await storageDirectories(this.root, this.lock);
+        await this.assertLease();
         if (await tree(path.join(this.lock, `old-${index}`)) !== operation.oldTree) throw new Error("Original saved bytes changed in the moved snapshot; retained external bytes instead of deleting them.");
         if (await statMaybe(target)) throw new Error("An external file appeared during commit; refusing overwrite.");
         if (await tree(path.join(this.lock, `next-${index}`)) !== operation.newTree) throw new Error("Staged bytes changed during commit; refusing save.");
         await rename(path.join(this.lock, `next-${index}`), target);
         await this.checkpoint?.("new-renamed", this.root);
+        await this.assertLease();
       }
       await this.checkpoint?.("before-catalog", this.root);
-      await storageDirectories(this.root, this.lock);
+      await this.assertLease();
       if (await tree(path.join(this.root, "items")) !== expectedNextTree) throw new Error("Saved bytes or another item changed during commit; refusing catalog update.");
       const actual = await checkedFile(path.join(this.root, "catalog.json"));
       if ((actual ? hash(actual) : null) !== journal.oldCatalog) throw new Error("Catalog changed during commit; refusing overwrite.");
@@ -376,17 +451,19 @@ export class StorageSession {
       if (await statMaybe(held)) throw new Error("Unexpected held catalog; refusing overwrite.");
       if (actual) await rename(destination, held);
       await this.checkpoint?.("catalog-held", this.root);
-      await storageDirectories(this.root, this.lock);
+      await this.assertLease();
       const original = await checkedFile(held);
       if ((original ? hash(original) : null) !== journal.oldCatalog) throw new Error("Original catalog changed in its held inode; retained external bytes instead of deleting them.");
       // link() atomically refuses an externally recreated catalog.json; rename() could overwrite it.
       await link(path.join(this.lock, "next-catalog"), destination);
       await this.checkpoint?.("catalog-renamed", this.root);
+      await this.assertLease();
       await this.checkpoint?.("directory-sync", this.root);
-      await storageDirectories(this.root, this.lock);
+      await this.assertLease();
       if (operations.length > 0) await syncDirectory(path.join(this.root, "items"));
       await syncDirectory(this.root);
       await this.checkpoint?.("committed", this.root);
+      await this.assertLease();
       if (await tree(path.join(this.root, "items")) !== expectedNextTree || hash((await checkedFile(path.join(this.root, "catalog.json")))!) !== journal.newCatalog) throw new Error("Saved library changed during commit finalization.");
       await this.assertOldSnapshots(operations);
       const originalAtFinish = await checkedFile(held);
@@ -423,7 +500,7 @@ export class StorageSession {
     return true;
   }
   async recover(rollback: boolean): Promise<void> {
-    await storageDirectories(this.root, this.lock);
+    await this.assertLease();
     const raw = await checkedFile(path.join(this.lock, "journal.json"));
     if (!raw) {
       if (await this.verifyFinalized()) return;
@@ -472,7 +549,7 @@ export class StorageSession {
     if (!rollbackMarker) { await writePrivate(path.join(this.lock, "rollback.json"), this.token); await syncDirectory(this.lock); }
     await this.checkpoint?.("rollback-started", this.root);
     for (const [index, operation] of journal.operations.entries()) {
-      await storageDirectories(this.root, this.lock);
+      await this.assertLease();
       const target = path.join(this.root, "items", operation.itemId);
       const current = await tree(target);
       if (current === operation.oldTree) continue;
@@ -482,7 +559,7 @@ export class StorageSession {
         if (await tree(path.join(this.lock, `displaced-${index}`)) !== operation.newTree) throw new Error("Snapshot changed externally during rollback; retained bytes instead of deleting them.");
         await this.checkpoint?.("rollback-displaced", this.root);
       }
-      await storageDirectories(this.root, this.lock);
+      await this.assertLease();
       if (await statMaybe(target)) throw new Error("An external snapshot appeared during rollback; refusing overwrite.");
       if (operation.oldTree !== null) {
         const original = path.join(this.lock, `old-${index}`);
@@ -490,7 +567,9 @@ export class StorageSession {
         await rename(original, target);
       }
       await this.checkpoint?.("rollback-restored", this.root);
+      await this.assertLease();
     }
+    await this.assertLease();
     if (committed) {
       const destination = path.join(this.root, "catalog.json");
       await rename(destination, path.join(this.lock, "displaced-catalog"));
@@ -500,7 +579,7 @@ export class StorageSession {
     }
     if (committed || catalogInTransit) {
       if (oldCatalog) {
-        await storageDirectories(this.root, this.lock);
+        await this.assertLease();
         const original = await checkedFile(heldPath);
         if (!original || hash(original) !== journal.oldCatalog) throw new Error("Original held catalog is missing or altered.");
         await link(heldPath, path.join(this.root, "catalog.json"));
