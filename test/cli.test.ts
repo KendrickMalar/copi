@@ -82,6 +82,44 @@ test("non-interactive mutations stop before creating the library", async (t) => 
   await assert.rejects(readFile(path.join(box.library, "catalog.json")), { code: "ENOENT" });
 });
 
+test("manage rejects non-TTY before creating a library, including npm-style symlink entry", async (t) => {
+  const box = await sandbox(t);
+  const linked = path.join(box.root, "copi");
+  await symlink(path.resolve("dist/src/cli.js"), linked);
+  for (const entry of [path.resolve("dist/src/cli.js"), linked]) {
+    const result = runCli(box, ["manage"], entry);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /manage.*TTY|TTY.*manage/i);
+    await assert.rejects(readFile(path.join(box.library, "catalog.json")), { code: "ENOENT" });
+  }
+  assert.match(runCli(box, []).stdout, /manage/);
+});
+
+test("list and non-TTY groups display names/kind/destination without internal UUIDs", async (t) => {
+  const box = await sandbox(t);
+  const source = path.join(box.root, "source.md");
+  await writeFile(source, "ordinary text\n");
+  const catalog = newCatalog();
+  const groupId = "9f2a4d22-eeba-43d3-b7d4-1325234a197f";
+  catalog.groups.push({ id: groupId, name: "Named group", itemIds: [] });
+  await saveCatalog(box.library, catalog);
+  const item = await importResource(box.library, {
+    id: "source", name: "Named resource", kind: "instruction", source: "test", scope: "project",
+    sourceRoot: box.root, sourcePath: source, destination: { kind: "project", path: "AGENTS.md" },
+  }, { confirmed: true, groupIds: [groupId] });
+  assert.ok(item);
+  const before = await readFile(path.join(box.library, "catalog.json"));
+  for (const command of ["list", "groups", "manage"]) {
+    const run = runCli(box, [command]);
+    assert.equal(run.status, command === "manage" ? 1 : 0, run.stderr);
+    assert.ok(!run.stdout.includes(item.id));
+    assert.ok(!run.stdout.includes(groupId));
+    if (command === "list") { assert.match(run.stdout, /Named resource/); assert.match(run.stdout, /AGENTS.md/); }
+    if (command === "groups") assert.match(run.stdout, /Named group/);
+    assert.deepEqual(await readFile(path.join(box.library, "catalog.json")), before);
+  }
+});
+
 test("apply --dry-run displays masked plans without changing the synthetic project", async (t) => {
   const box = await sandbox(t);
   const sourceRoot = path.join(box.root, "synthetic-source");

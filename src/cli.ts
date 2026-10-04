@@ -3,13 +3,15 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { listSnapshots, loadCatalog } from "./catalog.ts";
-import { printGroups, printItems, runApplyDryRun, runApplyWizard, runGroupManager, runSetup } from "./wizard.ts";
+import { printGroups, printItems, runApplyDryRun, runApplyWizard, runGroupManager, runSetup, safeDisplay } from "./wizard.ts";
+import { runManage } from "./manage.ts";
 
 function usage(): void {
   process.stdout.write(`copi — copy and organize reusable Pi coding-agent resources
 
 Usage:
   copi setup
+  copi manage
   copi groups
   copi list
   copi apply <group> [target]
@@ -18,6 +20,7 @@ Usage:
 
 Commands:
   setup              Search explicitly selected locations and save copied resources
+  manage             Select saved copies by name; masked view, edit, rename, groups, apply
   groups             Manage groups interactively; without a TTY, list groups only
   list               List saved snapshots without modifying the library
   apply <group>      Review and apply one group to the current directory or target
@@ -59,6 +62,12 @@ export async function main(args = process.argv.slice(2), environment = process.e
     : path.join(homeDir || requireHome(environment), ".pi", "agent");
   const projectDir = path.resolve(cwd);
 
+  if (command === "manage") {
+    if (rest.length > 0) throw new Error("manage does not accept positional arguments.");
+    if (!isInteractive()) throw new Error("manage requires an interactive stdin/stdout TTY; no library was created or searched.");
+    await runManage(libraryDir, { homeDir, agentDir, projectDir });
+    return 0;
+  }
   if (command === "setup") {
     if (rest.length > 0) throw new Error("setup does not accept positional arguments.");
     if (!isInteractive()) throw new Error("setup requires an interactive TTY; no search was performed.");
@@ -99,7 +108,7 @@ if (import.meta.url === invokedPath) {
     process.exitCode = await main();
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unexpected error.";
-    console.error(`copi: ${message}`);
+    console.error(`copi: ${safeDisplay(message)}`);
     process.exitCode = 1;
   }
 }

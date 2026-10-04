@@ -1,4 +1,4 @@
-import { autocompleteMultiselect, cancel, confirm, intro, isCancel, log, note, outro, select, text } from "@clack/prompts";
+import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, text as clackText } from "@clack/prompts";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
@@ -9,6 +9,54 @@ import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey 
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
 import type { Catalog, Group, ResourceCandidate, SavedItem } from "./types.ts";
+
+/** Mask display metadata too, and render controls literally rather than executing VT sequences. */
+export function safeDisplay(value: string): string {
+  return maskSensitiveText(value)
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "[internal reference]")
+    .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g,
+      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+let activeSignal: AbortSignal | undefined;
+function inheritedSignal(signal?: AbortSignal): { signal?: AbortSignal } {
+  const current = signal ?? activeSignal;
+  return current ? { signal: current } : {};
+}
+const select: typeof clackSelect = (options) => clackSelect({
+  ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message),
+  options: options.options.map((option) => ({ ...option, label: safeDisplay(option.label ?? "Unavailable entry"), ...(option.hint === undefined ? {} : { hint: safeDisplay(option.hint) }) })),
+});
+const autocompleteMultiselect: typeof clackMultiselect = (options) => clackMultiselect({
+  ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message),
+  options: typeof options.options === "function" ? options.options : options.options.map((option) => ({ ...option, label: safeDisplay(option.label ?? "Unavailable entry"), ...(option.hint === undefined ? {} : { hint: safeDisplay(option.hint) }) })),
+});
+const text: typeof clackText = (options) => clackText({ ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message) });
+const confirm: typeof clackConfirm = (options) => clackConfirm({ ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message) });
+const note: typeof clackNote = (message, title, options) => clackNote(safeDisplay(message ?? ""), safeDisplay(title ?? ""), options);
+const intro: typeof clackIntro = (message, options) => clackIntro(safeDisplay(message ?? ""), options);
+const outro: typeof clackOutro = (message, options) => clackOutro(safeDisplay(message ?? ""), options);
+const cancel: typeof clackCancel = (message, options) => clackCancel(safeDisplay(message ?? ""), options);
+
+/** One process-wide interactive lifecycle shared by manage and its existing wizard routes. */
+export async function withWizardLifecycle(operation: (signal: AbortSignal) => Promise<void>): Promise<void> {
+  if (activeSignal) throw new Error("An interactive wizard is already active.");
+  const controller = new AbortController();
+  const wasRaw = Boolean(process.stdin.isRaw), wasPaused = process.stdin.isPaused();
+  const abort = () => controller.abort();
+  const eofKey = (chunk: Buffer | string) => { if (typeof chunk === "string" ? chunk.includes("\u0004") : chunk.includes(4)) abort(); };
+  activeSignal = controller.signal;
+  process.stdin.on("end", abort); process.stdin.on("close", abort); process.stdin.on("error", abort); process.stdin.on("data", eofKey);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, abort);
+  try { await operation(controller.signal); }
+  finally {
+    activeSignal = undefined;
+    process.stdin.off("end", abort); process.stdin.off("close", abort); process.stdin.off("error", abort); process.stdin.off("data", eofKey);
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, abort);
+    if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw);
+    if (wasPaused) process.stdin.pause();
+    process.stdout.write("\u001b[?25h");
+  }
+}
 
 const previewMaxBytes = 1_000_000;
 const previewMaxFiles = 12;
@@ -38,7 +86,7 @@ export function formatMaskedPreview(relativePath: string, content: string): stri
   const lines = masked.split(/\r?\n/);
   const snippet = lines.slice(0, previewMaxLines).join("\n").slice(0, 2_000);
   const omitted = lines.length > previewMaxLines ? `\n… ${lines.length - previewMaxLines} more lines` : "";
-  return `${relativePath}:\n${snippet}${omitted}`;
+  return safeDisplay(`${relativePath}:\n${snippet}${omitted}`);
 }
 
 function formatPreparedFiles(files: readonly PreparedFile[]): string[] {
@@ -347,7 +395,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       else allSuspectedFilesApproved = false;
     }
     if (!allSuspectedFilesApproved) {
-      log.warn(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`);
+      log.warn(safeDisplay(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`));
       continue;
     }
     const groupIds = await autocompleteMultiselect({
@@ -368,7 +416,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     return;
   }
   const summary = approvedCandidates.map(({ review, groupIds }) => {
-    const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? id).join(", ");
+    const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? "Unavailable group").join(", ");
     return `${review.candidate.name} → ${names}`;
   }).join("\n");
   note(summary, "Resources ready to copy");
@@ -483,7 +531,7 @@ export function printGroups(catalog: Catalog): void {
     process.stdout.write("No saved groups.\n");
     return;
   }
-  for (const group of catalog.groups) process.stdout.write(`${group.name} (${group.id}) — ${group.itemIds.length} resource(s)\n`);
+  for (const group of catalog.groups) process.stdout.write(`${safeDisplay(group.name)} — ${group.itemIds.length} resource(s)\n`);
 }
 
 export function printItems(items: SavedItem[]): void {
@@ -492,16 +540,16 @@ export function printItems(items: SavedItem[]): void {
     return;
   }
   for (const item of items) {
-    process.stdout.write(`${item.name} [${item.kind}] (${item.id}) — ${item.files.length} file(s), ${item.destination.kind === "global-only" ? "saved only" : item.destination.path}\n`);
+    process.stdout.write(`${safeDisplay(item.name)} [${item.kind}] — ${item.files.length} file(s), ${safeDisplay(item.destination.kind === "global-only" ? "saved only" : item.destination.path)}\n`);
   }
 }
 
 function resolveGroup(catalog: Catalog, value: string): Group {
   const matching = catalog.groups.filter((group) => group.id === value || group.name === value);
-  if (matching.length === 0) throw new Error(`Unknown group: ${value}`);
-  if (matching.length > 1) throw new Error(`Group name is ambiguous: ${value}; use a group ID.`);
+  if (matching.length === 0) throw new Error("Unknown group; select a saved group with copi manage.");
+  if (matching.length > 1) throw new Error("Group name is ambiguous; resolve name conflicts with copi manage.");
   const group = matching[0];
-  if (!group) throw new Error(`Unknown group: ${value}`);
+  if (!group) throw new Error("Selected group is unavailable.");
   return group;
 }
 
@@ -511,18 +559,18 @@ function formatPlan(plan: ApplyPlan, catalog: Catalog): string {
     const mark = file.alternatives.some((option) => option.sensitive) ? " [suspected secret; approval required]" : "";
     const preview = file.preview.kind === "text" ? `\n${file.preview.diff}` : `\n${file.preview.summary}`;
     const alternatives = file.alternatives.length > 1
-      ? `\n  candidates: ${file.alternatives.map((option) => itemNames.get(option.itemId) ?? option.itemId).join(", ")}`
+      ? `\n  candidates: ${file.alternatives.map((option) => itemNames.get(option.itemId) ?? "Unavailable resource").join(", ")}`
       : "";
     return `${file.status}: ${file.path}${mark}${alternatives}${preview}`;
   });
   const warnings = plan.warnings.map((warning) => `warning${warning.path ? ` ${warning.path}` : ""}: ${warning.message}`);
-  const skipped = plan.skippedItems.map((id) => `save-only resource skipped from apply: ${itemNames.get(id) ?? id}`);
+  const skipped = plan.skippedItems.map((id) => `save-only resource skipped from apply: ${itemNames.get(id) ?? "Unavailable resource"}`);
   return [...lines, ...warnings, ...skipped].join("\n\n") || "No project files need changes.";
 }
 
 export function formatApplyOptionPreview(filePath: string, resourceName: string, option: ApplyFileOption): string {
   const preview = option.preview.kind === "text" ? option.preview.diff : option.preview.summary;
-  return `${resourceName} → ${filePath}\n${preview}`;
+  return safeDisplay(`${resourceName} → ${filePath}\n${preview}`);
 }
 
 export async function runApplyDryRun(libraryDir: string, groupValue: string, projectDir: string): Promise<void> {
@@ -553,7 +601,7 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
         message: `Choose one resource for colliding path ${file.path}`,
         options: file.alternatives.map((option) => ({
           value: option.itemId,
-          label: catalog.items.find((item) => item.id === option.itemId)?.name ?? option.itemId,
+          label: catalog.items.find((item) => item.id === option.itemId)?.name ?? "Unavailable resource",
           hint: option.preview.kind === "text" ? "masked text diff available" : option.preview.summary,
         })),
       });
@@ -565,7 +613,7 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
       if (!selectedOption) throw new Error(`Selected resource is unavailable for ${file.path}.`);
       collisionDecisions[file.path] = selectedItem;
       sensitive = selectedOption.sensitive;
-      const selectedName = catalog.items.find((item) => item.id === selectedItem)?.name ?? selectedItem;
+      const selectedName = catalog.items.find((item) => item.id === selectedItem)?.name ?? "Unavailable resource";
       note(formatApplyOptionPreview(file.path, selectedName, selectedOption), "Selected colliding resource preview");
     }
     let hasExistingFile = file.status === "different";
