@@ -338,3 +338,59 @@ test("F3 literal pasted control bytes survive manage review/commit while standal
   assert.deepEqual(await readFile(box.sourceFile),before.source);
   assert.match(run.output,/\\u0004/); assert.match(run.output,/\\u0003/); assert.match(run.output,/\\u0013/);
 });
+
+test("F5 real TTY CLI malformed catalog before any input exits naturally with reason and unchanged bytes",async(t)=>{
+  const box=await sandbox(t); await mkdir(box.libraryDir);
+  const catalogPath=path.join(box.libraryDir,"catalog.json"),bytes=Buffer.from("independent malformed early-error sentinel");
+  await writeFile(catalogPath,bytes);
+  const run=await manage(box,[]);
+  assert.equal(run.code,1,run.output); assert.match(run.output,/Invalid copi catalog JSON/);
+  assert.ok(!run.output.includes("Manage saved resources")); assert.ok(!run.output.includes("\u001b[?1049h"));
+  assert.match(run.output,/PTY_TERMIOS_EXACT=True/); assert.ok(run.output.includes("\u001b[?25h"));
+  assert.deepEqual(await readFile(catalogPath),bytes);
+});
+
+for(const initiallyPaused of [false,true]) {
+  test(`F5 early main error restores ${initiallyPaused?"paused":"inactive"} reader flow/listeners/raw without a test cleanup pause`,async(t)=>{
+    const box=await sandbox(t); await mkdir(box.libraryDir);
+    const catalogPath=path.join(box.libraryDir,"catalog.json"),bytes=Buffer.from("F5 malformed observed sentinel");
+    await writeFile(catalogPath,bytes);
+    const observedPath=path.join(box.root,"reader-state.json");
+    const moduleUrl=new URL("../src/cli.js",import.meta.url).href;
+    const code=`import {writeFile} from 'node:fs/promises';import {main} from ${JSON.stringify(moduleUrl)};
+const input=process.stdin;if(${initiallyPaused})input.pause();
+const counts=()=>['data','end','close','error'].map(e=>input.listenerCount(e)).concat(['SIGINT','SIGTERM','SIGHUP'].map(e=>process.listenerCount(e)),['resize','error'].map(e=>process.stdout.listenerCount(e)));
+const before={flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()};
+try{process.exitCode=await main(['manage']);}catch(error){console.error('copi: '+error.message);process.exitCode=1;}
+await writeFile(${JSON.stringify(observedPath)},JSON.stringify({before,after:{flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()}}));`;
+    const run=await runTerminalPty(box,[process.execPath,"--input-type=module","-e",code],[]);
+    const observed=JSON.parse(await readFile(observedPath,"utf8")) as {before:{flow:boolean|null;raw:boolean;listeners:number[]};after:{flow:boolean|null;raw:boolean;listeners:number[]}};
+    console.log(`F5 readerState=${JSON.stringify(observed)} naturalExit=${run.code} evidence=${run.logPath}`);
+    assert.equal(run.code,1,run.output); assert.equal(observed.before.flow,initiallyPaused?false:null);
+    assert.equal(observed.after.flow,false); assert.equal(observed.after.raw,observed.before.raw);
+    assert.deepEqual(observed.after.listeners,observed.before.listeners);
+    assert.match(run.output,/PTY_TERMIOS_EXACT=True/); assert.deepEqual(await readFile(catalogPath),bytes);
+  });
+}
+
+test("F5 lifecycle restores an already-flowing caller reader after its operation pauses input",async(t)=>{
+  const box=await sandbox(t),observedPath=path.join(box.root,"caller-reader-state.json");
+  const moduleUrl=new URL("../src/wizard.js",import.meta.url).href;
+  const code=`import {writeFile} from 'node:fs/promises';import {withWizardLifecycle} from ${JSON.stringify(moduleUrl)};
+const input=process.stdin;const counts=()=>['data','end','close','error'].map(e=>input.listenerCount(e));
+// This caller owns canonical input and ends its own stream only after receiving its line.
+const received=new Promise(resolve=>input.once('data',chunk=>{resolve(chunk.toString());input.push(null);}));
+const before={flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()};
+await withWizardLifecycle(async()=>{input.pause();});
+const after={flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()};
+process.stdout.write('CALLER_READER_READY '+JSON.stringify({before,after}));const line=await received;
+await writeFile(${JSON.stringify(observedPath)},JSON.stringify({before,after,line}));`;
+  const run=await runTerminalPty(box,[process.execPath,"--input-type=module","-e",code],[{waitFor:"CALLER_READER_READY",send:"caller canonical line\r"}]);
+  assert.equal(run.code,0,run.output);
+  const observed=JSON.parse(await readFile(observedPath,"utf8")) as {before:{flow:boolean;raw:boolean;listeners:number[]};after:{flow:boolean;raw:boolean;listeners:number[]};line:string};
+  console.log(`F5 callerReaderState=${JSON.stringify(observed)} evidence=${run.logPath}`);
+  assert.equal(observed.before.flow,true); assert.equal(observed.after.flow,true);
+  assert.equal(observed.after.raw,observed.before.raw); assert.deepEqual(observed.after.listeners,observed.before.listeners);
+  assert.equal(observed.line,"caller canonical line\n"); assert.match(run.output,/caller canonical line\r\n/);
+  assert.match(run.output,/PTY_TERMIOS_EXACT=True/);
+});

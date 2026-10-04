@@ -51,7 +51,7 @@ const cancel: typeof clackCancel = (message, options) => clackCancel(safeDisplay
 export async function withWizardLifecycle(operation: (signal: AbortSignal) => Promise<void>): Promise<void> {
   if (activeSignal) throw new Error("An interactive wizard is already active.");
   const controller = new AbortController();
-  const wasRaw = Boolean(process.stdin.isRaw), wasPaused = process.stdin.isPaused();
+  const wasRaw = Boolean(process.stdin.isRaw), wasFlowing = process.stdin.readableFlowing === true;
   const abort = () => controller.abort();
   const eofKey = (chunk: Buffer | string) => {
     if (!editorOwnsControlInput && (typeof chunk === "string" ? chunk.includes("\u0004") : chunk.includes(4))) abort();
@@ -65,7 +65,9 @@ export async function withWizardLifecycle(operation: (signal: AbortSignal) => Pr
     process.stdin.off("end", abort); process.stdin.off("close", abort); process.stdin.off("error", abort); process.stdin.off("data", eofKey);
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, abort);
     if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw);
-    if (wasPaused) process.stdin.pause();
+    // Adding our data listener starts an inactive reader too; restore its original ownership.
+    if (wasFlowing) process.stdin.resume();
+    else process.stdin.pause();
     process.stdout.write("\u001b[?25h");
   }
 }
