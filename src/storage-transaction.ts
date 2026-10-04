@@ -26,8 +26,10 @@ export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "befo
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
 interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean }
 interface DirectoryIdentity { dev: number; ino: number }
+interface InFlightControl { signal: AbortSignal; recovering: boolean }
 interface SessionLease {
   root: string; lock: string; owner: Owner;
+  stop: AbortController; pending: Set<Promise<void>>; operation?: InFlightControl;
   rootIdentity: DirectoryIdentity; lockIdentity: DirectoryIdentity;
   recoveryClaim?: { path: string; identity: DirectoryIdentity };
 }
@@ -236,7 +238,7 @@ function sameDirectory(left: DirectoryIdentity, right: DirectoryIdentity): boole
 }
 async function issueSessionLease(session: StorageSession, root: string, lock: string, owner: Owner, claim?: string): Promise<SessionLease> {
   const lease: SessionLease = {
-    root, lock, owner: { ...owner },
+    root, lock, owner: { ...owner }, stop: new AbortController(), pending: new Set(),
     rootIdentity: await directoryIdentity(root), lockIdentity: await directoryIdentity(lock),
     ...(claim ? { recoveryClaim: { path: claim, identity: await directoryIdentity(claim) } } : {}),
   };
@@ -252,6 +254,21 @@ async function assertLeaseOwner(lease: SessionLease): Promise<void> {
   if (lease.recoveryClaim) {
     if (!sameDirectory(await directoryIdentity(lease.recoveryClaim.path), lease.recoveryClaim.identity) || alive(actual)) throw new Error("Copi recovery lease changed or its previous owner is active; refusing recovery.");
   } else if (actual.pid !== process.pid || actual.host !== os.hostname()) throw new Error("Copi session does not belong to this process and host.");
+}
+async function inFlightCheckpoint(callback: StorageOptions["checkpoint"], control: InFlightControl, point: StorageCheckpoint, root: string): Promise<void> {
+  if (control.signal.aborted) {
+    if (control.recovering) return;
+    throw new Error("Copi storage session expired during its in-flight commit.");
+  }
+  let abort!: () => void;
+  const stopped = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(new Error("Copi storage session expired during its in-flight checkpoint."));
+    control.signal.addEventListener("abort", abort, { once: true });
+  });
+  try { await Promise.race([Promise.resolve().then(() => callback?.(point, root)), stopped]); }
+  catch (error) {
+    if (!control.recovering || !control.signal.aborted) throw error;
+  } finally { control.signal.removeEventListener("abort", abort); }
 }
 async function stageParent(filesRoot: string, filePath: string): Promise<string> {
   await directoryIdentity(filesRoot);
@@ -303,7 +320,9 @@ export class StorageTransactions {
     const session = new StorageSession(root, lock, owner.token, this.options.checkpoint);
     const lease = await issueSessionLease(session, root, lock, owner);
     try { return await operation(session); } finally {
-      sessionLeases.delete(session); // Revoke before releasing or inspecting the lock for cleanup.
+      sessionLeases.delete(session); // Reject new calls immediately; private in-flight leases are not exposed.
+      lease.stop.abort(); // Interrupt checkpoints rather than waiting for caller-owned deferred values.
+      await Promise.allSettled([...lease.pending]); // Finish safe rollback before cleanup/releasing the lock.
       await assertLeaseOwner(lease);
       if (await statMaybe(path.join(lock, "journal.json"))) {
         // A failed recovery deliberately retains all evidence, and prevents readers seeing mixed state.
@@ -341,10 +360,11 @@ export class StorageSession {
   private async assertLease(checkItems = true): Promise<void> {
     const lease = sessionLeases.get(this);
     if (!lease) throw new Error("Invalid or expired copi storage session; use the issued session inside its run callback.");
+    if (lease.operation?.signal.aborted && !lease.operation.recovering) throw new Error("Copi storage session expired during its in-flight commit.");
     if (this.root !== lease.root || this.lock !== lease.lock || this.token !== lease.owner.token) throw new Error("Copi session identity changed; refusing mutation.");
     await assertLeaseOwner(lease);
     if (checkItems) await checkedDirectory(path.join(this.root, "items"));
-    if (sessionLeases.get(this) !== lease) throw new Error("Copi storage session expired while checking its lease.");
+    if (sessionLeases.get(this) !== lease || (lease.operation?.signal.aborted && !lease.operation.recovering)) throw new Error("Copi storage session expired while checking its lease.");
   }
   async capture(): Promise<StorageRevision> {
     await this.assertLease(false);
@@ -357,6 +377,19 @@ export class StorageSession {
     if (JSON.stringify(await this.capture()) !== JSON.stringify(expected)) throw new Error("Copi library changed after preparation (catalog or saved bytes); reload and review before retrying. A manual checksum mismatch must not be repaired automatically.");
   }
   async commit(expected: StorageRevision, catalog: Buffer, replacements: readonly StorageReplacement[] = [], authorization?: StorageAuthorization): Promise<void> {
+    const lease = sessionLeases.get(this);
+    if (!lease || lease.stop.signal.aborted) throw new Error("Invalid or expired copi storage session; refusing a new commit.");
+    if (this.root !== lease.root || this.lock !== lease.lock || this.token !== lease.owner.token) throw new Error("Copi session identity changed; refusing mutation.");
+    const control: InFlightControl = { signal: lease.stop.signal, recovering: false };
+    const worker = new StorageSession(lease.root, lease.lock, lease.owner.token,
+      (point, root) => inFlightCheckpoint(this.checkpoint, control, point, root));
+    sessionLeases.set(worker, { ...lease, pending: new Set(), operation: control });
+    const operation = worker.#commitInFlight(expected, catalog, replacements, authorization);
+    lease.pending.add(operation);
+    try { await operation; }
+    finally { lease.pending.delete(operation); sessionLeases.delete(worker); }
+  }
+  async #commitInFlight(expected: StorageRevision, catalog: Buffer, replacements: readonly StorageReplacement[], authorization?: StorageAuthorization): Promise<void> {
     await this.assertLease();
     const prepared = approvedStorage(catalog, replacements, authorization);
     catalog = prepared.catalog;
@@ -472,6 +505,8 @@ export class StorageSession {
       await rm(path.join(this.lock, "journal.json"));
       await this.checkpoint?.("finalized", this.root);
     } catch (error) {
+      const operation = sessionLeases.get(this)?.operation;
+      if (operation) operation.recovering = true; // Cancellation never bypasses real owner/path/integrity validation.
       try { await this.recover(true); } catch (recoveryError) { throw new Error("Copi transaction could not safely recover an external change; retained private journal, no external bytes were overwritten.", { cause: new AggregateError([error, recoveryError]) }); }
       throw error;
     }

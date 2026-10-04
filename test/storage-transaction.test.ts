@@ -556,6 +556,41 @@ test("S2 callback expiry also revokes capture and recovery entry points", async 
   assert.equal((await readSnapshotFiles(box.libraryDir, box.item))[0]!.bytes.toString(), "old snapshot\n");
 });
 
+test("S2 F5 callback closes while commit waits after old rename: no half-update or reader block", { timeout: 15_000 }, async (t) => {
+  const box = await transactionFixture(t);
+  const beforeCatalog = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const beforeBytes = await readFile(box.file);
+  let atLive!: () => void; let resume!: () => void;
+  const reached = new Promise<void>((resolve) => { atLive = resolve; });
+  const suspended = new Promise<void>((resolve) => { resume = resolve; });
+  let pending: Promise<{ success: boolean; error?: string }> | undefined;
+  const tx = new StorageTransactions({ checkpoint: async (point) => {
+    if (point === "old-renamed") { atLive(); await suspended; }
+  } });
+  await tx.run(box.libraryDir, false, async (session) => {
+    assert.ok(session);
+    pending = session.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }])
+      .then(() => ({ success: true }), (error: Error) => ({ success: false, error: error.message }));
+    await reached;
+  });
+  // Same ordering as the independent F5: only resume after run has returned.
+  resume();
+  assert.ok(pending);
+  const outcome = await pending;
+  const catalog = await loadCatalog(box.libraryDir);
+  const files = await readSnapshotFiles(box.libraryDir, catalog.items[0]!);
+  const liveBytes = await readFile(box.file);
+  assert.ok(liveBytes.equals(beforeBytes) || liveBytes.equals(box.bytes));
+  assert.deepEqual(files[0]!.bytes, liveBytes);
+  assert.equal(files[0]!.sha256, createHash("sha256").update(liveBytes).digest("hex"));
+  if (liveBytes.equals(beforeBytes)) assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), beforeCatalog);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+  const evidence = { outcome, reader: "usable", liveHex: liveBytes.toString("hex"), sha256: files[0]!.sha256, oldHex: beforeBytes.toString("hex"), newHex: box.bytes.toString("hex") };
+  const evidencePath = path.join(process.env.TMPDIR!, `copi-f5-${randomUUID()}.json`);
+  await writeFile(evidencePath, JSON.stringify(evidence, null, 2));
+  console.log(`F5 raw evidence: ${evidencePath} ${JSON.stringify(evidence)}`);
+});
+
 test("S5 raw storage approval requires boolean true as well as the authenticated review", async (t) => {
   const box = await transactionFixture(t);
   box.files[0]!.bytes = Buffer.from("apiKey=sk_live_kernelapproved123456\n");
