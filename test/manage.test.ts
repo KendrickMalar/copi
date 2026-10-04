@@ -305,3 +305,36 @@ for(const stop of ["Ctrl-C", "Ctrl-D", "SIGTERM"] as const) {
     assert.equal(run.code,0,run.output); assert.match(run.output,/PTY_TERMIOS_RESTORED=True/); assert.deepEqual(await custody(box),before);
   });
 }
+
+for (const operation of ["rename", "placement"] as const) {
+  test(`F1/F2 ${operation} approval is bound to original raw catalog revision even for whitespace-only external changes`,async(t)=>{
+    const box=await fixture(t); const before=await custody(box);
+    const external=` ${before.catalog.toString()}`;
+    const actions:TerminalAction[]=[
+      {waitFor:"Manage saved resources",send:"\r"},{waitFor:"Select saved resource",send:"\r"},
+      {waitFor:"Resource action",send:`${down.repeat(operation==="rename"?2:3)}\r`},
+      ...(operation==="rename"?[{waitFor:"New display name",send:"Pending name\r"}]:[
+        {waitFor:"Destination kind",send:"\r"},{waitFor:"New project-relative destination",send:".pi/skills/pending\r"},
+      ]),
+      {waitFor:operation==="rename"?"Save display name":"Save destination",replaceFile:{path:path.join(box.libraryDir,"catalog.json"),text:external},send:"y\r"},
+    ];
+    const run=await manage(box,actions);
+    assert.equal(run.code,1,run.output); assert.match(run.output,/changed|revision|reload/i);
+    assert.deepEqual(await readFile(path.join(box.libraryDir,"catalog.json")),Buffer.from(external));
+    assert.deepEqual(await readFile(box.file),before.file); assert.deepEqual(await readFile(box.sourceFile),before.source);
+    assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+  });
+}
+
+test("F3 literal pasted control bytes survive manage review/commit while standalone control cancellation remains separate",async(t)=>{
+  const box=await fixture(t,"old\n"); const before=await custody(box);
+  const pasted="literal\u0004\u0003\u0013\n\n日本語\n";
+  const run=await manage(box,[...editActions(),
+    {waitFor:"Ctrl-S",send:`\u001b[200~${pasted}\u001b[201~\u0013`},
+    {waitFor:"Approve this masked diff",send:"y\r"},{waitFor:"Save edited",send:"y\r"},finish,
+  ]);
+  assert.equal(run.code,0,run.output); assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+  assert.deepEqual(await readFile(box.file),Buffer.from(`${pasted}old\n`));
+  assert.deepEqual(await readFile(box.sourceFile),before.source);
+  assert.match(run.output,/\\u0004/); assert.match(run.output,/\\u0003/); assert.match(run.output,/\\u0013/);
+});

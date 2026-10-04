@@ -1,10 +1,10 @@
 import { confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
 import path from "node:path";
-import { loadCatalog, readSnapshotFiles, renameSavedItem } from "./catalog.ts";
+import { loadCatalog, readSnapshotFiles, saveCatalog, saveNameChanges } from "./catalog.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts } from "./names.ts";
-import { changeSavedDestination, commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange, readSavedEdit } from "./resource-mutations.ts";
+import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange, readSavedEdit } from "./resource-mutations.ts";
 import { editTerminalText } from "./terminal-editor.ts";
-import { resolveNameConflicts, runApplyWizard, runGroupManager, runSetup, safeDisplay, withWizardLifecycle, type SearchRoots } from "./wizard.ts";
+import { resolveNameConflicts, runApplyWizard, runGroupManager, runSetup, safeDisplay, withEditorInput, withWizardLifecycle, type SearchRoots } from "./wizard.ts";
 import type { Catalog, ResourceDestination, SavedItem } from "./types.ts";
 
 class Cancelled extends Error {}
@@ -53,7 +53,7 @@ async function edit(libraryDir: string, item: SavedItem, signal: AbortSignal): P
   }
   if(signal.aborted) throw new Cancelled();
   const initial = new TextDecoder("utf-8",{fatal:true,ignoreBOM:true}).decode(original.file.bytes);
-  const result = await editTerminalText(initial);
+  const result = await withEditorInput(()=>editTerminalText(initial));
   if(result.kind==="cancelled" || signal.aborted) throw new Cancelled();
   const change = await prepareSavedChange(prepared,Buffer.from(result.text,"utf8"));
   const review = readSavedChange(change);
@@ -81,10 +81,13 @@ async function rename(libraryDir: string, catalog: Catalog, item: SavedItem, sig
   }}),signal);
   show(`${item.name} → ${name}\nSaved contents, file names, group references and destination remain unchanged.`,"Display name change");
   if(await yes("Save display name only?",signal)) {
-    await renameSavedItem(libraryDir,item.id,name);outro("Display name saved; contents and destination unchanged.");
+    const after = structuredClone(catalog);
+    after.items.find(entry=>entry.id===item.id)!.name = name.trim();
+    // Keep the UI's original object/revision; never reload and overwrite a newer name.
+    await saveNameChanges(libraryDir,catalog,after);outro("Display name saved; contents and destination unchanged.");
   } else outro("Display name was not changed.");
 }
-async function placement(libraryDir: string, item: SavedItem, signal: AbortSignal): Promise<void> {
+async function placement(libraryDir: string, catalog: Catalog, item: SavedItem, signal: AbortSignal): Promise<void> {
   const kind = await choose("Destination kind",[
     ...(item.destination.kind === "project" ? [{value:"project",label:"Project-relative path"}] : []),
     {value:"global-only",label:"Saved only (cannot later become project-applicable)"},
@@ -95,7 +98,11 @@ async function placement(libraryDir: string, item: SavedItem, signal: AbortSigna
     destination = {kind:"project",path:destinationPath};
   }
   show(`${item.destination.kind==="project"?item.destination.path:"saved only"} → ${destination.kind==="project"?destination.path:"saved only"}\nDisplay name and saved contents remain unchanged.`,"Destination change");
-  if(await yes("Save destination only?",signal)) {await changeSavedDestination(libraryDir,item.id,destination);outro("Destination saved; display name and contents unchanged.");}
+  if(await yes("Save destination only?",signal)) {
+    item.destination = destination;
+    // saveCatalog verifies this original loadCatalog object's revision under its commit lock.
+    await saveCatalog(libraryDir,catalog);outro("Destination saved; display name and contents unchanged.");
+  }
   else outro("Destination was not changed.");
 }
 async function resource(libraryDir: string, catalog: Catalog, conflict: boolean, signal: AbortSignal): Promise<void> {
@@ -113,7 +120,7 @@ async function resource(libraryDir: string, catalog: Catalog, conflict: boolean,
   assertNoNameConflicts(await loadCatalog(libraryDir));
   if(action==="edit") await edit(libraryDir,item,signal);
   else if(action==="rename") await rename(libraryDir,catalog,item,signal);
-  else await placement(libraryDir,item,signal);
+  else await placement(libraryDir,catalog,item,signal);
 }
 
 export async function runManage(libraryDir: string, roots: SearchRoots): Promise<void> {

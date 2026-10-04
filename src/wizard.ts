@@ -18,6 +18,16 @@ export function safeDisplay(value: string): string {
       (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 let activeSignal: AbortSignal | undefined;
+let editorOwnsControlInput = false;
+
+/** The editor parses literal paste versus cancel keys; stream EOF/errors/signals stay global. */
+export async function withEditorInput<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = editorOwnsControlInput;
+  editorOwnsControlInput = true;
+  try { return await operation(); }
+  finally { editorOwnsControlInput = previous; }
+}
+
 function inheritedSignal(signal?: AbortSignal): { signal?: AbortSignal } {
   const current = signal ?? activeSignal;
   return current ? { signal: current } : {};
@@ -43,7 +53,9 @@ export async function withWizardLifecycle(operation: (signal: AbortSignal) => Pr
   const controller = new AbortController();
   const wasRaw = Boolean(process.stdin.isRaw), wasPaused = process.stdin.isPaused();
   const abort = () => controller.abort();
-  const eofKey = (chunk: Buffer | string) => { if (typeof chunk === "string" ? chunk.includes("\u0004") : chunk.includes(4)) abort(); };
+  const eofKey = (chunk: Buffer | string) => {
+    if (!editorOwnsControlInput && (typeof chunk === "string" ? chunk.includes("\u0004") : chunk.includes(4))) abort();
+  };
   activeSignal = controller.signal;
   process.stdin.on("end", abort); process.stdin.on("close", abort); process.stdin.on("error", abort); process.stdin.on("data", eofKey);
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, abort);

@@ -213,9 +213,16 @@ export async function editTerminalText(initialText: string): Promise<TerminalEdi
       if (pending.startsWith("\u001b[200~")) { paste = true; pending = pending.slice(6); continue; }
       if (pending[0] === "\u001b") {
         const match = /^(?:\u001b\[[0-9;?]*[A-Za-z~]|\u001bO[A-Za-z])/.exec(pending);
-        if (match) { command(match[0]); pending = pending.slice(match[0].length); continue; }
-        if (pending === "\u001b" || /^\u001b(?:\[[0-9;?]*|O)$/.test(pending)) {
-          escapeTimer = setTimeout(cancel, 100); return;
+        if (match) {
+          if (match[0].length > 64) { cancel(); return; }
+          command(match[0]); pending = pending.slice(match[0].length); continue;
+        }
+        if (pending === "\u001b") { escapeTimer = setTimeout(cancel, 100); return; }
+        if (/^\u001b(?:\[[0-9;?]*|O)$/.test(pending)) {
+          // A recognized control prefix is not a standalone Esc key. Await continuation,
+          // with bounded parser storage; explicit cancel, EOF and signals still terminate.
+          if (pending.length > 64) cancel();
+          return;
         }
         cancel(); return;
       }

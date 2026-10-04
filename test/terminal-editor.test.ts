@@ -145,3 +145,8 @@ test("U3 after zero-input rendering exception canonical input/echo resumes witho
   assert.match(run.output,/next input\r\n/); // This echo comes from the real PTY, not our child fixture.
   assert.match(run.output,/PTY_TERMIOS_EXACT=True/);
 });
+
+test("F4 overlong CSI input cancels safely rather than accumulating or submitting a malformed command",async(t)=>{
+  const run=await editor(t,"unchanged",[{waitFor:"Ctrl-S",send:`\u001b[${"2".repeat(1_000)}~\u0013`}]);
+  assert.deepEqual(run.result,{kind:"cancelled"});
+});
