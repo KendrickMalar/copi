@@ -60,9 +60,9 @@ for (const bytes of [Buffer.from([0]), Buffer.from([0xff]), Buffer.from([0xc0, 0
 test("S1/S5 full snapshot replacement: all hunks/mask/binary/large/mode/source immutability", async () => {
   const oldSecret = "sk_live_acceptanceOLD123456";
   const newSecret = "sk_live_acceptanceNEW123456";
-  const b = await box({ "SKILL.md": `apiKey=${oldSecret}\n${"unchanged\n".repeat(20)}tail old\n`, "obsolete.md": "remove\n" });
+  const b = await box({ "SKILL.md": `head old\napiKey=${oldSecret}\n${"unchanged\n".repeat(20)}tail old\n`, "obsolete.md": "remove\n" });
   const before = await loadCatalog(b.library);
-  await writeFile(path.join(b.sourcePath, "SKILL.md"), `apiKey=${newSecret}\n${"unchanged\n".repeat(20)}tail new\n`);
+  await writeFile(path.join(b.sourcePath, "SKILL.md"), `head new\napiKey=${newSecret}\n${"unchanged\n".repeat(20)}tail new\n`);
   await writeFile(path.join(b.sourcePath, "binary.bin"), Buffer.from([0, 255]));
   await writeFile(path.join(b.sourcePath, "large.md"), Buffer.alloc(1_000_001, 98));
   await rename(path.join(b.sourcePath, "obsolete.md"), path.join(b.root, "removed-obsolete"));
@@ -75,7 +75,10 @@ test("S1/S5 full snapshot replacement: all hunks/mask/binary/large/mode/source i
   const view = readSavedChange(change);
   assert.equal(view.bytesChanged, true);
   assert.ok(!JSON.stringify(view).includes(oldSecret) && !JSON.stringify(view).includes(newSecret));
-  assert.match(view.diffs.find((d) => d.path === "SKILL.md")!.diff, /tail old[\s\S]*tail new/);
+  const textDiff = view.diffs.find((d) => d.path === "SKILL.md")!.diff;
+  assert.match(textDiff, /head old[\s\S]*head new/);
+  assert.match(textDiff, /tail old[\s\S]*tail new/);
+  assert.equal(textDiff.split("\n").filter((line) => line.startsWith("@@")).length, 2, "both separated hunks must be visible, not only a preview slice");
   assert.equal(view.diffs.find((d) => d.path === "binary.bin")!.diff, "");
   assert.equal(view.diffs.find((d) => d.path === "large.md")!.diff, "");
   assert.match(view.diffs.find((d) => d.path === "SKILL.md")!.summary, /755/);
