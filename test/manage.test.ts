@@ -7,6 +7,7 @@ import { importPreparedResource, loadCatalog, prepareResource, readSnapshotFiles
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { duplicateFixture, sandbox, type Sandbox } from "./helpers/sandbox.ts";
 import { runTerminalPty, type TerminalAction } from "./helpers/terminal-editor.ts";
+import { packageRefreshFixture, refreshFixture, refreshCustody } from "./helpers/refresh.ts";
 
 const cli = new URL("../src/cli.js", import.meta.url).pathname;
 const down = "\u001b[B";
@@ -39,6 +40,131 @@ function editActions(): TerminalAction[] {
   ];
 }
 const finish: TerminalAction = {waitFor:"Manage saved resources",send:"\u0003"};
+function refreshActions(): TerminalAction[] {
+  return [{waitFor:"Manage saved resources",send:"\r"},{waitFor:"Select saved resource",send:"\r"},
+    {waitFor:"Resource action",send:`${down.repeat(4)}\r`}];
+}
+
+for (const stop of ["source denied", "diff denied", "secret denied", "second secret denied", "final denied", "Ctrl-C", "EOF", "SIGTERM"] as const) {
+  test(`R4/R5/R6 real CLI refresh ${stop} preserves old copy/catalog and source bytes`, async t => {
+    const box = await refreshFixture(t);
+    await writeFile(box.sourceFile, "apiKey=sk_live_refreshsecret123456\n");
+    await writeFile(path.join(box.item.sourcePath,"second.json"),"password=syntheticpassword12345\n");
+    const before = await refreshCustody(box), actions = refreshActions();
+    actions.push({waitFor:"Authorize reading only",send:stop==="source denied"?"n\r":"y\r"});
+    if (stop !== "source denied") {
+      actions.push({waitFor:"Approve this refresh diff",send:stop==="diff denied"?"n\r":"y\r"});
+      if(stop!=="diff denied") {
+        actions.push({waitFor:"Save suspected sensitive file second.json",send:stop==="secret denied"?"n\r":"y\r"});
+        if(stop!=="secret denied") {
+          actions.push({waitFor:"Save suspected sensitive file SKILL.md",send:stop==="second secret denied"?"n\r":"y\r"});
+          if(stop!=="second secret denied") actions.push(stop==="SIGTERM"?{waitFor:"Replace saved copy",signal:"SIGTERM"}:{waitFor:"Replace saved copy",send:stop==="Ctrl-C"?"\u0003":stop==="EOF"?"\u0004":"n\r"});
+        }
+      }
+    }
+    if (stop.endsWith("denied")) actions.push(finish);
+    const run = await manage(box,actions);
+    assert.equal(run.code,0,run.output); assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+    assert.deepEqual(await refreshCustody(box),before);
+    assert.ok(!run.output.includes("sk_live_refreshsecret123456")); assert.ok(!run.output.includes("syntheticpassword12345"));
+    assert.ok(!run.output.includes(box.item.id));
+    if(stop!=="source denied") {
+      assert.ok(run.output.indexOf("copi-only edits will be lost")<run.output.indexOf("Approve this refresh diff"));
+      assert.match(run.output,/no history.*restore.*automatic merge/i);
+    }
+  });
+}
+
+test("R1/R3/R4 real CLI refresh shows complete masked hunks then commits source snapshot without rewriting identity",async t=>{
+  const lines=Array.from({length:120},(_,i)=>`line ${i}\n`).join(""),box=await refreshFixture(t,"skill",lines);
+  const expected=lines.replace("line 0\n","FIRST_REFRESH\n").replace("line 60\n","MIDDLE_REFRESH\n").replace("line 119\n","LAST_REFRESH\n");
+  await writeFile(box.sourceFile,expected); const before=await loadCatalog(box.libraryDir);
+  const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",send:"y\r"},
+    {waitFor:"Approve this refresh diff",send:"y\r"},{waitFor:"Replace saved copy",send:"y\r"},finish]);
+  assert.equal(run.code,0,run.output); const diff=run.output.slice(run.output.indexOf("Full masked refresh diff"),run.output.indexOf("Approve this refresh diff"));
+  for(const line of ["+FIRST_REFRESH","+MIDDLE_REFRESH","+LAST_REFRESH"]) assert.ok(diff.includes(line));
+  assert.equal((diff.match(/@@ /g)??[]).length,3); assert.deepEqual(await readFile(box.file),Buffer.from(expected));
+  assert.deepEqual(await readFile(box.sourceFile),Buffer.from(expected));
+  const after=await loadCatalog(box.libraryDir); assert.deepEqual(after.groups,before.groups);
+  assert.deepEqual({...after.items[0]!,files:[]},{...box.item,files:[]});
+  console.log(`R1 PTY=${run.logPath} bytes=${Buffer.from(expected).toString("hex")} hash=${after.items[0]!.files[0]!.sha256}`);
+});
+
+for(const stop of ["selection cancelled","read denied","commit"] as const) {
+  test(`R2 real CLI missing origin ${stop} permits new path only with explicit scope/read consent`,async t=>{
+    const box=await refreshFixture(t); const {rename}=await import("node:fs/promises");
+    const replacement=path.join(box.sourceRoot,"replacement"); await rename(box.item.sourcePath,replacement);
+    await writeFile(path.join(replacement,"SKILL.md"),"selected source\n");
+    const before={catalog:await readFile(path.join(box.libraryDir,"catalog.json")),file:await readFile(box.file)},actions=refreshActions();
+    actions.push({waitFor:"New source path",send:stop==="selection cancelled"?"\u0003":`${replacement}\r`});
+    if(stop!=="selection cancelled") {
+      actions.push({waitFor:"Source scope",send:"\r"},{waitFor:"Authorize reading only",send:stop==="read denied"?"n\r":"y\r"});
+      if(stop==="commit") actions.push({waitFor:"Approve this refresh diff",send:"y\r"},{waitFor:"Replace saved copy",send:"y\r"});
+      actions.push(finish);
+    }
+    const run=await manage(box,actions); assert.equal(run.code,0,run.output); assert.match(run.output,/original source is unavailable/i);
+    assert.match(run.output,/sourceRoot was not stored/i); assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+    assert.equal(await readFile(path.join(replacement,"SKILL.md"),"utf8"),"selected source\n");
+    if(stop!=="commit") {assert.deepEqual(await readFile(box.file),before.file);assert.deepEqual(await readFile(path.join(box.libraryDir,"catalog.json")),before.catalog);}
+    else {const after=(await loadCatalog(box.libraryDir)).items[0]!;assert.equal(after.source,"explicit-refresh-path");assert.equal(after.scope,"project");assert.equal(after.id,box.item.id);assert.equal(after.name,box.item.name);assert.deepEqual(after.destination,box.item.destination);assert.equal(await readFile(box.file,"utf8"),"selected source\n");}
+  });
+}
+
+for(const mutation of ["catalog","body","source"] as const) {
+  test(`R6 real CLI refresh ${mutation} after preview uses bound revision/bytes`,async t=>{
+    const box=await refreshFixture(t);await writeFile(box.sourceFile,"prepared replacement\n");const before=await refreshCustody(box);
+    const external=mutation==="catalog"?` ${before.catalog.toString()}`:"external content\n";
+    const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",send:"y\r"},
+      {waitFor:"Approve this refresh diff",send:"y\r"},
+      {waitFor:"Replace saved copy",replaceFile:{path:mutation==="catalog"?path.join(box.libraryDir,"catalog.json"):mutation==="body"?box.file:box.sourceFile,text:external},send:"y\r"},
+      ...(mutation==="source"?[finish]:[])]);
+    assert.equal(run.code,mutation==="source"?0:1,run.output);assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+    assert.deepEqual(await readFile(box.file),mutation==="source"?Buffer.from("prepared replacement\n"):mutation==="body"?Buffer.from(external):before.file);
+    if(mutation!=="source") assert.deepEqual(await readFile(path.join(box.libraryDir,"catalog.json")),mutation==="catalog"?Buffer.from(external):before.catalog);
+    else {const saved=(await loadCatalog(box.libraryDir)).items[0]!;assert.equal(saved.id,box.item.id);assert.equal(saved.files[0]!.sha256,createHash("sha256").update("prepared replacement\n").digest("hex"));}
+    assert.deepEqual(await readFile(box.sourceFile),mutation==="source"?Buffer.from(external):before.source);
+  });
+}
+
+
+for(const operation of ["commit","discovery denied"] as const) {
+  test(`R1/R5 real CLI registered npm source ${operation} respects scope consent and declared-package origin`,async t=>{
+    const box=await packageRefreshFixture(t);await writeFile(box.sourceFile,"npm replacement\n");const before=await refreshCustody(box);
+    const actions=[...refreshActions(),{waitFor:"Registered package source",send:"\r"},
+      {waitFor:"Select origin search scope",send:`${down}\r`},{waitFor:"Authorize origin discovery",send:operation==="commit"?"y\r":"n\r"}];
+    if(operation==="commit")actions.push({waitFor:"Authorize reading only",send:"y\r"},{waitFor:"Approve this refresh diff",send:"y\r"},{waitFor:"Replace saved copy",send:"y\r"});
+    actions.push(finish);const run=await manage(box,actions);assert.equal(run.code,0,run.output);assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+    assert.equal(await readFile(box.sourceFile,"utf8"),"npm replacement\n");assert.ok(!run.output.includes(box.item.id));
+    if(operation==="commit"){assert.equal(await readFile(box.file,"utf8"),"npm replacement\n");const saved=(await loadCatalog(box.libraryDir)).items[0]!;assert.equal(saved.id,box.item.id);assert.equal(saved.name,box.item.name);assert.deepEqual(saved.destination,box.item.destination);}
+    else assert.deepEqual(await refreshCustody(box),before);
+  });
+}
+
+for(const mutation of ["name","groups","destination","source metadata"] as const) {
+  test(`R6 old ${mutation} change before source prepare cannot silently replace selection metadata`,async t=>{
+    const box=await refreshFixture(t);await writeFile(box.sourceFile,"pending source\n");const before=await refreshCustody(box),catalog=await loadCatalog(box.libraryDir);
+    if(mutation==="name")catalog.items[0]!.name="External name";
+    else if(mutation==="groups")catalog.groups[0]!.itemIds=[];
+    else if(mutation==="destination")catalog.items[0]!.destination={kind:"global-only"};
+    else catalog.items[0]!.source="External source";
+    const external=JSON.stringify(catalog,null,2)+"\n";
+    const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",replaceFile:{path:path.join(box.libraryDir,"catalog.json"),text:external},send:"y\r"}]);
+    assert.equal(run.code,1,run.output);assert.match(run.output,/changed since selection/);assert.ok(!run.output.includes("Approve this refresh diff"));
+    assert.deepEqual(await readFile(box.file),before.file);assert.deepEqual(await readFile(path.join(box.libraryDir,"catalog.json")),Buffer.from(external));assert.deepEqual(await readFile(box.sourceFile),before.source);
+  });
+}
+
+test("R6 real CLI prepare failure retains unknown physical files rather than replacing them",async t=>{
+  const box=await refreshFixture(t);await writeFile(box.sourceFile,"new source\n");const unknown=path.join(path.dirname(box.file),"unregistered.md");await writeFile(unknown,"retain this physical file\n");const before=await refreshCustody(box);
+  const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",send:"y\r"}]);
+  assert.equal(run.code,1,run.output);assert.match(run.output,/unregistered|unexpected|layout/i);assert.deepEqual(await refreshCustody(box),before);assert.equal(await readFile(unknown,"utf8"),"retain this physical file\n");
+});
+
+test("R1 real CLI mode-only refresh still reviews and commits, without a byte-only no-op shortcut",async t=>{
+  const box=await refreshFixture(t);const {chmod}=await import("node:fs/promises");await chmod(box.sourceFile,0o755);const before=await refreshCustody(box);
+  const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",send:"y\r"},{waitFor:"Approve this refresh diff",send:"y\r"},{waitFor:"Replace saved copy",send:"y\r"},finish]);
+  assert.equal(run.code,0,run.output);assert.match(run.output,/Bytes unchanged/);assert.match(run.output,/mode .*755/);assert.equal((await loadCatalog(box.libraryDir)).items[0]!.files[0]!.mode,0o755);assert.deepEqual(await readFile(box.file),before.file);assert.deepEqual(await readFile(box.sourceFile),before.source);
+});
 
 test("U1 real manage selects resource by name/kind/group/destination and masked file view never exposes IDs", async (t) => {
   const secret = "sk_live_syntheticsecret12345";

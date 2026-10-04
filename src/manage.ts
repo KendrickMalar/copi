@@ -1,11 +1,13 @@
 import { confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
 import path from "node:path";
+import { lstat } from "node:fs/promises";
 import { loadCatalog, readSnapshotFiles, saveCatalog, saveNameChanges } from "./catalog.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts } from "./names.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange, readSavedEdit } from "./resource-mutations.ts";
 import { editTerminalText } from "./terminal-editor.ts";
+import { commitRefresh, discoverRefreshOrigin, prepareRefresh, readRefresh, resolveRefreshPath } from "./refresh.ts";
 import { resolveNameConflicts, runApplyWizard, runGroupManager, runSetup, safeDisplay, withEditorInput, withWizardLifecycle, type SearchRoots } from "./wizard.ts";
-import type { Catalog, ResourceDestination, SavedItem } from "./types.ts";
+import type { Catalog, ResourceCandidate, ResourceDestination, ResourceScope, SavedItem } from "./types.ts";
 
 class Cancelled extends Error {}
 function checked<T>(value: T, signal: AbortSignal): Exclude<T, symbol> {
@@ -16,7 +18,7 @@ async function choose<T extends string>(message: string, options: Array<{value:T
   return checked(await select<string>({message,signal,options:options.map(option=>({...option,label:safeDisplay(option.label),...(option.hint===undefined?{}:{hint:safeDisplay(option.hint)})}))}),signal) as T;
 }
 async function yes(message: string, signal: AbortSignal): Promise<boolean> {
-  return checked(await confirm({message:safeDisplay(message),initialValue:false,signal}),signal);
+  return checked(await confirm({message:safeDisplay(message),initialValue:false,signal}),signal) === true;
 }
 function show(body: string, title: string): void { note(safeDisplay(body),safeDisplay(title)); }
 function hint(catalog: Catalog, item: SavedItem, order: number): string {
@@ -105,7 +107,63 @@ async function placement(libraryDir: string, catalog: Catalog, item: SavedItem, 
   }
   else outro("Destination was not changed.");
 }
-async function resource(libraryDir: string, catalog: Catalog, conflict: boolean, signal: AbortSignal): Promise<void> {
+async function refresh(libraryDir: string, catalog: Catalog, item: SavedItem, roots: SearchRoots, signal: AbortSignal): Promise<void> {
+  show("sourceRoot was not stored in the saved catalog. No HOME or parent tree will be searched implicitly. Select only a same-kind source; a skill uses a directory tree, other kinds use one regular file. Private/auth/.env*/cache/history paths remain excluded.","Refresh source boundary");
+  let requested = item.sourcePath;
+  let exists: boolean;
+  try { await lstat(requested); exists = true; }
+  catch(error) { if((error as NodeJS.ErrnoException).code!=="ENOENT") throw error; exists = false; }
+  let source: ResourceCandidate | undefined;
+  if(exists && (item.source.startsWith("package:") || requested.split(path.sep).some(part=>part.toLowerCase()==="node_modules"))) {
+    const route = await choose("Registered package source",[{value:"discover",label:"Rediscover declared origin in explicitly permitted locations"},{value:"manual",label:"Choose a different non-excluded source path"}],signal);
+    if(route==="discover") {
+      const scopes = await choose("Select origin search scope",[{value:"project",label:`Current project: ${roots.projectDir}`},{value:"home",label:`HOME and Pi agent directory: ${roots.homeDir} · ${roots.agentDir}`},{value:"both",label:"HOME, Pi agent directory and current project"}],signal);
+      const home = scopes!=="project", project = scopes!=="home";
+      show(`Original path: ${requested}\nHOME: ${home?roots.homeDir:"not selected"}\nPi agent: ${home?roots.agentDir:"not selected"}\nProject: ${project?roots.projectDir:"not selected"}\nDiscovery uses existing declarations, exclusions and package checks; no arbitrary node_modules exception is granted.`,"Explicit origin discovery");
+      if(!await yes("Authorize origin discovery only in these selected locations?",signal)) {outro("Origin discovery not authorized; nothing was saved.");return;}
+      const options = {...roots,scopes:{home,project}};
+      if(home) {options.homeDir=await resolveRefreshPath(roots.homeDir);options.agentDir=await resolveRefreshPath(roots.agentDir);}
+      if(project) options.projectDir=await resolveRefreshPath(roots.projectDir);
+      source = await discoverRefreshOrigin(item,options);
+      if(!source) show("Declared origin is no longer available in the approved locations. Choose another non-excluded source explicitly, or cancel; the saved copy remains available.","Origin unavailable");
+    }
+    exists = Boolean(source);
+  }
+  if(!exists) {
+    show("The original source is unavailable or was not selected. The old saved copy can still be viewed. Choose a new source path explicitly, or Esc / Ctrl-C to cancel.","Source selection");
+    requested = checked(await text({message:"New source path (absolute; same resource kind)",signal,validate:value=>value && path.isAbsolute(value)?undefined:"Enter an absolute source path."}),signal);
+    const scope = await choose("Source scope (metadata only; does not authorize wider searches)",[{value:"project",label:"Project"},{value:"user",label:"User"},{value:"shared",label:"Shared"},{value:"package",label:"Package (no private path exception)"}],signal) as ResourceScope;
+    const physical = await resolveRefreshPath(requested);
+    source = {id:item.id,kind:item.kind,name:item.name,source:"explicit-refresh-path",scope,sourcePath:physical,sourceRoot:path.dirname(physical),destination:{...item.destination}};
+  }
+  if(!source) {
+    const physical = await resolveRefreshPath(requested);
+    source = {id:item.id,kind:item.kind,name:item.name,source:item.source,scope:item.scope,sourcePath:physical,sourceRoot:path.dirname(physical),destination:{...item.destination}};
+  }
+  show(`Requested path: ${requested}\nPhysical source: ${source.sourcePath}\nValidation boundary: ${source.sourceRoot}\nRead only: ${item.kind==="skill"?"selected directory tree":"selected regular file"}\nKind: ${source.kind}; source: ${source.source}; scope: ${source.scope}\nNo parent-tree search. Existing exclusions and symlink checks apply.`,"Source read permission");
+  if(!await yes("Authorize reading only this selected source file or directory tree now?",signal)) {outro("Source reading not authorized; nothing was saved.");return;}
+  if(signal.aborted) throw new Cancelled();
+  const prepared = await prepareRefresh(libraryDir,item.id,source), review = readRefresh(prepared);
+  if(JSON.stringify(review.originalCatalog)!==JSON.stringify(catalog)) throw new Error("Saved metadata, memberships or copy state changed since selection; reload and review again.");
+  const original = review.originalCatalog.items.find(entry=>entry.id===item.id)!;
+  show(`${original.name} · ${hint(review.originalCatalog,original,review.originalCatalog.items.indexOf(original))}\nSource: ${original.sourcePath} → ${review.item.sourcePath}\nSource metadata: ${original.source} / ${original.scope} → ${review.item.source} / ${review.item.scope}\nID, display name, all memberships, savedAt and destination are retained.`,"Prepared refresh identity and source");
+  process.stdout.write(`\n${safeDisplay(`Full masked refresh diff: ${review.item.name}`)}\n`);
+  for(const diff of review.diffs) process.stdout.write(`${safeDisplay(diff.path)}\n${safeDisplay(diff.summary)}\n${safeDisplay(diff.diff)}\n`);
+  show(review.warnings.map(w=>`${w.path?`${w.path}: `:""}${w.message}`).join("\n"),"Fixed source inspection warnings · masking can hide byte changes");
+  if(review.excludedPaths.length) show(review.excludedPaths.join("\n"),"Fixed source excluded paths");
+  show("All copi-only edits will be lost when this source snapshot replaces the saved copy, including added/removed bundle files and mode changes shown above. Original files will not be changed or written back. There is no history, restore or automatic merge.","Replacement warning");
+  if(!await yes("Approve this refresh diff and source metadata? All masked hunks and byte/mode summaries are shown above.",signal)) {outro("Refresh diff not approved; nothing was saved.");return;}
+  const approvedSensitivePaths: string[] = [];
+  for(const file of review.sensitivePaths) {
+    if(!await yes(`Save suspected sensitive file ${file} from ${review.item.name}? This individual approval covers only the fixed prepared source bytes. Detection is heuristic; raw source is not displayed.`,signal)) {outro("Sensitive source bytes not approved; nothing was saved.");return;}
+    approvedSensitivePaths.push(file);
+  }
+  if(!await yes("Replace saved copy with this approved source snapshot? Copi edits will be lost; originals stay unchanged; no history, restore or automatic merge.",signal)) {outro("Refresh cancelled; nothing was saved.");return;}
+  if(signal.aborted) throw new Cancelled();
+  await commitRefresh(prepared,{reviewId:prepared.reviewId,confirmed:true,approvedSensitivePaths});
+  outro("Refreshed saved copy committed with matching checksums; originals unchanged.");
+}
+async function resource(libraryDir: string, catalog: Catalog, conflict: boolean, roots: SearchRoots, signal: AbortSignal): Promise<void> {
   const id = await choose("Select saved resource",catalog.items.map((item,index)=>({value:item.id,label:`[${item.kind}] ${item.name}`,hint:hint(catalog,item,index)})),signal);
   const item = catalog.items.find(item=>item.id===id);
   if(!item) throw new Error("Selected resource is unavailable; reload the library.");
@@ -113,6 +171,7 @@ async function resource(libraryDir: string, catalog: Catalog, conflict: boolean,
     {value:"view",label:"View saved file (masked)"},
     ...(!conflict?[
       {value:"edit",label:"Edit saved text"},{value:"rename",label:"Rename display name"},{value:"placement",label:"Change destination"},
+      {value:"refresh",label:"Refresh from source (replace saved copy)"},
     ]:[]),{value:"back",label:"Back"},
   ],signal);
   if(action==="view") {await view(libraryDir,item,signal);return;}
@@ -120,6 +179,7 @@ async function resource(libraryDir: string, catalog: Catalog, conflict: boolean,
   assertNoNameConflicts(await loadCatalog(libraryDir));
   if(action==="edit") await edit(libraryDir,item,signal);
   else if(action==="rename") await rename(libraryDir,catalog,item,signal);
+  else if(action==="refresh") await refresh(libraryDir,catalog,item,roots,signal);
   else await placement(libraryDir,catalog,item,signal);
 }
 
@@ -140,7 +200,7 @@ export async function runManage(libraryDir: string, roots: SearchRoots): Promise
           ]),{value:"done",label:"Finish"},
         ],signal);
         if(action==="done") break;
-        if(action==="resource") await resource(libraryDir,catalog,conflict,signal);
+        if(action==="resource") await resource(libraryDir,catalog,conflict,roots,signal);
         else if(action==="resolve") await resolveNameConflicts(libraryDir);
         else {
           assertNoNameConflicts(await loadCatalog(libraryDir));
