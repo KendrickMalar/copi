@@ -296,3 +296,59 @@ test("S1 replacement records the new source metadata but keeps ID/display name/g
   assert.deepEqual(await readFile(path.join(box.item.sourcePath, "SKILL.md")), original);
   assert.equal((await readSnapshotFiles(box.libraryDir, saved))[0]!.bytes.toString(), "new selected source\n");
 });
+
+test("S5 replacement warnings retain immutable source exclusions rather than dropping auth-directory warnings", async (t) => {
+  const box = await fixture(t);
+  await mkdir(path.join(box.item.sourcePath, "auth"));
+  await writeFile(path.join(box.item.sourcePath, "auth", "private.json"), "apiKey=sk_live_excludedsource123456\n");
+  const prepared = await prepareResource(box.candidate);
+  const change = await prepareSavedReplacement(box.libraryDir, box.item.id, prepared);
+  const view = readSavedChange(change);
+  assert.ok(view.warnings.some((warning) => warning.code === "auth-directory-excluded" && warning.path === "auth"));
+  assert.deepEqual(view.excludedPaths, ["auth"]);
+  assert.deepEqual(view.sensitivePaths, []);
+  await commitSavedChange(change, approve(change));
+  await assert.rejects(lstat(path.join(path.dirname(box.file), "auth")), {code:"ENOENT"});
+});
+
+test("S5 old import compares destination meaning, not object property order, while retaining byte-bound approval", async (t) => {
+  const box = await fixture(t, "apiKey=sk_live_fixedsecret123456\n");
+  assert.equal(box.candidate.destination.kind, "project");
+  if (box.candidate.destination.kind !== "project") throw new Error("fixture destination");
+  const candidate = { ...box.candidate, destination: { path: box.candidate.destination.path, kind: "project" as const } };
+  const item = await importResource(path.join(box.root, "same-meaning"), candidate, { confirmed: true, groupIds: [], inspection: box.inspection, approvedSensitivePaths: ["SKILL.md"] });
+  assert.ok(item);
+  assert.deepEqual(item.destination, box.candidate.destination);
+  assert.equal((await readSnapshotFiles(path.join(box.root, "same-meaning"), item))[0]!.bytes.toString(), "apiKey=sk_live_fixedsecret123456\n");
+});
+
+for (const entry of ["prepared", "legacy"] as const) {
+  test(`S5 ${entry} import captures approval arrays at invocation; later caller mutation cannot grant approval`, async (t) => {
+    const box = await fixture(t, "apiKey=sk_live_fixedsecret123456\n");
+    const library = path.join(box.root, "unapproved-race");
+    const approvedSensitivePaths: string[] = [];
+    const options = {confirmed:true,groupIds:[],inspection:box.inspection,approvedSensitivePaths};
+    const pending = entry === "prepared" ? importPreparedResource(library, box.prepared, options) : importResource(library, box.candidate, options);
+    approvedSensitivePaths.push("SKILL.md");
+    await assert.rejects(pending, /approval|sensitive|inspection/i);
+    await assert.rejects(lstat(library), {code:"ENOENT"});
+  });
+}
+
+test("S5 saved-change confirmation requires boolean true, not a truthy nonboolean", async (t) => {
+  const box = await fixture(t);
+  const edit = await prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md");
+  const change = await prepareSavedChange(edit, Buffer.from("new text\n"));
+  await assert.rejects(commitSavedChange(change, { ...approve(change), confirmed: "false" as unknown as boolean }), /confirm/i);
+  assert.equal(await readFile(box.file, "utf8"), "old\r\n日本語\n");
+});
+
+for (const entry of ["prepared", "legacy"] as const) {
+  test(`S5 ${entry} import does not treat a truthy nonboolean as confirmed`, async (t) => {
+    const box = await fixture(t, "apiKey=sk_live_fixedsecret123456\n");
+    const library = path.join(box.root, "not-confirmed");
+    const options = {confirmed:"false" as unknown as boolean,groupIds:[],inspection:box.inspection,approvedSensitivePaths:["SKILL.md"]};
+    assert.equal(await (entry === "prepared" ? importPreparedResource(library, box.prepared, options) : importResource(library, box.candidate, options)), null);
+    await assert.rejects(lstat(library), {code:"ENOENT"});
+  });
+}

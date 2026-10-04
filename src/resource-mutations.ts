@@ -15,9 +15,9 @@ export interface PreparedSavedChange { readonly [changeBrand]: true; readonly re
 export interface ChangeApproval { reviewId: string; confirmed: boolean; approvedSensitivePaths: readonly string[] }
 export interface SavedEditView { readonly item: SavedItem; readonly file: SnapshotFileContents; readonly sensitivePaths: readonly string[]; readonly warnings: readonly InspectionWarning[] }
 export interface SavedFileDiff { readonly path: string; readonly bytesChanged: boolean; readonly diff: string; readonly summary: string }
-export interface SavedChangeView { readonly reviewId: string; readonly item: SavedItem; readonly diffs: readonly SavedFileDiff[]; readonly sensitivePaths: readonly string[]; readonly warnings: readonly InspectionWarning[]; readonly bytesChanged: boolean }
+export interface SavedChangeView { readonly reviewId: string; readonly item: SavedItem; readonly diffs: readonly SavedFileDiff[]; readonly sensitivePaths: readonly string[]; readonly excludedPaths: readonly string[]; readonly warnings: readonly InspectionWarning[]; readonly bytesChanged: boolean }
 interface EditState { libraryDir: string; revision: StorageRevision; catalog: Catalog; item: SavedItem; files: SnapshotFileContents[]; filePath: string }
-interface ChangeState extends Omit<EditState, "filePath"> { nextFiles: StorageFile[]; nextItem: SavedItem; inspection: InspectionResult; diffs: SavedFileDiff[]; changed: boolean; used: boolean }
+interface ChangeState extends Omit<EditState, "filePath"> { nextFiles: StorageFile[]; nextItem: SavedItem; excludedPaths: string[]; inspection: InspectionResult; diffs: SavedFileDiff[]; changed: boolean; used: boolean }
 const edits = new WeakMap<PreparedSavedEdit, EditState>();
 const changes = new WeakMap<PreparedSavedChange, ChangeState>();
 const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
@@ -62,8 +62,8 @@ function changeState(change: PreparedSavedChange): ChangeState {
   if (!state) throw new Error("Invalid or unavailable prepared change token.");
   return state;
 }
-function inspect(item: SavedItem, files: readonly StorageFile[]): InspectionResult {
-  return inspectFixedResource({ candidate: candidate(item), files, excludedPaths: [] });
+function inspect(item: SavedItem, files: readonly StorageFile[], excludedPaths: readonly string[] = []): InspectionResult {
+  return inspectFixedResource({ candidate: candidate(item), files, excludedPaths });
 }
 function fileDiffs(before: readonly StorageFile[], after: readonly StorageFile[]): SavedFileDiff[] {
   const previous = new Map(before.map((file) => [file.path, file]));
@@ -79,7 +79,7 @@ function fileDiffs(before: readonly StorageFile[], after: readonly StorageFile[]
     return { path: filePath, bytesChanged, diff, summary: `${bytesChanged ? "Bytes changed" : "Bytes unchanged"}; ${old?.bytes.length ?? 0} → ${current?.bytes.length ?? 0} bytes; mode ${old?.mode.toString(8) ?? "absent"} → ${current?.mode.toString(8) ?? "absent"}.` };
   });
 }
-function makeChange(state: Omit<EditState, "filePath">, nextFiles: readonly StorageFile[], nextItem: SavedItem): PreparedSavedChange {
+function makeChange(state: Omit<EditState, "filePath">, nextFiles: readonly StorageFile[], nextItem: SavedItem, excludedPaths: readonly string[] = []): PreparedSavedChange {
   const files = nextFiles.map((file) => ({ path: file.path, mode: file.mode, bytes: Buffer.from(file.bytes) }));
   for (const file of files) if (!safeStoragePath(file.path) || privatePath(file.path)) throw new Error("Unsafe or excluded snapshot path in saved change.");
   if (files.length === 0 || new Set(files.map((file) => file.path)).size !== files.length) throw new Error("Saved replacement must contain unique registered files.");
@@ -87,7 +87,7 @@ function makeChange(state: Omit<EditState, "filePath">, nextFiles: readonly Stor
   const item = structuredClone(nextItem);
   item.files = files.map((file) => ({ path: file.path, mode: file.mode, sha256: sha256(file.bytes) }));
   const change = Object.freeze({ reviewId: randomUUID() }) as PreparedSavedChange;
-  changes.set(change, { ...state, nextFiles: files, nextItem: item, inspection: inspect(item, files), diffs, changed: diffs.some((diff) => diff.bytesChanged) || JSON.stringify(item) !== JSON.stringify(state.item), used: false });
+  changes.set(change, { ...state, nextFiles: files, nextItem: item, excludedPaths: [...excludedPaths], inspection: inspect(item, files, excludedPaths), diffs, changed: diffs.some((diff) => diff.bytesChanged) || JSON.stringify(item) !== JSON.stringify(state.item), used: false });
   return change;
 }
 export async function prepareSavedEdit(libraryDir: string, itemId: string, filePath: string): Promise<PreparedSavedEdit> {
@@ -119,14 +119,14 @@ export function readSavedEdit(edit: PreparedSavedEdit): SavedEditView {
 }
 export function readSavedChange(change: PreparedSavedChange): SavedChangeView {
   const state = changeState(change);
-  return { reviewId: change.reviewId, item: structuredClone(state.nextItem), diffs: structuredClone(state.diffs), sensitivePaths: [...state.inspection.sensitivePaths], warnings: structuredClone(state.inspection.warnings), bytesChanged: state.diffs.some((diff) => diff.bytesChanged) };
+  return { reviewId: change.reviewId, item: structuredClone(state.nextItem), diffs: structuredClone(state.diffs), sensitivePaths: [...state.inspection.sensitivePaths], excludedPaths: [...state.excludedPaths], warnings: structuredClone(state.inspection.warnings), bytesChanged: state.diffs.some((diff) => diff.bytesChanged) };
 }
 export async function commitSavedChange(change: PreparedSavedChange, approval: ChangeApproval): Promise<SavedItem> {
   const state = changeState(change);
   if (state.used) throw new Error("Prepared change was already committed; prepare and review again.");
-  if (!approval.confirmed) throw new Error("Saved change was not confirmed; no bytes were written.");
+  if (approval.confirmed !== true) throw new Error("Saved change was not confirmed; no bytes were written.");
   if (approval.reviewId !== change.reviewId) throw new Error("Approval reviewId does not match this prepared change.");
-  const inspected = inspect(state.nextItem, state.nextFiles);
+  const inspected = inspect(state.nextItem, state.nextFiles, state.excludedPaths);
   const approved = new Set(approval.approvedSensitivePaths);
   if (approved.size !== approval.approvedSensitivePaths.length || approved.size !== inspected.sensitivePaths.length || inspected.sensitivePaths.some((filePath) => !approved.has(filePath))) throw new Error("Individual approval is required for every suspected sensitive file in this saved change.");
   return withSavedLibrary(state.libraryDir, async ({ catalog, session }) => {
@@ -167,6 +167,6 @@ export async function prepareSavedReplacement(libraryDir: string, itemId: string
     if (source.candidate.kind !== item.kind) throw new Error("Replacement source must have the same resource kind.");
     if (source.candidate.destination.kind === "global-only" && item.destination.kind !== "global-only") throw new Error("A reference-only/global-only replacement source cannot become project-applicable.");
     const next = { ...structuredClone(item), source: source.candidate.source, scope: source.candidate.scope, sourcePath: source.candidate.sourcePath };
-    return makeChange({ libraryDir: state.session.root, revision: state.revision, catalog: structuredClone(state.catalog), item: structuredClone(item), files: state.files.get(item.id)! }, source.files, next);
+    return makeChange({ libraryDir: state.session.root, revision: state.revision, catalog: structuredClone(state.catalog), item: structuredClone(item), files: state.files.get(item.id)! }, source.files, next, source.excludedPaths);
   });
 }

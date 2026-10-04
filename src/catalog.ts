@@ -398,35 +398,44 @@ async function storePreparedResource(libraryDir: string, candidate: ResourceCand
 }
 
 export async function importPreparedResource(libraryDir: string, prepared: PreparedResource, options: PreparedImportOptions): Promise<SavedItem | null> {
-  if (!options.confirmed) return null;
+  if (options.confirmed !== true) return null;
   const snapshot = getPreparedSnapshot(prepared);
-  assertPreparedInspection(options.inspection, prepared);
+  const inspection = options.inspection;
+  const approvedSensitivePaths = [...options.approvedSensitivePaths];
+  const groupIds = [...options.groupIds];
+  assertPreparedInspection(inspection, prepared);
   const internalInspection = await inspectPreparedResource(prepared);
   const inspectedPaths = new Set(internalInspection.sensitivePaths);
-  const approvedPaths = new Set(options.approvedSensitivePaths);
+  const approvedPaths = new Set(approvedSensitivePaths);
   const availablePaths = new Set(snapshot.files.map((file) => file.path));
-  if (inspectedPaths.size !== options.inspection.sensitivePaths.length || approvedPaths.size !== options.approvedSensitivePaths.length ||
+  if (inspectedPaths.size !== inspection.sensitivePaths.length || approvedPaths.size !== approvedSensitivePaths.length ||
       [...inspectedPaths].some((filePath) => !availablePaths.has(filePath)) || inspectedPaths.size !== approvedPaths.size ||
       [...inspectedPaths].some((filePath) => !approvedPaths.has(filePath))) {
     throw new Error("Prepared import requires approval for every suspected sensitive file in its inspection.");
   }
-  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, [...options.groupIds], [...approvedPaths]);
+  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, groupIds, [...approvedPaths]);
 }
 
 export async function importResource(libraryDir: string, candidate: ResourceCandidate, options: ImportOptions): Promise<SavedItem | null> {
-  if (!options.confirmed) return null;
-  const prepared = options.inspection?.preparedResource ?? await prepareResource(candidate);
+  if (options.confirmed !== true) return null;
+  const capturedCandidate = copyCandidate(candidate);
+  const suppliedInspection = options.inspection;
+  const approvedSensitivePaths = [...(options.approvedSensitivePaths ?? [])];
+  const groupIds = [...options.groupIds];
+  const prepared = suppliedInspection?.preparedResource ?? await prepareResource(capturedCandidate);
   const snapshot = getPreparedSnapshot(prepared);
-  if (options.inspection) {
-    assertPreparedInspection(options.inspection, prepared);
+  if (suppliedInspection) {
+    assertPreparedInspection(suppliedInspection, prepared);
     const fixed = snapshot.candidate;
-    if (["id", "kind", "source", "scope", "sourceRoot", "sourcePath", "name"].some((key) => candidate[key as keyof ResourceCandidate] !== fixed[key as keyof ResourceCandidate]) || JSON.stringify(candidate.destination) !== JSON.stringify(fixed.destination)) {
+    const sameDestination = capturedCandidate.destination?.kind === fixed.destination.kind &&
+      (fixed.destination.kind !== "project" || (capturedCandidate.destination.kind === "project" && capturedCandidate.destination.path === fixed.destination.path));
+    if (["id", "kind", "source", "scope", "sourceRoot", "sourcePath", "name"].some((key) => capturedCandidate[key as keyof ResourceCandidate] !== fixed[key as keyof ResourceCandidate]) || !sameDestination) {
       throw new Error("Inspection candidate does not match the prepared resource metadata.");
     }
   }
   const inspection = await inspectPreparedResource(prepared);
-  if (!options.inspection && inspection.sensitivePaths.length > 0) throw new Error("A prepared inspection and individual approval are required for sensitive content.");
-  return importPreparedResource(libraryDir, prepared, { ...options, inspection: options.inspection ?? inspection, approvedSensitivePaths: options.approvedSensitivePaths ?? [] });
+  if (!suppliedInspection && inspection.sensitivePaths.length > 0) throw new Error("A prepared inspection and individual approval are required for sensitive content.");
+  return importPreparedResource(libraryDir, prepared, { confirmed: true, groupIds, inspection: suppliedInspection ?? inspection, approvedSensitivePaths });
 }
 
 async function readSnapshotFilesUnlocked(libraryDir: string, catalog: Catalog, item: SavedItem): Promise<SnapshotFileContents[]> {

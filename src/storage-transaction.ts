@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -22,7 +22,7 @@ interface ReviewState { catalog: Buffer; replacements: StorageReplacement[]; sen
 const reviews = new WeakMap<StorageReview, ReviewState>();
 interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: string; mode: number }
 export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly tree: string }
-export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "finalized" | "rollback-finalized";
+export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-held" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "rollback-catalog-held" | "finalized" | "rollback-finalized";
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
 interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean }
 interface JournalOperation { itemId: string; oldTree: string | null; newTree: string }
@@ -76,7 +76,7 @@ function approvedStorage(catalog: Buffer, replacements: readonly StorageReplacem
     return state;
   }
   const approved = new Set(authorization.approval.approvedSensitivePaths);
-  if (!authorization.approval.confirmed || authorization.approval.reviewId !== review.reviewId || approved.size !== authorization.approval.approvedSensitivePaths.length || approved.size !== checked.sensitivePaths.length || checked.sensitivePaths.some((filePath) => !approved.has(filePath))) throw new Error("Storage approval must match the prepared review and every sensitive file.");
+  if (authorization.approval.confirmed !== true || authorization.approval.reviewId !== review.reviewId || approved.size !== authorization.approval.approvedSensitivePaths.length || approved.size !== checked.sensitivePaths.length || checked.sensitivePaths.some((filePath) => !approved.has(filePath))) throw new Error("Storage approval must match the prepared review and every sensitive file.");
   return state;
 }
 
@@ -357,6 +357,7 @@ export class StorageSession {
         if (operation.oldTree !== null) await rename(target, path.join(this.lock, `old-${index}`));
         await this.checkpoint?.("old-renamed", this.root);
         await storageDirectories(this.root, this.lock);
+        if (await tree(path.join(this.lock, `old-${index}`)) !== operation.oldTree) throw new Error("Original saved bytes changed in the moved snapshot; retained external bytes instead of deleting them.");
         if (await statMaybe(target)) throw new Error("An external file appeared during commit; refusing overwrite.");
         if (await tree(path.join(this.lock, `next-${index}`)) !== operation.newTree) throw new Error("Staged bytes changed during commit; refusing save.");
         await rename(path.join(this.lock, `next-${index}`), target);
@@ -368,8 +369,18 @@ export class StorageSession {
       const actual = await checkedFile(path.join(this.root, "catalog.json"));
       if ((actual ? hash(actual) : null) !== journal.oldCatalog) throw new Error("Catalog changed during commit; refusing overwrite.");
       for (const operation of operations) if (await tree(path.join(this.root, "items", operation.itemId)) !== operation.newTree) throw new Error("Saved bytes changed during commit; refusing catalog update.");
+      await this.assertOldSnapshots(operations);
       if (!(await checkedFile(path.join(this.lock, "next-catalog")))?.equals(catalog)) throw new Error("Staged catalog changed during commit; refusing save.");
-      await rename(path.join(this.lock, "next-catalog"), path.join(this.root, "catalog.json"));
+      const destination = path.join(this.root, "catalog.json");
+      const held = path.join(this.lock, "held-catalog");
+      if (await statMaybe(held)) throw new Error("Unexpected held catalog; refusing overwrite.");
+      if (actual) await rename(destination, held);
+      await this.checkpoint?.("catalog-held", this.root);
+      await storageDirectories(this.root, this.lock);
+      const original = await checkedFile(held);
+      if ((original ? hash(original) : null) !== journal.oldCatalog) throw new Error("Original catalog changed in its held inode; retained external bytes instead of deleting them.");
+      // link() atomically refuses an externally recreated catalog.json; rename() could overwrite it.
+      await link(path.join(this.lock, "next-catalog"), destination);
       await this.checkpoint?.("catalog-renamed", this.root);
       await this.checkpoint?.("directory-sync", this.root);
       await storageDirectories(this.root, this.lock);
@@ -377,12 +388,20 @@ export class StorageSession {
       await syncDirectory(this.root);
       await this.checkpoint?.("committed", this.root);
       if (await tree(path.join(this.root, "items")) !== expectedNextTree || hash((await checkedFile(path.join(this.root, "catalog.json")))!) !== journal.newCatalog) throw new Error("Saved library changed during commit finalization.");
+      await this.assertOldSnapshots(operations);
+      const originalAtFinish = await checkedFile(held);
+      if ((originalAtFinish ? hash(originalAtFinish) : null) !== journal.oldCatalog) throw new Error("Original held catalog changed during finalization; retained external bytes.");
       await this.markFinalized();
       await rm(path.join(this.lock, "journal.json"));
       await this.checkpoint?.("finalized", this.root);
     } catch (error) {
       try { await this.recover(true); } catch (recoveryError) { throw new Error("Copi transaction could not safely recover an external change; retained private journal, no external bytes were overwritten.", { cause: new AggregateError([error, recoveryError]) }); }
       throw error;
+    }
+  }
+  private async assertOldSnapshots(operations: readonly JournalOperation[]): Promise<void> {
+    for (const [index, operation] of operations.entries()) {
+      if (await tree(path.join(this.lock, `old-${index}`)) !== operation.oldTree) throw new Error("Original saved bytes changed in a moved snapshot; retained external bytes instead of deleting them.");
     }
   }
   private async markFinalized(): Promise<void> {
@@ -424,8 +443,16 @@ export class StorageSession {
     }
     const catalog = await checkedFile(path.join(this.root, "catalog.json"));
     const currentHash = catalog ? hash(catalog) : null;
-    if (currentHash !== journal.oldCatalog && currentHash !== journal.newCatalog) throw new Error("Catalog changed externally; refusing rollback.");
+    const heldPath = path.join(this.lock, "held-catalog");
+    const held = await checkedFile(heldPath);
+    const heldHash = held ? hash(held) : null;
+    if (held && heldHash !== journal.oldCatalog) throw new Error("Original catalog was changed externally in its held inode; refusing rollback or deletion.");
+    const catalogInTransit = currentHash === null && journal.oldCatalog !== null && heldHash === journal.oldCatalog;
+    if (currentHash !== journal.oldCatalog && currentHash !== journal.newCatalog && !catalogInTransit) throw new Error("Catalog changed externally; refusing rollback.");
     const committed = currentHash === journal.newCatalog;
+    if (committed && journal.oldCatalog !== null && heldHash !== journal.oldCatalog) throw new Error("Original held catalog is missing; refusing recovery.");
+    const displacedCatalog = await checkedFile(path.join(this.lock, "displaced-catalog"));
+    if (displacedCatalog && hash(displacedCatalog) !== journal.newCatalog) throw new Error("Displaced catalog was changed externally; refusing deletion.");
     // Validate *all* targets/backups first, before modifying anything during recovery.
     for (const [index, operation] of journal.operations.entries()) {
       const current = await tree(path.join(this.root, "items", operation.itemId));
@@ -455,19 +482,39 @@ export class StorageSession {
         if (await tree(path.join(this.lock, `displaced-${index}`)) !== operation.newTree) throw new Error("Snapshot changed externally during rollback; retained bytes instead of deleting them.");
         await this.checkpoint?.("rollback-displaced", this.root);
       }
-      if (operation.oldTree !== null) await rename(path.join(this.lock, `old-${index}`), target);
+      await storageDirectories(this.root, this.lock);
+      if (await statMaybe(target)) throw new Error("An external snapshot appeared during rollback; refusing overwrite.");
+      if (operation.oldTree !== null) {
+        const original = path.join(this.lock, `old-${index}`);
+        if (await tree(original) !== operation.oldTree) throw new Error("Original rollback bytes changed externally; retained them instead of restoring unchecked data.");
+        await rename(original, target);
+      }
       await this.checkpoint?.("rollback-restored", this.root);
     }
     if (committed) {
-      if (oldCatalog) {
-        const restore = path.join(this.lock, "restore-catalog");
-        const existing = await checkedFile(restore);
-        if (existing && hash(existing) !== journal.oldCatalog) throw new Error("Restoration catalog was altered; refusing recovery.");
-        if (!existing) await writePrivate(restore, oldCatalog);
-        await rename(restore, path.join(this.root, "catalog.json"));
-      }
-      else await rm(path.join(this.root, "catalog.json"));
+      const destination = path.join(this.root, "catalog.json");
+      await rename(destination, path.join(this.lock, "displaced-catalog"));
+      const displaced = await checkedFile(path.join(this.lock, "displaced-catalog"));
+      if (!displaced || hash(displaced) !== journal.newCatalog) throw new Error("Catalog changed externally during rollback; retained bytes instead of deleting them.");
+      await this.checkpoint?.("rollback-catalog-held", this.root);
     }
+    if (committed || catalogInTransit) {
+      if (oldCatalog) {
+        await storageDirectories(this.root, this.lock);
+        const original = await checkedFile(heldPath);
+        if (!original || hash(original) !== journal.oldCatalog) throw new Error("Original held catalog is missing or altered.");
+        await link(heldPath, path.join(this.root, "catalog.json"));
+      }
+    }
+    // Late writes to displaced/backup inodes must not be discarded by cleanup.
+    for (const [index, operation] of journal.operations.entries()) {
+      for (const [prefix, expectedTree] of [["old", operation.oldTree], ["next", operation.newTree], ["displaced", operation.newTree]] as const) {
+        const retained = await tree(path.join(this.lock, `${prefix}-${index}`));
+        if (retained !== null && retained !== expectedTree) throw new Error("Retained snapshot inode changed externally during recovery; refusing deletion.");
+      }
+    }
+    const retainedCatalog = await checkedFile(path.join(this.lock, "displaced-catalog"));
+    if (retainedCatalog && hash(retainedCatalog) !== journal.newCatalog) throw new Error("Retained catalog inode changed externally during recovery; refusing deletion.");
     await syncDirectory(this.root);
     await this.markFinalized();
     await rm(path.join(this.lock, "journal.json"));
