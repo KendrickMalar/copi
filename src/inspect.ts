@@ -1,6 +1,8 @@
 import path from "node:path";
-import { prepareResource, readPreparedResource, type PreparedResource, type PreparedInspection } from "./catalog.ts";
+import { prepareResource, readPreparedResource, type PreparedResource, type PreparedInspection, type PreparedResourceContents } from "./catalog.ts";
 import type { InspectionResult, InspectionWarning, ResourceCandidate } from "./types.ts";
+
+const inspections = new WeakSet<PreparedInspection>();
 
 const maxInspectionBytes = 1_000_000;
 const relativePathReference = /(?:^|[\s"'`])(?:\.{1,2}\/)?[A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+(?:$|[\s"'`),;!?])/m;
@@ -17,8 +19,7 @@ function containsInlineSecret(text: string): boolean {
   return namedValue.test(text) || recognizableToken.test(text) || bearer.test(text);
 }
 
-export async function inspectPreparedResource(prepared: PreparedResource): Promise<PreparedInspection> {
-  const { candidate, files, excludedPaths } = readPreparedResource(prepared);
+export function inspectFixedResource({ candidate, files, excludedPaths }: PreparedResourceContents): InspectionResult {
   const warnings: InspectionWarning[] = [];
   const sensitivePaths: string[] = [];
   addWarning(warnings, "secret-detection-limited", "Secret detection is heuristic and cannot guarantee completeness.");
@@ -60,12 +61,23 @@ export async function inspectPreparedResource(prepared: PreparedResource): Promi
     }
   }
   if (candidate.destination.kind === "global-only") addWarning(warnings, "global-only", "This resource is saved for reference and cannot be applied to a project.");
-  return Object.freeze({
-    warnings: Object.freeze(warnings.map((warning) => Object.freeze({ ...warning }))),
-    sensitivePaths: Object.freeze([...new Set(sensitivePaths)].sort((left, right) => left.localeCompare(right))),
-    excludedPaths: Object.freeze([...new Set(excludedPaths)].sort((left, right) => left.localeCompare(right))),
+  return { warnings, sensitivePaths: [...new Set(sensitivePaths)].sort((left, right) => left.localeCompare(right)), excludedPaths: [...new Set(excludedPaths)].sort((left, right) => left.localeCompare(right)) };
+}
+
+export async function inspectPreparedResource(prepared: PreparedResource): Promise<PreparedInspection> {
+  const result = inspectFixedResource(readPreparedResource(prepared));
+  const inspection: PreparedInspection = Object.freeze({
+    warnings: Object.freeze(result.warnings.map((warning) => Object.freeze({ ...warning }))),
+    sensitivePaths: Object.freeze(result.sensitivePaths),
+    excludedPaths: Object.freeze(result.excludedPaths),
     preparedResource: prepared,
   });
+  inspections.add(inspection);
+  return inspection;
+}
+
+export function assertPreparedInspection(inspection: PreparedInspection, prepared: PreparedResource): void {
+  if (!inspections.has(inspection) || inspection.preparedResource !== prepared) throw new Error("Inspection does not match the prepared resource or is not an authentic inspection.");
 }
 
 export async function inspectResource(candidate: ResourceCandidate): Promise<InspectionResult> {

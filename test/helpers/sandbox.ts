@@ -5,7 +5,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { TestContext } from "node:test";
-import { importResource, loadCatalog, saveCatalog } from "../../src/catalog.ts";
+import { importResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
+import { inspectPreparedResource } from "../../src/inspect.ts";
 
 export async function sandbox(t: TestContext) {
   const root = await mkdtemp(path.join(os.tmpdir(), "copi-names-"));
@@ -23,11 +24,14 @@ export async function addItem(box: Sandbox, name: string) {
   const sourcePath = path.join(box.sourceRoot, randomUUID());
   await mkdir(sourcePath);
   await writeFile(path.join(sourcePath, "SKILL.md"), "# Original name\napiKey: sk_live_syntheticsecret12345\n");
-  const item = await importResource(box.libraryDir, {
+  const candidate = {
     id: sourcePath, kind: "skill", source: "synthetic", scope: "project",
     sourceRoot: box.sourceRoot, sourcePath, name,
-    destination: { kind: "project", path: `.pi/skills/${path.basename(sourcePath)}` },
-  }, { confirmed: true, groupIds: [] });
+    destination: { kind: "project" as const, path: `.pi/skills/${path.basename(sourcePath)}` },
+  } as const;
+  const prepared = await prepareResource(candidate);
+  const inspection = await inspectPreparedResource(prepared);
+  const item = await importResource(box.libraryDir, candidate, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths });
   assert.ok(item);
   return item;
 }

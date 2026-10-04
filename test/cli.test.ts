@@ -4,7 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { importResource, newCatalog, saveCatalog } from "../src/catalog.ts";
+import { importResource, newCatalog, prepareResource, saveCatalog } from "../src/catalog.ts";
+import { inspectPreparedResource } from "../src/inspect.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
 interface Sandbox {
@@ -104,7 +105,9 @@ test("apply --dry-run displays masked plans without changing the synthetic proje
     name: "credential-skill",
     destination: { kind: "project", path: ".pi/skills/credential-skill" },
   };
-  await importResource(box.library, candidate, { confirmed: true, groupIds: ["bundle"] });
+  const prepared = await prepareResource(candidate);
+  const inspection = await inspectPreparedResource(prepared);
+  await importResource(box.library, candidate, { confirmed: true, groupIds: ["bundle"], inspection, approvedSensitivePaths: ["SKILL.md"] });
 
   const result = runCli(box, ["apply", "bundle", box.project, "--dry-run"]);
   assert.equal(result.status, 0, result.stderr);

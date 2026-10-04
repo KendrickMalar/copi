@@ -3,7 +3,8 @@ import { constants, type Stats } from "node:fs";
 import { access, chmod, lstat, mkdir, open, readFile, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { createTwoFilesPatch } from "diff";
-import { loadCatalog, readSnapshotFiles } from "./catalog.ts";
+import { withSavedLibrary, type SavedLibraryState } from "./catalog.ts";
+import type { StorageRevision } from "./storage-transaction.ts";
 import { maskSensitiveText } from "./inspect.ts";
 import { assertNoNameConflicts } from "./names.ts";
 import type { InspectionWarning, SavedItem, SnapshotFileContents } from "./types.ts";
@@ -78,6 +79,7 @@ interface SnapshotCandidate {
 }
 
 interface InternalPlan {
+  revision: StorageRevision;
   libraryRoot: string;
   projectRoot: string;
   requestedProjectDir: string;
@@ -261,11 +263,15 @@ function candidateKey(candidate: SnapshotCandidate): string {
 }
 
 export async function planApply(libraryDir: string, groupId: string, projectDir: string): Promise<ApplyPlan> {
-  const catalog = await loadCatalog(libraryDir);
+  return withSavedLibrary(libraryDir, async (state) => planApplyLocked(state, groupId, projectDir));
+}
+
+async function planApplyLocked(state: SavedLibraryState, groupId: string, projectDir: string): Promise<ApplyPlan> {
+  const catalog = state.catalog;
   assertNoNameConflicts(catalog);
   const group = catalog.groups.find((item) => item.id === groupId);
   if (!group) throw new Error(`Unknown group: ${groupId}`);
-  const storeRoot = await realpath(libraryDir);
+  const storeRoot = state.session.root;
   const project = await safeProjectRoot(projectDir);
   const warnings: InspectionWarning[] = [];
   const skippedItems: string[] = [];
@@ -279,7 +285,7 @@ export async function planApply(libraryDir: string, groupId: string, projectDir:
       addWarning(warnings, "global-only", "This resource is saved for reference and cannot be applied to a project.", item.name);
       continue;
     }
-    const snapshotFiles = await readSnapshotFiles(storeRoot, item);
+    const snapshotFiles = state.files.get(item.id)!;
     for (const snapshot of snapshotFiles) {
       if (isExcludedSnapshotPath(snapshot.path)) {
         addWarning(warnings, "private-path-skipped", "Authentication, environment, history, and cache files are not applied.", snapshot.path);
@@ -287,7 +293,7 @@ export async function planApply(libraryDir: string, groupId: string, projectDir:
       }
       const destination = targetPath(item, snapshot.path, snapshotFiles.length);
       const relativePath = path.posix.normalize(destination);
-      if (!safeRelativePath(relativePath)) throw new Error(`Unsafe project destination in catalog: ${relativePath}`);
+      if (!safeRelativePath(relativePath) || isExcludedSnapshotPath(relativePath)) throw new Error(`Unsafe or private/excluded project destination in catalog: ${relativePath}`);
       const fileCandidates = candidates.get(relativePath) ?? [];
       const candidate: SnapshotCandidate = {
         itemId: item.id,
@@ -327,7 +333,9 @@ export async function planApply(libraryDir: string, groupId: string, projectDir:
     });
   }
   const plan: ApplyPlan = { projectDir: project.canonical, files, collisions, warnings, skippedItems };
+  await state.session.assertRevision(state.revision);
   planState.set(plan, {
+    revision: state.revision,
     libraryRoot: storeRoot,
     projectRoot: project.canonical,
     requestedProjectDir: project.requested,
@@ -441,10 +449,15 @@ async function writeSnapshotFile(root: string, relativePath: string, candidate: 
 }
 
 export async function executeApply(libraryDir: string, plan: ApplyPlan, decisions: ApplyDecisions): Promise<ApplyResult> {
+  return withSavedLibrary(libraryDir, async (state) => executeApplyLocked(state, plan, decisions));
+}
+
+async function executeApplyLocked(state: SavedLibraryState, plan: ApplyPlan, decisions: ApplyDecisions): Promise<ApplyResult> {
   const internal = planState.get(plan);
   if (!internal) throw new Error("Apply plan is not a verified plan created by planApply.");
-  if (await realpath(libraryDir) !== internal.libraryRoot) throw new Error("Apply plan belongs to a different copi library.");
-  assertNoNameConflicts(await loadCatalog(libraryDir));
+  if (state.session.root !== internal.libraryRoot) throw new Error("Apply plan belongs to a different copi library.");
+  assertNoNameConflicts(state.catalog);
+  await state.session.assertRevision(internal.revision);
   if (await realpath(internal.requestedProjectDir) !== internal.projectRoot) throw new Error("Project destination changed after planning.");
   const operations: WriteOperation[] = [];
   const kept: string[] = [];
@@ -486,6 +499,7 @@ export async function executeApply(libraryDir: string, plan: ApplyPlan, decision
     }
     await assertWritableParent(internal.projectRoot, operation.path);
   }
+  await state.session.assertRevision(internal.revision);
   const backups = await createBackupSet(internal.libraryRoot, operations);
   const written: string[] = [];
   for (const operation of operations) {
@@ -494,6 +508,7 @@ export async function executeApply(libraryDir: string, plan: ApplyPlan, decision
     if ((current?.sha256 ?? undefined) !== (expected?.sha256 ?? undefined) || (current?.mode ?? undefined) !== (expected?.mode ?? undefined)) {
       throw new Error(`Destination changed during apply: ${operation.path}`);
     }
+    await state.session.assertRevision(internal.revision);
     await writeSnapshotFile(internal.projectRoot, operation.path, operation.candidate);
     written.push(operation.path);
   }
