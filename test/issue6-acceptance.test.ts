@@ -277,3 +277,23 @@ test("U7 old CLI help/invalid args/symlink/list/groups/setup/apply remain guarde
   for (const args of [["manage", "bad"], ["unknown"], ["setup"], ["apply", "Named"], ["list", "extra"], ["groups", "extra"]]) { const run = runCli(b, args, linked); assert.equal(run.status, 1); assert.ok(run.stderr.length > 0); }
   assert.deepEqual(await custody(b), before);
 });
+
+test("U3 recognized partial paste CSI with finite 180ms continuation must not act as a standalone Esc cancellation", async () => {
+  const b = await box(), initial = "ANCHOR", pasted = "finite-delay\n\n旅程\n", expected = { kind: "submitted", text: pasted + initial };
+  const resultFile = path.join(b.root, "finite-csi-result.json"), module = new URL("../src/terminal-editor.js", import.meta.url).href;
+  const code = `import {writeFile} from 'node:fs/promises'; import {editTerminalText} from ${JSON.stringify(module)};
+const result=await editTerminalText(${JSON.stringify(initial)});
+await writeFile(${JSON.stringify(resultFile)},JSON.stringify({result,expected:${JSON.stringify(expected)},expectedHex:${JSON.stringify(Buffer.from(expected.text).toString("hex"))}}));
+process.stdout.write('FINITE_CSI_RESULT_READY'); await new Promise(resolve=>setTimeout(resolve,1000));`;
+  // Valid opening CSI is already recognized (ESC[2); this is not an isolated Esc key.
+  // Hold the child alive only to record the completed ordered input even on premature cancellation.
+  const steps: Step[] = [{ wait: "Ctrl-S", hex: "1b5b32" }, { delayMs: 180, text: `00~${pasted}\x1b[201~\x13` }];
+  const run = await pty(b, [process.execPath, "--input-type=module", "-e", code], steps);
+  const saved = JSON.parse(await readFile(resultFile, "utf8")) as { result: { kind: string; text?: string }; expectedHex: string };
+  console.log(`finite CSI result=${JSON.stringify(saved)} timeline=${JSON.stringify(run.timeline)} resultFile=${resultFile}`);
+  assert.equal(run.code, 0, run.output); assert.equal(run.timeout, false); assert.equal(run.actions, 2);
+  assert.ok(run.timeline[1]!.elapsedMs - run.timeline[0]!.elapsedMs >= 180);
+  for (const action of run.timeline) assert.equal(action.written, action.sentHex.length / 2, "full ordered input must reach PTY");
+  assert.deepEqual(saved.result, expected, `finite recognized CSI continuation must preserve pasted text; result ${resultFile}, evidence ${run.log}`);
+  restored(run);
+});

@@ -80,7 +80,7 @@ def state():
 def resize(size): fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',*size,0,0))
 resize(config['size']); before=state(); mode=config['mode']
 p=subprocess.Popen(config['argv'],stdin=slave if mode not in ['stdin-pipe','both-pipe'] else subprocess.DEVNULL,stdout=slave if mode not in ['stdout-pipe','both-pipe'] else subprocess.PIPE,stderr=slave,cwd=config['cwd'],env=os.environ.copy())
-steps=config['steps']; index=0; out=b''; pending=b''; checkpoints=[]; probes=[]; deadline=time.monotonic()+30
+steps=config['steps']; index=0; out=b''; pending=b''; checkpoints=[]; probes=[]; timeline=[]; started=time.monotonic(); deadline=started+30
 while time.monotonic()<deadline:
     if select.select([master],[],[],.025)[0]:
         try: data=os.read(master,65536)
@@ -99,9 +99,11 @@ while time.monotonic()<deadline:
         if 'replace' in s:
             with open(s['replace']['path'],'wb') as f: f.write(s['replace']['text'].encode())
         if 'resize' in s: resize(s['resize']); p.send_signal(signal.SIGWINCH)
-        if 'text' in s: os.write(master,s['text'].encode())
-        if 'hex' in s: os.write(master,bytes.fromhex(s['hex']))
+        sent=b''; written=0
+        if 'text' in s: sent=s['text'].encode(); written=os.write(master,sent)
+        if 'hex' in s: sent=bytes.fromhex(s['hex']); written=os.write(master,sent)
         if 'signal' in s: p.send_signal(getattr(signal,s['signal']))
+        timeline.append({'action':index,'elapsedMs':(time.monotonic()-started)*1000,'sentHex':sent.hex(),'written':written})
         index+=1; pending=b''
     if p.poll() is not None:
         while select.select([master],[],[],.03)[0]:
@@ -113,10 +115,10 @@ if timeout: p.kill()
 code=p.wait(); after=state()
 if mode in ['stdout-pipe','both-pipe']: out+=p.stdout.read()
 open(config['output'],'wb').write(out)
-json.dump({'code':124 if timeout else code,'timeout':timeout,'actions':index,'totalActions':len(steps),'before':before,'after':after,'exact':before==after,'xor':[before[i]^after[i] for i in range(6)],'checkpoints':checkpoints,'probes':probes,'platform':sys.platform},open(config['state'],'w'))
+json.dump({'code':124 if timeout else code,'timeout':timeout,'actions':index,'totalActions':len(steps),'before':before,'after':after,'exact':before==after,'xor':[before[i]^after[i] for i in range(6)],'checkpoints':checkpoints,'probes':probes,'timeline':timeline,'platform':sys.platform},open(config['state'],'w'))
 os.close(master); os.close(slave)
 `;
-export interface PtyState { code: number; timeout: boolean; actions: number; totalActions: number; before: Array<number | Array<string | number>>; after: Array<number | Array<string | number>>; exact: boolean; xor: number[]; checkpoints: Array<{ action: number; raw: PtyState["before"] }>; platform: string; probes: Array<{ action: number; code: number; stdout?: string; stderr?: string }> }
+export interface PtyState { code: number; timeout: boolean; actions: number; totalActions: number; before: Array<number | Array<string | number>>; after: Array<number | Array<string | number>>; exact: boolean; xor: number[]; checkpoints: Array<{ action: number; raw: PtyState["before"] }>; platform: string; probes: Array<{ action: number; code: number; stdout?: string; stderr?: string }>; timeline: Array<{ action: number; elapsedMs: number; sentHex: string; written: number }> }
 export async function pty(b: Box, argv: string[], steps: Step[], mode = "tty", size: [number, number] = [14, 72]) {
   const prefix = path.join(b.root, `pty-${randomUUID()}`), output = `${prefix}.bin`, state = `${prefix}.state.json`, config = `${prefix}.actions.json`;
   await writeFile(config, JSON.stringify({ argv, steps, cwd: b.cwd, mode, size, output, state }));
