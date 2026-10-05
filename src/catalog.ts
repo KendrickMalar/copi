@@ -4,7 +4,7 @@ import path from "node:path";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import { assertPreparedInspection, inspectFixedResource, inspectPreparedResource } from "./inspect.ts";
 import { absentStorageRevision, prepareStorageReview, storageTransactions, type StorageRevision, type StorageSession } from "./storage-transaction.ts";
-import { readSourceContent, validateContentLocations } from "./source-content.ts";
+import { readSourceContent, validateContentLocations, validateRuntimeContentLocations } from "./source-content.ts";
 
 import type { Catalog, Group, InspectionResult, LegacySavedItem, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents, StoredCatalog } from "./types.ts";
 
@@ -307,7 +307,9 @@ async function loadCatalogUnlocked(libraryDir: string): Promise<StoredCatalog> {
   } catch (error) {
     throw new Error("Invalid copi catalog JSON.", { cause: error });
   }
-  return parseStoredCatalog(value);
+  const catalog = parseStoredCatalog(value);
+  if (catalog.version === 2) await validateRuntimeContentLocations(root, catalog.items);
+  return catalog;
 }
 
 export function catalogBytes(catalog: Catalog): Buffer {
@@ -362,6 +364,7 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
   // Invalid new names are rejected without creating a library.
   const preflight = await loadCatalog(libraryDir);
   assertNoNameConflicts(preflight);
+  await validateRuntimeContentLocations(libraryDir, validated.items);
   await storageTransactions.run(libraryDir, true, async (session) => {
     if (!session) throw new Error("Missing storage session.");
     const revision = await session.capture();

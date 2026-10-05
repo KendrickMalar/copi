@@ -1,12 +1,21 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { importResource, parseStoredCatalog, readSnapshotFiles } from "../src/catalog.ts";
+import { importResource, loadCatalog, parseStoredCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { sandbox } from "./helpers/sandbox.ts";
 
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+async function isCaseInsensitiveAlias(target: string, alias: string): Promise<boolean> {
+  const canonicalTarget = await realpath(target);
+  const canonicalAlias = await realpath(alias).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  return canonicalAlias === canonicalTarget;
+}
 
 function v2Catalog(content: unknown, files?: Array<{ path: string; mode: number; sha256: string }>, kind: "instruction" | "skill" = "instruction") {
   return {
@@ -207,6 +216,166 @@ test("tree content tracks current included files, preserves registered modes, an
 
   await rm(path.join(storedRoot, "SKILL.md"));
   await assert.rejects(readSnapshotFiles(box.libraryDir, item), /SKILL\.md|missing|required/i);
+});
+
+test("reader rejects same-inode source edits during byte reading", async (t) => {
+  const box = await sandbox(t);
+  const id = "123e4567-e89b-42d3-a456-426614174000";
+  const target = path.join(box.libraryDir, "sources", id, "origin.md");
+  await mkdir(path.dirname(target), { recursive: true });
+  const beforeBytes = Buffer.from("before-read\n");
+  const changedBytes = Buffer.from("after-read!\n");
+  assert.equal(changedBytes.length, beforeBytes.length);
+  await writeFile(target, beforeBytes);
+  const parsed = parseStoredCatalog(v2Catalog({ kind: "file", path: `sources/${id}/origin.md` }, [
+    { path: "origin.md", mode: 0o644, sha256: digest(beforeBytes) },
+  ]));
+  assert.equal(parsed.version, 2);
+  const item = parsed.items[0]!;
+
+  const originalStat = await lstat(target, { bigint: true });
+  const handle = await open(target, "r");
+  const prototype: object = Object.getPrototypeOf(handle);
+  const method = Object.getOwnPropertyDescriptor(prototype, "readFile");
+  assert.ok(method && typeof method.value === "function");
+  const originalRead = method.value as (...args: unknown[]) => Promise<Buffer>;
+  let changed = false;
+  Object.defineProperty(prototype, "readFile", {
+    ...method,
+    value: async function (this: object, ...args: unknown[]): Promise<Buffer> {
+      const bytes = await Reflect.apply(originalRead, this, args) as Buffer;
+      if (!changed) {
+        changed = true;
+        await writeFile(target, changedBytes);
+      }
+      return bytes;
+    },
+  });
+  try {
+    await assert.rejects(readPureSourceContent(box.libraryDir, item), /changed|modified|consistent|stable/i);
+  } finally {
+    Object.defineProperty(prototype, "readFile", method);
+    await handle.close();
+  }
+  assert.equal(changed, true);
+  const finalStat = await lstat(target, { bigint: true });
+  assert.equal(finalStat.dev, originalStat.dev, "the injected write keeps the original device");
+  assert.equal(finalStat.ino, originalStat.ino, "the injected write keeps the original inode");
+});
+
+test("reader accepts one canonical content path alias on a case-insensitive filesystem", async (t) => {
+  const box = await sandbox(t);
+  const library = box.libraryDir;
+  const target = path.join(library, "sources", "CaseProbe", "origin.md");
+  await mkdir(path.dirname(target), { recursive: true });
+  const bytes = Buffer.from("canonical content\n");
+  await writeFile(target, bytes);
+  const alias = path.join(library, "sources", "caseprobe", "origin.md");
+  if (!await isCaseInsensitiveAlias(target, alias)) {
+    t.skip("requires a case-insensitive filesystem to exercise path aliases");
+    return;
+  }
+  const catalog = v2Catalog({ kind: "file", path: "sources/caseprobe/origin.md" }, [
+    { path: "origin.md", mode: 0o644, sha256: digest(bytes) },
+  ]);
+  await mkdir(library, { recursive: true });
+  await writeFile(path.join(library, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+
+  const loaded = await loadCatalog(library);
+  assert.equal(loaded.version, 2);
+  const files = await readSnapshotFiles(library, loaded.items[0]!);
+  assert.deepEqual(files[0]!.bytes, bytes);
+  assert.equal(files[0]!.sha256, digest(bytes));
+});
+
+test("catalog runtime validation rejects distinct path spellings for one physical source", async (t) => {
+  const box = await sandbox(t);
+  const library = box.libraryDir;
+  const target = path.join(library, "sources", "CaseProbe", "origin.md");
+  await mkdir(path.dirname(target), { recursive: true });
+  const bytes = Buffer.from("one physical source\n");
+  await writeFile(target, bytes);
+  const alias = path.join(library, "sources", "caseprobe", "origin.md");
+  if (!await isCaseInsensitiveAlias(target, alias)) {
+    t.skip("requires a case-insensitive filesystem to exercise path aliases");
+    return;
+  }
+  const catalog = v2Catalog({ kind: "file", path: "sources/CaseProbe/origin.md" }, [
+    { path: "origin.md", mode: 0o644, sha256: digest(bytes) },
+  ]);
+  const duplicate = structuredClone(catalog.items[0]!);
+  duplicate.id = randomUUID();
+  duplicate.name = "Physical alias";
+  duplicate.content = { kind: "file", path: "sources/caseprobe/origin.md" };
+  catalog.items.push(duplicate);
+  assert.equal(parseStoredCatalog(catalog).version, 2, "the pure parser stays independent of filesystem semantics");
+  await mkdir(library, { recursive: true });
+  await writeFile(path.join(library, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+
+  await assert.rejects(loadCatalog(library), /duplicate|overlap|physical|content/i);
+});
+
+test("catalog runtime validation rejects hard-linked content locations", async (t) => {
+  const box = await sandbox(t);
+  const library = box.libraryDir;
+  const originalPath = path.join(library, "sources", "First", "origin.md");
+  const linkedPath = path.join(library, "sources", "Second", "origin.md");
+  await mkdir(path.dirname(originalPath), { recursive: true });
+  await mkdir(path.dirname(linkedPath), { recursive: true });
+  const bytes = Buffer.from("one inode, two paths\n");
+  await writeFile(originalPath, bytes);
+  await link(originalPath, linkedPath);
+  assert.notEqual(await realpath(originalPath), await realpath(linkedPath));
+  const originalStat = await lstat(originalPath, { bigint: true });
+  const linkedStat = await lstat(linkedPath, { bigint: true });
+  assert.equal(linkedStat.dev, originalStat.dev);
+  assert.equal(linkedStat.ino, originalStat.ino);
+
+  const catalog = v2Catalog({ kind: "file", path: "sources/First/origin.md" }, [
+    { path: "origin.md", mode: 0o644, sha256: digest(bytes) },
+  ]);
+  const duplicate = structuredClone(catalog.items[0]!);
+  duplicate.id = randomUUID();
+  duplicate.name = "Hard-linked content";
+  duplicate.content = { kind: "file", path: "sources/Second/origin.md" };
+  catalog.items.push(duplicate);
+  assert.equal(parseStoredCatalog(catalog).version, 2);
+  await mkdir(library, { recursive: true });
+  await writeFile(path.join(library, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+
+  await assert.rejects(loadCatalog(library), /duplicate|overlap|physical|content/i);
+});
+
+test("saveCatalog rejects physical content aliases before writing", async (t) => {
+  const box = await sandbox(t);
+  const library = box.libraryDir;
+  const target = path.join(library, "sources", "CaseProbe", "origin.md");
+  await mkdir(path.dirname(target), { recursive: true });
+  const bytes = Buffer.from("one physical source\n");
+  await writeFile(target, bytes);
+  const alias = path.join(library, "sources", "caseprobe", "origin.md");
+  if (!await isCaseInsensitiveAlias(target, alias)) {
+    t.skip("requires a case-insensitive filesystem to exercise path aliases");
+    return;
+  }
+  const catalogPath = path.join(library, "catalog.json");
+  const original = v2Catalog({ kind: "file", path: "sources/CaseProbe/origin.md" }, [
+    { path: "origin.md", mode: 0o644, sha256: digest(bytes) },
+  ]);
+  await mkdir(library, { recursive: true });
+  await writeFile(catalogPath, `${JSON.stringify(original, null, 2)}\n`);
+  const loaded = await loadCatalog(library);
+  assert.equal(loaded.version, 2);
+  if (loaded.version !== 2) throw new Error("Expected a v2 fixture catalog.");
+  const duplicate = structuredClone(loaded.items[0]!);
+  duplicate.id = randomUUID();
+  duplicate.name = "Physical alias";
+  duplicate.content = { kind: "file", path: "sources/caseprobe/origin.md" };
+  loaded.items.push(duplicate);
+  const before = await readFile(catalogPath);
+
+  await assert.rejects(saveCatalog(library, loaded), /duplicate|overlap|physical/i);
+  assert.deepEqual(await readFile(catalogPath), before);
 });
 
 test("content roots and registered files refuse symlink substitution", async (t) => {

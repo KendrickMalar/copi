@@ -63,6 +63,27 @@ export function validateContentLocations(items: readonly SavedItem[]): void {
   }
 }
 
+interface FileIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+interface StableFileState extends FileIdentity {
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  mode: bigint;
+}
+
+function sameInode(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameFileState(left: StableFileState, right: StableFileState): boolean {
+  return sameInode(left, right) && left.size === right.size && left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs && left.mode === right.mode;
+}
+
 async function safeLibraryRoot(libraryDir: string): Promise<string> {
   const requested = path.resolve(libraryDir);
   const rootStat = await lstat(requested);
@@ -86,22 +107,43 @@ async function checkedPath(root: string, relative: string, directory: boolean): 
   if (!isWithin(root, canonical)) throw new Error("Content path resolves outside the copi library.");
   const stat = await lstat(target);
   if (directory ? !stat.isDirectory() : !stat.isFile()) throw new Error(`Content path is not a regular ${directory ? "directory" : "file"}.`);
-  return target;
+  return canonical;
+}
+
+export async function validateRuntimeContentLocations(libraryDir: string, items: readonly SavedItem[]): Promise<void> {
+  if (items.length === 0) return;
+  validateContentLocations(items);
+  const libraryRoot = await safeLibraryRoot(libraryDir);
+  const sourcesRoot = await checkedPath(libraryRoot, "sources", true);
+  const locations: Array<{ id: string; path: string; identity: FileIdentity }> = [];
+  for (const item of items) {
+    const canonical = await checkedPath(libraryRoot, item.content.path, item.content.kind === "tree");
+    if (!isWithin(sourcesRoot, canonical)) throw new Error("Content path escapes the canonical sources root.");
+    const stat = await lstat(canonical, { bigint: true });
+    for (const other of locations) {
+      if (sameInode(stat, other.identity) || isWithin(other.path, canonical) || isWithin(canonical, other.path)) {
+        throw new Error(`Duplicate or overlapping physical content locations for items ${other.id} and ${item.id}.`);
+      }
+    }
+    locations.push({ id: item.id, path: canonical, identity: stat });
+  }
 }
 
 async function readRegularFile(libraryRoot: string, contentRoot: string, target: string): Promise<{ bytes: Buffer; mode: number }> {
-  const before = await lstat(target);
+  const before = await lstat(target, { bigint: true });
   if (!before.isFile() || before.isSymbolicLink()) throw new Error("Source content is not a regular file or is a symbolic link.");
   const canonical = await realpath(target);
   if (!isWithin(libraryRoot, canonical) || !isWithin(contentRoot, canonical)) throw new Error("Source content resolves outside its registered content location.");
   const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
-    const opened = await handle.stat();
-    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("Source content inode changed while it was being opened.");
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || !sameFileState(before, opened)) throw new Error("Source content changed while it was being opened.");
     const bytes = await handle.readFile();
-    const after = await lstat(target);
-    if (after.isSymbolicLink() || after.dev !== opened.dev || after.ino !== opened.ino) throw new Error("Source content inode changed during reading.");
-    return { bytes, mode: opened.mode & 0o777 };
+    const [afterHandle, after] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true })]);
+    if (after.isSymbolicLink() || !sameFileState(opened, afterHandle) || !sameFileState(opened, after)) {
+      throw new Error("Source content changed while it was being read.");
+    }
+    return { bytes, mode: Number(opened.mode & 0o777n) };
   } finally {
     await handle.close();
   }
