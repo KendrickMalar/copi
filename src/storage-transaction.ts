@@ -3,7 +3,7 @@ import { chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath,
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { parseStoredCatalog } from "./catalog.ts";
+import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { Catalog, InspectionWarning, SavedItem, SnapshotFile } from "./types.ts";
@@ -20,8 +20,8 @@ export interface StorageReviewView { readonly sensitivePaths: readonly string[];
 export interface StorageAuthorization { readonly review: StorageReview; readonly approval: { readonly reviewId: string; readonly confirmed: boolean; readonly approvedSensitivePaths: readonly string[] } }
 interface ReviewState { catalog: Buffer; replacements: StorageReplacement[]; sensitivePaths: string[]; warnings: InspectionWarning[] }
 const reviews = new WeakMap<StorageReview, ReviewState>();
-interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: string; mode: number }
-export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly tree: string }
+interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: string; mode: number; dev?: number; ino?: number }
+export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly catalogIdentity: string | null; readonly format: "v1" | "v2"; readonly tree: string }
 export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-held" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "rollback-catalog-held" | "finalized" | "rollback-finalized";
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
 interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean }
@@ -105,20 +105,21 @@ async function checkedDirectory(target: string): Promise<boolean> {
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe symbolic link or non-directory in copi storage: ${target}`);
   return true;
 }
-async function tree(target: string, replacements?: ReadonlyMap<string, string>): Promise<string | null> {
+async function tree(target: string, replacements?: ReadonlyMap<string, string>, includeIdentity = false): Promise<string | null> {
   if (!await statMaybe(target)) return null;
   const entries: TreeEntry[] = [];
   async function visit(current: string, relative: string): Promise<void> {
     const stat = await lstat(current);
-    if (stat.isSymbolicLink()) entries.push({ path: relative, kind: "link", value: await readlink(current), mode: stat.mode & 0o777 });
+    const identity = includeIdentity ? { dev: stat.dev, ino: stat.ino } : {};
+    if (stat.isSymbolicLink()) entries.push({ path: relative, kind: "link", value: await readlink(current), mode: stat.mode & 0o777, ...identity });
     else if (stat.isDirectory()) {
-      entries.push({ path: relative, kind: "directory", value: "", mode: stat.mode & 0o777 });
+      entries.push({ path: relative, kind: "directory", value: "", mode: stat.mode & 0o777, ...identity });
       const names = await readdir(current);
       const atRoot = relative === "." && replacements;
       for (const entry of [...new Set([...names, ...(atRoot ? replacements.keys() : [])])].sort()) {
         await visit(atRoot ? replacements.get(entry) ?? path.join(current, entry) : path.join(current, entry), path.posix.join(relative, entry));
       }
-    } else if (stat.isFile()) entries.push({ path: relative, kind: "file", value: hash(await readFile(current)), mode: stat.mode & 0o777 });
+    } else if (stat.isFile()) entries.push({ path: relative, kind: "file", value: hash(await readFile(current)), mode: stat.mode & 0o777, ...identity });
     else throw new Error("Unsupported special file in copi storage.");
   }
   await visit(target, ".");
@@ -201,7 +202,7 @@ export async function absentStorageRevision(libraryDir: string): Promise<Storage
   const missing: string[] = [];
   while (!await statMaybe(existing)) { missing.unshift(path.basename(existing)); existing = path.dirname(existing); }
   const root = path.join(await realpath(existing), ...missing);
-  return Object.freeze({ root, catalog: null, tree: "absent" });
+  return Object.freeze({ root, catalog: null, catalogIdentity: null, format: "v2", tree: "absent" });
 }
 
 function ownerFrom(value: unknown): Owner {
@@ -356,8 +357,8 @@ export class StorageTransactions {
 }
 
 export class StorageSession {
-  constructor(readonly root: string, private readonly lock: string, private readonly token: string, private readonly checkpoint?: StorageOptions["checkpoint"]) {}
-  private async assertLease(checkItems = true): Promise<void> {
+  constructor(readonly root: string, private readonly lock: string, private readonly token: string, private readonly checkpoint?: StorageOptions["checkpoint"], private readonly checkLegacyItems = true) {}
+  private async assertLease(checkItems = this.checkLegacyItems): Promise<void> {
     const lease = sessionLeases.get(this);
     if (!lease) throw new Error("Invalid or expired copi storage session; use the issued session inside its run callback.");
     if (lease.operation?.signal.aborted && !lease.operation.recovering) throw new Error("Copi storage session expired during its in-flight commit.");
@@ -368,9 +369,22 @@ export class StorageSession {
   }
   async capture(): Promise<StorageRevision> {
     await this.assertLease(false);
-    const catalog = await checkedFile(path.join(this.root, "catalog.json"));
-    const revision = Object.freeze({ root: this.root, catalog: catalog?.toString("base64") ?? null, tree: await tree(path.join(this.root, "items")) ?? "absent" });
-    await this.assertLease(false);
+    const catalogPath = path.join(this.root, "catalog.json");
+    const beforeCatalog = await statMaybe(catalogPath);
+    const catalog = await checkedFile(catalogPath);
+    const afterCatalog = await statMaybe(catalogPath);
+    const beforeIdentity = beforeCatalog ? `${beforeCatalog.dev}:${beforeCatalog.ino}` : null;
+    const catalogIdentity = afterCatalog ? `${afterCatalog.dev}:${afterCatalog.ino}` : null;
+    if (beforeIdentity !== catalogIdentity) throw new Error("Copi catalog changed while capturing its revision.");
+    const format = catalog === undefined ? "v2" : parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown).version === 1 ? "v1" : "v2";
+    const revision = Object.freeze({
+      root: this.root,
+      catalog: catalog?.toString("base64") ?? null,
+      catalogIdentity,
+      format,
+      tree: await tree(path.join(this.root, format === "v2" ? "sources" : "items"), undefined, format === "v2") ?? "absent",
+    });
+    await this.assertLease(format === "v1");
     return revision;
   }
   async assertRevision(expected: StorageRevision): Promise<void> {
@@ -382,7 +396,7 @@ export class StorageSession {
     if (this.root !== lease.root || this.lock !== lease.lock || this.token !== lease.owner.token) throw new Error("Copi session identity changed; refusing mutation.");
     const control: InFlightControl = { signal: lease.stop.signal, recovering: false };
     const worker = new StorageSession(lease.root, lease.lock, lease.owner.token,
-      (point, root) => inFlightCheckpoint(this.checkpoint, control, point, root));
+      (point, root) => inFlightCheckpoint(this.checkpoint, control, point, root), expected.format === "v1");
     sessionLeases.set(worker, { ...lease, pending: new Set(), operation: control });
     const operation = worker.#commitInFlight(expected, catalog, replacements, authorization);
     lease.pending.add(operation);
@@ -396,8 +410,13 @@ export class StorageSession {
     replacements = prepared.replacements;
     await this.assertLease();
     await this.assertRevision(expected);
-    const previous = expected.catalog === null ? { version: 1 as const, items: [], groups: [] } : parseStoredCatalog(JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown);
-    const next = parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown);
+    const previousStored = expected.catalog === null ? { version: 2 as const, items: [], groups: [] } : parseStoredCatalog(JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown);
+    const nextStored = parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown);
+    if (expected.format !== "v2" || previousStored.version !== 2 || nextStored.version !== 2) throw new Error("Ordinary storage commits require catalog v2; explicitly migrate legacy v1 storage first.");
+    assertModernCatalog(previousStored);
+    assertModernCatalog(nextStored);
+    const previous = previousStored;
+    const next = nextStored;
     await validateCommitCatalogs(this.root, previous, next, replacements);
     const operations: JournalOperation[] = [];
     if (new Set(replacements.map((replacement) => replacement.itemId)).size !== replacements.length) throw new Error("Duplicate snapshot replacement.");
