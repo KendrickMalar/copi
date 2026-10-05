@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
 import { inspectPreparedResource } from "../../src/inspect.ts";
@@ -14,11 +13,19 @@ export const cli = new URL("../../src/cli.js", import.meta.url).pathname;
 // Expectations derive from approved R1–R6, not implementation's reported behaviour.
 export const contract = Object.freeze({ preserve: ["id", "name", "kind", "savedAt", "destination"], final: "Replace saved copy with this approved source snapshot?", diff: "Approve this refresh diff and source metadata?", permission: "Authorize reading only this selected source file or directory tree now?" });
 export async function fixture(files: Record<string, string | Buffer> = { "SKILL.md": "# Original embedded name\ncopi-only edit\n" }, kind: ResourceKind = "skill") {
-  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "copi-r4-independent-")));
-  assert.ok(root.startsWith("/private/tmp/copi-issue1-tester4.G7sT9W/") || root.startsWith("/tmp/copi-issue1-tester4.G7sT9W/"), "fixtures must stay in assigned sandbox");
+  const assigned = await realpath(process.env.TMPDIR!);
+  assert.ok(assigned === "/private/tmp/copi-issue1-coder4.G6vORm/tmp" ||
+    assigned === "/private/tmp/copi-issue1-tester4.G7sT9W/tmp" ||
+    assigned === "/private/tmp/copi-issue1-coder3.v57BLf/tmp" ||
+    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp", "Fixtures require an exactly approved canonical TMPDIR.");
+  const root = await realpath(await mkdtemp(path.join(assigned, "copi-r4-independent-")));
+  assert.equal(path.dirname(root), assigned, "fixtures must stay directly under assigned TMPDIR");
   const home = path.join(root, "home"), agent = path.join(home, ".pi/agent"), cwd = path.join(root, "project"), source = path.join(root, "source"), tmp = path.join(root, "tmp"), cache = path.join(root, "cache");
   for (const dir of [agent, cwd, source, tmp, cache]) await mkdir(dir, { recursive: true });
   const b: Box = { root, home, agent, cwd, source, tmp, cache, library: path.join(home, ".copi") };
+  assert.equal(path.dirname(home), root, "explicit HOME must stay in its fixture");
+  assert.equal(path.relative(home, agent), ".pi/agent", "explicit agent must stay under fixture HOME");
+  assert.equal(environment(b).HOME, home); assert.equal(environment(b).PI_CODING_AGENT_DIR, agent);
   const sourcePath = kind === "skill" ? path.join(source, "original") : path.join(source, Object.keys(files)[0]!);
   for (const [relative, bytes] of Object.entries(files)) { const file = kind === "skill" ? path.join(sourcePath, relative) : sourcePath; await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, bytes); }
   const candidate: ResourceCandidate = { id: "fixture-source", name: "保存済みの名前", kind, source: "acceptance-original", scope: "project", sourceRoot: source, sourcePath, destination: kind === "model-config" || kind === "keybindings" ? { kind: "global-only" } : { kind: "project", path: kind === "skill" ? ".pi/skills/retained" : "AGENTS.md" } };
