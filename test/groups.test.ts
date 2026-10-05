@@ -29,6 +29,22 @@ test("keeps group edits in memory and lets the same saved item belong to multipl
   ]);
 });
 
+test("rejects normalized new names and ordinary mutations until existing duplicates are resolved", () => {
+  const catalog = newCatalog();
+  const first = createGroup(catalog, "Straße");
+  assert.throws(() => createGroup(catalog, " STRASSE "), /duplicate|conflict/i);
+  const second = createGroup(catalog, "Other");
+  assert.throws(() => renameGroup(catalog, second.id, "ＳＴＲＡＳＳＥ"), /duplicate|conflict/i);
+  second.name = "STRASSE";
+  const before = JSON.stringify(catalog);
+  assert.throws(() => createGroup(catalog, "Third"), /duplicate|conflict/i);
+  assert.throws(() => setGroupItems(catalog, first.id, []), /duplicate|conflict/i);
+  assert.equal(JSON.stringify(catalog), before);
+  renameGroup(catalog, second.id, " Separate ");
+  assert.equal(second.name, "Separate");
+  setGroupItems(catalog, first.id, []);
+});
+
 test("rejects invalid group edits without changing existing membership", () => {
   const catalog = newCatalog();
   const group = createGroup(catalog, "Daily");

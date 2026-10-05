@@ -1,11 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
+import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
+import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
+import { assertPreparedInspection, inspectFixedResource, inspectPreparedResource } from "./inspect.ts";
+import { absentStorageRevision, prepareStorageReview, storageTransactions, type StorageRevision, type StorageSession } from "./storage-transaction.ts";
+
 import type { Catalog, Group, InspectionResult, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents } from "./types.ts";
+
+const catalogRevisions = new WeakMap<Catalog, StorageRevision>();
 
 export interface ImportOptions {
   confirmed: boolean;
   groupIds: string[];
+  inspection?: PreparedInspection;
+  approvedSensitivePaths?: readonly string[];
 }
 
 declare const preparedResourceBrand: unique symbol;
@@ -73,7 +81,7 @@ function isWithin(root: string, target: string): boolean {
 }
 
 function safeRelativePath(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || value.includes("\\") || path.posix.isAbsolute(value)) return false;
+  if (typeof value !== "string" || value.length === 0 || value.includes("\\") || value.includes("\0") || path.posix.isAbsolute(value)) return false;
   const parts = value.split("/");
   return parts.every((part) => part.length > 0 && part !== "." && part !== "..") && path.posix.normalize(value) === value;
 }
@@ -132,34 +140,10 @@ function parseCatalog(value: unknown): Catalog {
   return { version: 1, items: items as SavedItem[], groups: groups as Group[] };
 }
 
-async function ensurePrivateDirectory(requestedPath: string, mode: number): Promise<string> {
-  const absolute = path.resolve(requestedPath);
-  const parsed = path.parse(absolute);
-  const segments = absolute.slice(parsed.root.length).split(path.sep).filter(Boolean);
-  if (segments.length === 0) throw new Error("Refusing to use the filesystem root as a copi directory.");
-  let current = parsed.root;
-  for (let index = 0; index < segments.length; index += 1) {
-    const segment = segments[index];
-    if (!segment) continue;
-    let next = path.join(current, segment);
-    let stat = await lstat(next).catch(() => undefined);
-    if (!stat) {
-      await mkdir(next, { mode: 0o700 });
-      stat = await lstat(next);
-    }
-    if (stat.isSymbolicLink()) {
-      if (index === segments.length - 1) throw new Error("Refusing to follow a symbolic link for a copi storage directory.");
-      next = await realpath(next);
-      stat = await lstat(next);
-    }
-    if (!stat.isDirectory()) throw new Error("A copi storage path component is not a directory.");
-    current = next;
-  }
-  await chmod(current, mode);
-  return await realpath(current);
-}
+/** @internal Shared validation for the persistence kernel, not a saving API. */
+export { parseCatalog as parseStoredCatalog };
 
-async function ensurePrivateSubdirectory(root: string, relativePath: string, mode: number | undefined, create: boolean): Promise<string> {
+async function existingPrivateSubdirectory(root: string, relativePath: string): Promise<string> {
   if (!safeRelativePath(relativePath)) throw new Error("Unsafe relative path inside copi storage.");
   const canonicalRoot = await realpath(root);
   const rootStat = await lstat(canonicalRoot);
@@ -167,16 +151,11 @@ async function ensurePrivateSubdirectory(root: string, relativePath: string, mod
   let current = canonicalRoot;
   for (const segment of relativePath.split("/")) {
     const next = path.join(current, segment);
-    let stat = await lstat(next).catch((error: NodeJS.ErrnoException) => {
+    const stat = await lstat(next).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
       throw error;
     });
-    if (!stat && create) {
-      await mkdir(next, { mode: 0o700 });
-      stat = await lstat(next);
-    }
     if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Copi storage contains a missing, non-directory, or symbolic-link path component.");
-    if (mode !== undefined) await chmod(next, mode);
     current = next;
   }
   return current;
@@ -294,31 +273,10 @@ export function readPreparedResource(prepared: PreparedResource): PreparedResour
 function validateCandidate(candidate: ResourceCandidate): void {
   if (!candidate || typeof candidate !== "object" || !kinds.has(candidate.kind) || !scopes.has(candidate.scope) || typeof candidate.source !== "string" || !candidate.source || typeof candidate.name !== "string" || !candidate.name || !path.isAbsolute(candidate.sourceRoot) || !path.isAbsolute(candidate.sourcePath)) throw new Error("Invalid resource candidate.");
   const destination = candidate.destination;
-  if (!destination || (destination.kind !== "global-only" && !(destination.kind === "project" && safeRelativePath(destination.path)))) throw new Error("Invalid resource destination.");
+  if (!destination || (destination.kind !== "global-only" && !(destination.kind === "project" && safeRelativePath(destination.path) && !excludedRelative(destination.path)))) throw new Error("Invalid or private/excluded resource destination.");
 }
 
-async function writeSnapshotFiles(root: string, itemId: string, files: SourceFile[]): Promise<SnapshotFile[]> {
-  const itemRoot = await ensurePrivateSubdirectory(root, path.posix.join("items", itemId, "files"), 0o700, true);
-  const snapshots: SnapshotFile[] = [];
-  for (const file of files) {
-    const outputPath = path.resolve(itemRoot, ...file.path.split("/"));
-    if (!isWithin(itemRoot, outputPath)) throw new Error("Snapshot file path escapes the item directory.");
-    const parentRelative = path.posix.dirname(file.path);
-    const parent = parentRelative === "." ? itemRoot : await ensurePrivateSubdirectory(itemRoot, parentRelative, 0o700, true);
-    const target = path.join(parent, path.basename(outputPath));
-    const handle = await open(target, "wx", 0o600);
-    try {
-      await handle.writeFile(file.bytes);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    snapshots.push({ path: file.path, mode: file.mode, sha256: createHash("sha256").update(file.bytes).digest("hex") });
-  }
-  return snapshots;
-}
-
-export async function loadCatalog(libraryDir: string): Promise<Catalog> {
+async function loadCatalogUnlocked(libraryDir: string): Promise<Catalog> {
   const root = await existingStoreRoot(libraryDir);
   if (!root) return newCatalog();
   const filePath = path.join(root, "catalog.json");
@@ -337,86 +295,156 @@ export async function loadCatalog(libraryDir: string): Promise<Catalog> {
   return parseCatalog(value);
 }
 
-export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
-  const validated = parseCatalog(catalog);
-  const root = await ensurePrivateDirectory(libraryDir, 0o700);
-  const destination = path.join(root, "catalog.json");
-  const temporary = path.join(root, `catalog.${randomUUID()}.tmp`);
-  const handle = await open(temporary, "wx", 0o600);
-  try {
-    await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
-    await handle.sync();
-  } catch (error) {
-    await rm(temporary, { force: true });
-    throw error;
-  } finally {
-    await handle.close();
-  }
-  await rename(temporary, destination);
-  await chmod(destination, 0o600);
+export function catalogBytes(catalog: Catalog): Buffer {
+  return Buffer.from(`${JSON.stringify(parseCatalog(catalog), null, 2)}\n`, "utf8");
 }
 
-async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[]): Promise<SavedItem> {
+export async function loadCatalog(libraryDir: string): Promise<Catalog> {
+  return storageTransactions.run(libraryDir, false, async (session) => {
+    if (!session) {
+      const catalog = newCatalog();
+      catalogRevisions.set(catalog, await absentStorageRevision(libraryDir));
+      return catalog;
+    }
+    const revision = await session.capture();
+    const catalog = await loadCatalogUnlocked(session.root);
+    await session.assertRevision(revision);
+    catalogRevisions.set(catalog, revision);
+    return catalog;
+  });
+}
+
+export interface SavedLibraryState {
+  catalog: Catalog;
+  revision: StorageRevision;
+  files: Map<string, SnapshotFileContents[]>;
+  session: StorageSession;
+}
+
+/** Internal seam: a single lock, checked catalog and all snapshots; no recursive reader locking. */
+export async function withSavedLibrary<T>(libraryDir: string, operation: (state: SavedLibraryState) => Promise<T>): Promise<T> {
+  return storageTransactions.run(libraryDir, false, async (session) => {
+    if (!session) throw new Error("Snapshot catalog does not exist.");
+    const revision = await session.capture();
+    const catalog = await loadCatalogUnlocked(session.root);
+    const files = new Map<string, SnapshotFileContents[]>();
+    for (const item of catalog.items) files.set(item.id, await readSnapshotFilesUnlocked(session.root, catalog, item));
+    await session.assertRevision(revision);
+    return operation({ catalog, revision, files, session });
+  });
+}
+
+export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
+  const validated = parseCatalog(catalog);
+  assertNoNameConflicts(validated);
+  const binding = catalogRevisions.get(catalog);
+  // Invalid new names are rejected without creating a library.
+  const preflight = await loadCatalog(libraryDir);
+  assertNoNameConflicts(preflight);
+  await storageTransactions.run(libraryDir, true, async (session) => {
+    if (!session) throw new Error("Missing storage session.");
+    const revision = await session.capture();
+    const current = await loadCatalogUnlocked(session.root);
+    assertNoNameConflicts(current);
+    for (const item of current.items) await readSnapshotFilesUnlocked(session.root, current, item);
+    if (binding) await session.assertRevision(binding);
+    else {
+      if (current.items.length > 0 || current.groups.length > 0) throw new Error("Saving an existing catalog requires the original object returned by loadCatalog; detached catalogs have no verified starting revision.");
+      if (JSON.stringify(current) !== JSON.stringify(preflight)) throw new Error("Catalog changed before saving.");
+    }
+    for (const item of validated.items) {
+      const old = current.items.find((entry) => entry.id === item.id);
+      if (old?.destination.kind === "global-only" && item.destination.kind !== "global-only") throw new Error("A reference-only/global-only resource cannot become project-applicable.");
+      if (JSON.stringify(old?.destination) !== JSON.stringify(item.destination) && item.destination.kind === "project" && excludedRelative(item.destination.path)) throw new Error("Invalid or private/excluded resource destination.");
+      const files = await readSnapshotFilesUnlocked(session.root, validated, item);
+      if (!old || JSON.stringify(old.files) !== JSON.stringify(item.files)) {
+        const inspection = inspectFixedResource({ candidate: { ...item, sourceRoot: path.dirname(item.sourcePath) }, files, excludedPaths: [] });
+        if (inspection.sensitivePaths.length > 0) throw new Error("Content changes require a prepared inspection and individual approval; use the saved-change API.");
+      }
+    }
+    await session.commit(revision, catalogBytes(validated));
+    catalogRevisions.set(catalog, await session.capture());
+  });
+}
+
+async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[], approvedSensitivePaths: readonly string[]): Promise<SavedItem> {
+  const preflight = await loadCatalog(libraryDir);
+  assertNoNameConflicts(preflight);
+  assertNameAvailable(preflight, "item", candidate.name);
   const groupIds = [...new Set(requestedGroupIds)];
-  const catalog = await loadCatalog(libraryDir);
-  const groups = new Map(catalog.groups.map((group) => [group.id, group]));
-  if (groupIds.some((id) => !groups.has(id))) throw new Error("Cannot import a resource into an unknown group.");
-  const root = await ensurePrivateDirectory(libraryDir, 0o700);
-  const id = randomUUID();
-  const item: SavedItem = {
-    id,
-    kind: candidate.kind,
-    source: candidate.source,
-    scope: candidate.scope,
-    sourcePath: candidate.sourcePath,
-    destination: candidate.destination,
-    name: candidate.name,
-    savedAt: new Date().toISOString(),
-    files: [],
-  };
-  const itemDirectory = path.join(root, "items", id);
-  try {
-    item.files = await writeSnapshotFiles(root, id, sourceFiles);
+  if (groupIds.some((id) => !preflight.groups.some((group) => group.id === id))) throw new Error("Cannot import a resource into an unknown group.");
+  return storageTransactions.run(libraryDir, true, async (session) => {
+    if (!session) throw new Error("Missing storage session.");
+    const revision = await session.capture();
+    const catalog = await loadCatalogUnlocked(session.root);
+    assertNoNameConflicts(catalog);
+    assertNameAvailable(catalog, "item", candidate.name);
+    for (const saved of catalog.items) await readSnapshotFilesUnlocked(session.root, catalog, saved);
+    const groups = new Map(catalog.groups.map((group) => [group.id, group]));
+    if (groupIds.some((id) => !groups.has(id))) throw new Error("Cannot import a resource into an unknown group.");
+    const item: SavedItem = {
+      id: randomUUID(), kind: candidate.kind, source: candidate.source, scope: candidate.scope,
+      sourcePath: candidate.sourcePath, destination: { ...candidate.destination }, name: candidate.name.trim(), savedAt: new Date().toISOString(),
+      files: sourceFiles.map((file) => ({ path: file.path, mode: file.mode, sha256: createHash("sha256").update(file.bytes).digest("hex") })),
+    };
     catalog.items.push(item);
-    for (const groupId of groupIds) groups.get(groupId)?.itemIds.push(id);
-    await saveCatalog(root, catalog);
-  } catch (error) {
-    await rm(itemDirectory, { recursive: true, force: true });
-    throw error;
-  }
-  return item;
+    for (const groupId of groupIds) groups.get(groupId)?.itemIds.push(item.id);
+    const bytes = catalogBytes(catalog);
+    const replacements = [{ itemId: item.id, files: sourceFiles }];
+    const review = prepareStorageReview(bytes, replacements);
+    await session.commit(revision, bytes, replacements, { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: approvedSensitivePaths.map((filePath) => `${item.id}/${filePath}`) } });
+    return structuredClone(item);
+  });
 }
 
 export async function importPreparedResource(libraryDir: string, prepared: PreparedResource, options: PreparedImportOptions): Promise<SavedItem | null> {
-  if (!options.confirmed) return null;
+  if (options.confirmed !== true) return null;
   const snapshot = getPreparedSnapshot(prepared);
-  if (options.inspection.preparedResource !== prepared) throw new Error("Inspection does not match the prepared resource.");
-  const inspectedPaths = new Set(options.inspection.sensitivePaths);
-  const approvedPaths = new Set(options.approvedSensitivePaths);
+  const inspection = options.inspection;
+  const approvedSensitivePaths = [...options.approvedSensitivePaths];
+  const groupIds = [...options.groupIds];
+  assertPreparedInspection(inspection, prepared);
+  const internalInspection = await inspectPreparedResource(prepared);
+  const inspectedPaths = new Set(internalInspection.sensitivePaths);
+  const approvedPaths = new Set(approvedSensitivePaths);
   const availablePaths = new Set(snapshot.files.map((file) => file.path));
-  if (inspectedPaths.size !== options.inspection.sensitivePaths.length || approvedPaths.size !== options.approvedSensitivePaths.length ||
+  if (inspectedPaths.size !== inspection.sensitivePaths.length || approvedPaths.size !== approvedSensitivePaths.length ||
       [...inspectedPaths].some((filePath) => !availablePaths.has(filePath)) || inspectedPaths.size !== approvedPaths.size ||
       [...inspectedPaths].some((filePath) => !approvedPaths.has(filePath))) {
     throw new Error("Prepared import requires approval for every suspected sensitive file in its inspection.");
   }
-  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, options.groupIds);
+  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, groupIds, [...approvedPaths]);
 }
 
 export async function importResource(libraryDir: string, candidate: ResourceCandidate, options: ImportOptions): Promise<SavedItem | null> {
-  if (!options.confirmed) return null;
-  const prepared = await prepareResource(candidate);
+  if (options.confirmed !== true) return null;
+  const capturedCandidate = copyCandidate(candidate);
+  const suppliedInspection = options.inspection;
+  const approvedSensitivePaths = [...(options.approvedSensitivePaths ?? [])];
+  const groupIds = [...options.groupIds];
+  const prepared = suppliedInspection?.preparedResource ?? await prepareResource(capturedCandidate);
   const snapshot = getPreparedSnapshot(prepared);
-  return storePreparedResource(libraryDir, snapshot.candidate, snapshot.files, options.groupIds);
+  if (suppliedInspection) {
+    assertPreparedInspection(suppliedInspection, prepared);
+    const fixed = snapshot.candidate;
+    const sameDestination = capturedCandidate.destination?.kind === fixed.destination.kind &&
+      (fixed.destination.kind !== "project" || (capturedCandidate.destination.kind === "project" && capturedCandidate.destination.path === fixed.destination.path));
+    if (["id", "kind", "source", "scope", "sourceRoot", "sourcePath", "name"].some((key) => capturedCandidate[key as keyof ResourceCandidate] !== fixed[key as keyof ResourceCandidate]) || !sameDestination) {
+      throw new Error("Inspection candidate does not match the prepared resource metadata.");
+    }
+  }
+  const inspection = await inspectPreparedResource(prepared);
+  if (!suppliedInspection && inspection.sensitivePaths.length > 0) throw new Error("A prepared inspection and individual approval are required for sensitive content.");
+  return importPreparedResource(libraryDir, prepared, { confirmed: true, groupIds, inspection: suppliedInspection ?? inspection, approvedSensitivePaths });
 }
 
-export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Promise<SnapshotFileContents[]> {
+async function readSnapshotFilesUnlocked(libraryDir: string, catalog: Catalog, item: SavedItem): Promise<SnapshotFileContents[]> {
   if (!itemIdPattern.test(item.id)) throw new Error("Invalid snapshot identifier.");
   const root = await existingStoreRoot(libraryDir);
   if (!root) throw new Error("Snapshot catalog does not exist.");
-  const catalog = await loadCatalog(root);
   const storedItem = catalog.items.find((entry) => entry.id === item.id);
   if (!storedItem) throw new Error("Snapshot is not present in the catalog.");
-  const canonicalFilesRoot = await ensurePrivateSubdirectory(root, path.posix.join("items", storedItem.id, "files"), undefined, false);
+  const canonicalFilesRoot = await existingPrivateSubdirectory(root, path.posix.join("items", storedItem.id, "files"));
   const results: SnapshotFileContents[] = [];
   for (const file of storedItem.files) {
     if (!safeRelativePath(file.path)) throw new Error("Catalog contains an unsafe snapshot path.");
@@ -431,10 +459,71 @@ export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Pr
     const canonicalFile = await realpath(filePath);
     if (!isWithin(canonicalFilesRoot, canonicalFile)) throw new Error("Snapshot path resolves outside the item directory.");
     const bytes = await readFile(canonicalFile);
-    if (createHash("sha256").update(bytes).digest("hex") !== file.sha256) throw new Error(`Snapshot checksum mismatch for ${file.path}.`);
+    if (createHash("sha256").update(bytes).digest("hex") !== file.sha256) throw new Error(`Snapshot checksum mismatch for ${file.path}: saved bytes were manually changed or damaged. Changes are stopped; inspect the saved copy and its source before re-importing. Checksums are not automatically repaired.`);
     results.push({ ...file, bytes });
   }
   return results;
+}
+
+export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Promise<SnapshotFileContents[]> {
+  return storageTransactions.run(libraryDir, false, async (session) => {
+    if (!session) throw new Error("Snapshot catalog does not exist.");
+    const revision = await session.capture();
+    const catalog = await loadCatalogUnlocked(session.root);
+    const result = await readSnapshotFilesUnlocked(session.root, catalog, item);
+    await session.assertRevision(revision);
+    return result;
+  });
+}
+
+/** Persist staged, explicit name-only changes together, so cancellation never partially resolves names. */
+export async function saveNameChanges(libraryDir: string, before: Catalog, after: Catalog): Promise<void> {
+  return withSavedLibrary(libraryDir, async ({ catalog: current, revision, session }) => {
+    await saveNameChangesLocked(before, after, current, revision, session);
+  });
+}
+
+async function saveNameChangesLocked(before: Catalog, after: Catalog, current: Catalog, revision: StorageRevision, session: StorageSession): Promise<void> {
+  const validated = parseCatalog(after);
+  if (JSON.stringify(current) !== JSON.stringify(before)) throw new Error("Catalog changed while renaming; reload before trying again.");
+  const restored = structuredClone(validated);
+  const conflicts = findNameConflicts(before);
+  for (const namespace of ["item", "group"] as const) {
+    const previousEntries = namespace === "item" ? before.items : before.groups;
+    const nextEntries = namespace === "item" ? restored.items : restored.groups;
+    if (previousEntries.length !== nextEntries.length) throw new Error("Renaming must preserve catalog entries.");
+    for (const [index, entry] of nextEntries.entries()) {
+      const previous = previousEntries[index];
+      if (!previous || previous.id !== entry.id) throw new Error("Renaming must preserve catalog identifiers and order.");
+      if (entry.name !== previous.name) {
+        if (conflicts.length > 0 && !conflicts.some((conflict) => conflict.namespace === namespace && conflict.ids.includes(entry.id))) {
+          throw new Error("Only conflicting names may change until duplicate names are resolved.");
+        }
+        nameKey(entry.name);
+        const finalEntries = namespace === "item" ? validated.items : validated.groups;
+        if (finalEntries.some((other) => other.id !== entry.id && nameKey(other.name) === nameKey(entry.name))) {
+          throw new Error("Duplicate name; choose a unique display name.");
+        }
+      }
+      entry.name = previous.name;
+    }
+  }
+  if (JSON.stringify(restored) !== JSON.stringify(before)) throw new Error("Renaming must preserve metadata, files, destinations, and group references.");
+  const binding = catalogRevisions.get(before);
+  if (!binding) throw new Error("Renaming requires the original before-catalog returned by loadCatalog; reload to obtain a verified revision.");
+  await session.assertRevision(binding);
+  await session.commit(revision, catalogBytes(validated));
+}
+
+export async function renameSavedItem(libraryDir: string, itemId: string, name: string): Promise<SavedItem> {
+  const before = await loadCatalog(libraryDir);
+  const after = structuredClone(before);
+  const item = after.items.find((entry) => entry.id === itemId);
+  if (!item) throw new Error("Unknown saved item.");
+  assertNameAvailable(before, "item", name, itemId);
+  item.name = name.trim();
+  await saveNameChanges(libraryDir, before, after);
+  return item;
 }
 
 export async function listSnapshots(libraryDir: string): Promise<SavedItem[]> {

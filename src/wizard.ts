@@ -1,13 +1,76 @@
-import { autocompleteMultiselect, cancel, confirm, intro, isCancel, log, note, outro, select, text } from "@clack/prompts";
+import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, text as clackText } from "@clack/prompts";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import { importPreparedResource, loadCatalog, prepareResource, readPreparedResource, saveCatalog, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
+import { importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
+import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
 import type { Catalog, Group, ResourceCandidate, SavedItem } from "./types.ts";
+
+/** Mask display metadata too, and render controls literally rather than executing VT sequences. */
+export function safeDisplay(value: string): string {
+  return maskSensitiveText(value)
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "[internal reference]")
+    .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g,
+      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+let activeSignal: AbortSignal | undefined;
+let editorOwnsControlInput = false;
+
+/** The editor parses literal paste versus cancel keys; stream EOF/errors/signals stay global. */
+export async function withEditorInput<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = editorOwnsControlInput;
+  editorOwnsControlInput = true;
+  try { return await operation(); }
+  finally { editorOwnsControlInput = previous; }
+}
+
+function inheritedSignal(signal?: AbortSignal): { signal?: AbortSignal } {
+  const current = signal ?? activeSignal;
+  return current ? { signal: current } : {};
+}
+const select: typeof clackSelect = (options) => clackSelect({
+  ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message),
+  options: options.options.map((option) => ({ ...option, label: safeDisplay(option.label ?? "Unavailable entry"), ...(option.hint === undefined ? {} : { hint: safeDisplay(option.hint) }) })),
+});
+const autocompleteMultiselect: typeof clackMultiselect = (options) => clackMultiselect({
+  ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message),
+  options: typeof options.options === "function" ? options.options : options.options.map((option) => ({ ...option, label: safeDisplay(option.label ?? "Unavailable entry"), ...(option.hint === undefined ? {} : { hint: safeDisplay(option.hint) }) })),
+});
+const text: typeof clackText = (options) => clackText({ ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message) });
+const confirm: typeof clackConfirm = (options) => clackConfirm({ ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message) });
+const note: typeof clackNote = (message, title, options) => clackNote(safeDisplay(message ?? ""), safeDisplay(title ?? ""), options);
+const intro: typeof clackIntro = (message, options) => clackIntro(safeDisplay(message ?? ""), options);
+const outro: typeof clackOutro = (message, options) => clackOutro(safeDisplay(message ?? ""), options);
+const cancel: typeof clackCancel = (message, options) => clackCancel(safeDisplay(message ?? ""), options);
+
+/** One process-wide interactive lifecycle shared by manage and its existing wizard routes. */
+export async function withWizardLifecycle(operation: (signal: AbortSignal) => Promise<void>): Promise<void> {
+  if (activeSignal) throw new Error("An interactive wizard is already active.");
+  const controller = new AbortController();
+  const wasRaw = Boolean(process.stdin.isRaw), wasFlowing = process.stdin.readableFlowing === true;
+  const abort = () => controller.abort();
+  const eofKey = (chunk: Buffer | string) => {
+    if (!editorOwnsControlInput && (typeof chunk === "string" ? chunk.includes("\u0004") : chunk.includes(4))) abort();
+  };
+  activeSignal = controller.signal;
+  process.stdin.on("end", abort); process.stdin.on("close", abort); process.stdin.on("error", abort); process.stdin.on("data", eofKey);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, abort);
+  try { await operation(controller.signal); }
+  finally {
+    activeSignal = undefined;
+    process.stdin.off("end", abort); process.stdin.off("close", abort); process.stdin.off("error", abort); process.stdin.off("data", eofKey);
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, abort);
+    if (process.stdin.isTTY) process.stdin.setRawMode(wasRaw);
+    // Adding our data listener starts an inactive reader too; restore its original ownership.
+    if (wasFlowing) process.stdin.resume();
+    else process.stdin.pause();
+    process.stdout.write("\u001b[?25h");
+  }
+}
 
 const previewMaxBytes = 1_000_000;
 const previewMaxFiles = 12;
@@ -37,7 +100,7 @@ export function formatMaskedPreview(relativePath: string, content: string): stri
   const lines = masked.split(/\r?\n/);
   const snippet = lines.slice(0, previewMaxLines).join("\n").slice(0, 2_000);
   const omitted = lines.length > previewMaxLines ? `\n… ${lines.length - previewMaxLines} more lines` : "";
-  return `${relativePath}:\n${snippet}${omitted}`;
+  return safeDisplay(`${relativePath}:\n${snippet}${omitted}`);
 }
 
 function formatPreparedFiles(files: readonly PreparedFile[]): string[] {
@@ -89,6 +152,125 @@ function showWarnings(warnings: readonly { code: string; path?: string; message:
   note(warnings.map((warning) => `${warning.path ? `${warning.path}: ` : ""}${warning.message}`).join("\n"), title);
 }
 
+function savedItemHint(catalog: Catalog, item: SavedItem): string {
+  const groups = catalog.groups.filter((group) => group.itemIds.includes(item.id)).map((group) => group.name).join(", ") || "no groups";
+  return `${groups} · ${item.source} · ${item.destination.kind === "project" ? item.destination.path : "saved only"}`;
+}
+
+async function viewSavedEntry(libraryDir: string): Promise<void> {
+  const catalog = await loadCatalog(libraryDir);
+  const entry = await select({
+    message: "Select saved resource or group",
+    options: [
+      ...catalog.items.map((item) => ({ value: `item:${item.id}`, label: `[${item.kind}] ${item.name}`, hint: savedItemHint(catalog, item) })),
+      ...catalog.groups.map((group) => ({ value: `group:${group.id}`, label: `[group] ${group.name}`, hint: `${group.itemIds.length} resources` })),
+    ],
+  });
+  if (isCancel(entry)) return;
+  const item = catalog.items.find((item) => `item:${item.id}` === entry);
+  if (item) {
+    const files = await readSnapshotFiles(libraryDir, item);
+    note(formatPreparedFiles(files).join("\n\n") || "No previewable files.", `Masked saved preview: ${item.name}`);
+  } else {
+    const group = catalog.groups.find((group) => `group:${group.id}` === entry);
+    if (!group) throw new Error("Selected group is no longer available.");
+    note(group.itemIds.map((id) => {
+      const member = catalog.items.find((item) => item.id === id);
+      return member ? `[${member.kind}] ${member.name} · ${savedItemHint(catalog, member)}` : "Unavailable resource";
+    }).join("\n") || "No saved resources.", group.name);
+  }
+}
+
+/** Resolve all staged conflicts in one name-only catalog save; cancellation writes nothing. */
+export async function resolveNameConflicts(libraryDir: string): Promise<void> {
+  const before = await loadCatalog(libraryDir);
+  const catalog = structuredClone(before);
+  if (findNameConflicts(catalog).length === 0) {
+    outro("No name conflicts.");
+    return;
+  }
+  while (true) {
+    const conflicts = findNameConflicts(catalog);
+    if (conflicts.length === 0) break;
+    const options = conflicts.flatMap((conflict) => conflict.ids.map((id) => {
+      if (conflict.namespace === "item") {
+        const item = catalog.items.find((entry) => entry.id === id)!;
+        return { value: `item:${id}`, label: `[${item.kind}] ${item.name}`, hint: savedItemHint(catalog, item) };
+      }
+      const group = catalog.groups.find((entry) => entry.id === id)!;
+      return { value: `group:${id}`, label: `[group] ${group.name}`, hint: `${group.itemIds.length} resources` };
+    }));
+    const selected = await select({ message: "Select a conflicting name to rename", options });
+    if (isCancel(selected)) {
+      cancel("Name changes were not saved.");
+      return;
+    }
+    const namespace = selected.startsWith("item:") ? "item" : "group";
+    const id = selected.slice(namespace.length + 1);
+    const entries = namespace === "item" ? catalog.items : catalog.groups;
+    const entry = entries.find((entry) => entry.id === id);
+    if (!entry) throw new Error("Selected name is no longer available.");
+    const name = await text({
+      message: `New name for ${entry.name}`,
+      validate: (value) => {
+        try {
+          assertNameAvailable(catalog, namespace, value ?? "", id);
+          return undefined;
+        } catch (error) {
+          return error instanceof Error ? error.message : "Choose a unique non-empty name.";
+        }
+      },
+    });
+    if (isCancel(name)) {
+      cancel("Name changes were not saved.");
+      return;
+    }
+    entry.name = name.trim();
+  }
+  const changes: string[] = [];
+  for (const namespace of ["item", "group"] as const) {
+    const oldEntries = namespace === "item" ? before.items : before.groups;
+    const nextEntries = namespace === "item" ? catalog.items : catalog.groups;
+    for (const entry of nextEntries) {
+      const previous = oldEntries.find((previous) => previous.id === entry.id)!;
+      if (previous.name !== entry.name) changes.push(`[${namespace}] ${previous.name} → ${entry.name}`);
+    }
+  }
+  note(changes.join("\n"), "Explicit name changes; saved contents and destinations stay unchanged");
+  const save = await confirm({ message: "Save these name changes?", initialValue: false });
+  if (isCancel(save) || !save) {
+    outro("Name changes were not saved.");
+    return;
+  }
+  assertNoNameConflicts(catalog);
+  await saveNameChanges(libraryDir, before, catalog);
+  outro("Name conflicts resolved. Run setup or groups again to make other changes.");
+}
+
+async function handleNameConflicts(libraryDir: string): Promise<boolean> {
+  if (findNameConflicts(await loadCatalog(libraryDir)).length === 0) return false;
+  while (true) {
+    const catalog = await loadCatalog(libraryDir);
+    const conflicts = findNameConflicts(catalog);
+    if (conflicts.length === 0) return true;
+    note(conflicts.map((conflict) => {
+      const entries = conflict.namespace === "item" ? catalog.items : catalog.groups;
+      return `[${conflict.namespace}] ${conflict.ids.map((id) => entries.find((entry) => entry.id === id)!.name).join(" / ")}`;
+    }).join("\n"), "Duplicate names: only listing, masked viewing, and resolution are allowed");
+    const action = await select({
+      message: "Unresolved names",
+      options: [
+        { value: "view", label: "View saved resources or groups (masked)" },
+        { value: "resolve", label: "Resolve name conflicts" },
+        { value: "done", label: "Finish without changes" },
+      ],
+    });
+    if (isCancel(action) || action === "done") return true;
+    if (action === "view") await viewSavedEntry(libraryDir);
+    else await resolveNameConflicts(libraryDir);
+  }
+}
+
 function groupOptions(groups: Group[]) {
   return groups.map((group) => ({ value: group.id, label: group.name, hint: `${group.itemIds.length} saved resources` }));
 }
@@ -96,12 +278,17 @@ function groupOptions(groups: Group[]) {
 async function askForGroupName(message: string): Promise<string | undefined> {
   const value = await text({
     message,
-    validate: (name) => name === undefined || name.trim().length === 0 ? "Enter a non-empty group name." : undefined,
+    validate: (name) => {
+      try { nameKey(name ?? ""); return undefined; }
+      catch { return "Enter a non-empty group name."; }
+    },
   });
   return isCancel(value) ? undefined : value.trim();
 }
 
 export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<void> {
+  if (await handleNameConflicts(libraryDir)) return;
+  assertNoNameConflicts(await loadCatalog(libraryDir));
   intro("copi setup");
   const scopeOptions: Array<{ value: "home" | "project"; label: string; hint: string }> = [];
   if (roots.homeDir) {
@@ -222,7 +409,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       else allSuspectedFilesApproved = false;
     }
     if (!allSuspectedFilesApproved) {
-      log.warn(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`);
+      log.warn(safeDisplay(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`));
       continue;
     }
     const groupIds = await autocompleteMultiselect({
@@ -243,7 +430,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     return;
   }
   const summary = approvedCandidates.map(({ review, groupIds }) => {
-    const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? id).join(", ");
+    const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? "Unavailable group").join(", ");
     return `${review.candidate.name} → ${names}`;
   }).join("\n");
   note(summary, "Resources ready to copy");
@@ -256,6 +443,14 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     return;
   }
 
+  // Validate the whole batch before saving groups or any snapshot.
+  const pending = structuredClone(catalog);
+  assertNoNameConflicts(pending);
+  for (const { review } of approvedCandidates) {
+    const candidate = readPreparedResource(review.prepared).candidate;
+    assertNameAvailable(pending, "item", candidate.name);
+    pending.items.push({ ...candidate, name: candidate.name.trim(), savedAt: new Date().toISOString(), files: [] });
+  }
   await saveCatalog(libraryDir, catalog);
   for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
     await saveReviewedCandidate(libraryDir, review, groupIds, approvedSensitivePaths, true);
@@ -264,6 +459,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
 }
 
 export async function runGroupManager(libraryDir: string): Promise<void> {
+  if (await handleNameConflicts(libraryDir)) return;
   const catalog = await loadCatalog(libraryDir);
   if (catalog.groups.length === 0) {
     note("No groups are saved yet.", "Groups");
@@ -349,7 +545,7 @@ export function printGroups(catalog: Catalog): void {
     process.stdout.write("No saved groups.\n");
     return;
   }
-  for (const group of catalog.groups) process.stdout.write(`${group.name} (${group.id}) — ${group.itemIds.length} resource(s)\n`);
+  for (const group of catalog.groups) process.stdout.write(`${safeDisplay(group.name)} — ${group.itemIds.length} resource(s)\n`);
 }
 
 export function printItems(items: SavedItem[]): void {
@@ -358,16 +554,16 @@ export function printItems(items: SavedItem[]): void {
     return;
   }
   for (const item of items) {
-    process.stdout.write(`${item.name} [${item.kind}] (${item.id}) — ${item.files.length} file(s), ${item.destination.kind === "global-only" ? "saved only" : item.destination.path}\n`);
+    process.stdout.write(`${safeDisplay(item.name)} [${item.kind}] — ${item.files.length} file(s), ${safeDisplay(item.destination.kind === "global-only" ? "saved only" : item.destination.path)}\n`);
   }
 }
 
 function resolveGroup(catalog: Catalog, value: string): Group {
   const matching = catalog.groups.filter((group) => group.id === value || group.name === value);
-  if (matching.length === 0) throw new Error(`Unknown group: ${value}`);
-  if (matching.length > 1) throw new Error(`Group name is ambiguous: ${value}; use a group ID.`);
+  if (matching.length === 0) throw new Error("Unknown group; select a saved group with copi manage.");
+  if (matching.length > 1) throw new Error("Group name is ambiguous; resolve name conflicts with copi manage.");
   const group = matching[0];
-  if (!group) throw new Error(`Unknown group: ${value}`);
+  if (!group) throw new Error("Selected group is unavailable.");
   return group;
 }
 
@@ -377,18 +573,18 @@ function formatPlan(plan: ApplyPlan, catalog: Catalog): string {
     const mark = file.alternatives.some((option) => option.sensitive) ? " [suspected secret; approval required]" : "";
     const preview = file.preview.kind === "text" ? `\n${file.preview.diff}` : `\n${file.preview.summary}`;
     const alternatives = file.alternatives.length > 1
-      ? `\n  candidates: ${file.alternatives.map((option) => itemNames.get(option.itemId) ?? option.itemId).join(", ")}`
+      ? `\n  candidates: ${file.alternatives.map((option) => itemNames.get(option.itemId) ?? "Unavailable resource").join(", ")}`
       : "";
     return `${file.status}: ${file.path}${mark}${alternatives}${preview}`;
   });
   const warnings = plan.warnings.map((warning) => `warning${warning.path ? ` ${warning.path}` : ""}: ${warning.message}`);
-  const skipped = plan.skippedItems.map((id) => `save-only resource skipped from apply: ${itemNames.get(id) ?? id}`);
+  const skipped = plan.skippedItems.map((id) => `save-only resource skipped from apply: ${itemNames.get(id) ?? "Unavailable resource"}`);
   return [...lines, ...warnings, ...skipped].join("\n\n") || "No project files need changes.";
 }
 
 export function formatApplyOptionPreview(filePath: string, resourceName: string, option: ApplyFileOption): string {
   const preview = option.preview.kind === "text" ? option.preview.diff : option.preview.summary;
-  return `${resourceName} → ${filePath}\n${preview}`;
+  return safeDisplay(`${resourceName} → ${filePath}\n${preview}`);
 }
 
 export async function runApplyDryRun(libraryDir: string, groupValue: string, projectDir: string): Promise<void> {
@@ -419,7 +615,7 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
         message: `Choose one resource for colliding path ${file.path}`,
         options: file.alternatives.map((option) => ({
           value: option.itemId,
-          label: catalog.items.find((item) => item.id === option.itemId)?.name ?? option.itemId,
+          label: catalog.items.find((item) => item.id === option.itemId)?.name ?? "Unavailable resource",
           hint: option.preview.kind === "text" ? "masked text diff available" : option.preview.summary,
         })),
       });
@@ -431,7 +627,7 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
       if (!selectedOption) throw new Error(`Selected resource is unavailable for ${file.path}.`);
       collisionDecisions[file.path] = selectedItem;
       sensitive = selectedOption.sensitive;
-      const selectedName = catalog.items.find((item) => item.id === selectedItem)?.name ?? selectedItem;
+      const selectedName = catalog.items.find((item) => item.id === selectedItem)?.name ?? "Unavailable resource";
       note(formatApplyOptionPreview(file.path, selectedName, selectedOption), "Selected colliding resource preview");
     }
     let hasExistingFile = file.status === "different";
