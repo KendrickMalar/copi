@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { loadCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { importPreparedResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { inspectPreparedResource } from "../src/inspect.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange, type ChangeApproval, type SavedChangeView } from "../src/resource-mutations.ts";
 import type { Catalog, ResourceCandidate, SavedItem } from "../src/types.ts";
 import { packageRefreshFixture, refreshCustody, refreshFixture } from "./helpers/refresh.ts";
@@ -195,3 +197,137 @@ for (const error of ["wrong kind", "wrong shape", "outside boundary", "source li
     if (error === "unknown physical file") assert.equal(await readFile(path.join(path.dirname(box.file), "unknown.md"), "utf8"), "do not remove\n");
   });
 }
+
+// Regression target: a genuine mutable discovery result must not move its
+// declared-package authority to a different capture via serialization/accessors.
+// Retain these new fixtures/evidence; existing helpers' own t.after remains unchanged.
+async function originTree(root: string): Promise<Record<string, string>> {
+  const entries: Record<string, string> = {};
+  const visit = async (target: string, relative: string): Promise<void> => {
+    const stat = await lstat(target), mode = (stat.mode & 0o777).toString(8);
+    if (stat.isSymbolicLink()) entries[relative] = `link:${await readlink(target)};mode:${mode}`;
+    else if (stat.isDirectory()) {
+      entries[relative] = `directory:${mode}`;
+      for (const name of (await readdir(target)).sort()) await visit(path.join(target, name), path.posix.join(relative, name));
+    } else entries[relative] = `file:${mode};hex:${(await readFile(target)).toString("hex")}`;
+  };
+  await visit(root, ".");
+  return entries;
+}
+async function originFixture() {
+  const assigned = await realpath(process.env.TMPDIR!);
+  assert.ok(assigned.startsWith("/private/tmp/copi-issue1-coder4.G6vORm/") || assigned.startsWith("/tmp/copi-issue1-coder4.G6vORm/"));
+  const root = await realpath(await mkdtemp(path.join(assigned, "copi-origin-fix1-")));
+  const homeDir = path.join(root, "home"), agentDir = path.join(homeDir, ".pi/agent"), projectDir = path.join(root, "project");
+  const packageRoot = path.join(agentDir, "npm/node_modules/declared-origin"), sourcePath = path.join(packageRoot, "skills/declared");
+  const outsideRoot = path.join(root, "not-in-approved-home-or-project"), forbidden = path.join(outsideRoot, "node_modules/undeclared/skill");
+  await Promise.all([mkdir(sourcePath, { recursive: true }), mkdir(projectDir), mkdir(forbidden, { recursive: true })]);
+  const sourceFile = path.join(sourcePath, "SKILL.md");
+  await writeFile(sourceFile, "declared original\n", { mode: 0o644 });
+  await writeFile(path.join(forbidden, "SKILL.md"), "UNDECLARED outside approved roots bytes\n", { mode: 0o751 });
+  await writeFile(path.join(packageRoot, "package.json"), JSON.stringify({ name: "declared-origin", pi: { skills: ["skills/declared"] } }));
+  await writeFile(path.join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:declared-origin"] }));
+  const candidate: ResourceCandidate = { id: "origin-fixture", kind: "skill", source: "package:npm:declared-origin", scope: "package", sourceRoot: packageRoot, sourcePath, name: "Retained name", destination: { kind: "project", path: ".pi/skills/retained" } };
+  const prepared = await prepareResource(candidate), inspection = await inspectPreparedResource(prepared), libraryDir = path.join(homeDir, ".copi");
+  const item = await importPreparedResource(libraryDir, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths }); assert.ok(item);
+  const options: DiscoveryOptions = { homeDir, agentDir, projectDir, scopes: { home: true, project: false } };
+  const refresh = await api(), origin = await refresh.discoverRefreshOrigin(item, options); assert.ok(origin);
+  const file = path.join(libraryDir, "items", item.id, "files/SKILL.md");
+  const custody = async () => ({ library: await originTree(libraryDir), approvedSource: await originTree(agentDir), outside: await originTree(outsideRoot), project: await originTree(projectDir) });
+  console.log(`origin retained fixture=${root}`);
+  return { root, libraryDir, item, origin, refresh, file, sourceFile, agentDir, outsideRoot, forbidden, options, custody };
+}
+async function originEvidence(box: Awaited<ReturnType<typeof originFixture>>, label: string, details: unknown) {
+  const bytes = Buffer.from(JSON.stringify(details, null, 2));
+  const filename = path.join(box.root, `${label}.json`); await writeFile(filename, bytes);
+  console.log(`origin evidence=${filename} bytes=${bytes.length} sha256=${createHash("sha256").update(bytes).digest("hex")}`);
+}
+
+for (const attack of ["prototype-toJSON", "nonenumerable-own-toJSON"] as const) {
+  test(`origin-fix1 R5 ${attack} refuses actual prepare/commit of outside undeclared bytes`, async () => {
+    const box = await originFixture(), initial = structuredClone(box.origin), before = await box.custody();
+    const forged = { ...initial, sourcePath: box.forbidden, sourceRoot: path.dirname(box.forbidden) };
+    await assert.rejects(box.refresh.prepareRefresh(box.libraryDir, box.item.id, forged), /private|excluded/i);
+    assert.deepEqual(await box.custody(), before, "plain forged control must preserve all FS");
+    if (attack === "prototype-toJSON") Object.setPrototypeOf(box.origin, { toJSON: () => initial });
+    else Object.defineProperty(box.origin, "toJSON", { enumerable: false, value: () => initial });
+    Object.assign(box.origin, { sourcePath: box.forbidden, sourceRoot: path.dirname(box.forbidden) });
+    let outcome = "rejected", error = "";
+    try {
+      const token = await box.refresh.prepareRefresh(box.libraryDir, box.item.id, box.origin);
+      await box.refresh.commitRefresh(token, approval(box.refresh, token));
+      outcome = "COMMITTED outside undeclared bytes";
+    } catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
+    const after = await box.custody();
+    await originEvidence(box, attack, { outcome, error, initial, forbidden: box.forbidden, before, after, savedHex: (await readFile(box.file)).toString("hex") });
+    assert.deepEqual(after.approvedSource, before.approvedSource);
+    assert.deepEqual(after.outside, before.outside);
+    assert.deepEqual(after.project, before.project);
+    assert.equal(outcome, "rejected", "declared authority must not authorize mutated/serialized outside source");
+    assert.deepEqual(after.library, before.library);
+  });
+}
+
+for (const attack of ["clone", "manual-label", "mutation", "proxy", "prototype-derived", "custom-prototype", "accessor-switch", "accessor-same", "nonenumerable-field", "extra-symbol", "nested-mutation", "nested-prototype", "nested-toJSON", "nested-accessor", "nested-proxy"] as const) {
+  test(`origin-fix1 R5 ${attack} rejects at prepare with full FS custody`, async () => {
+    const box = await originFixture(), initial = structuredClone(box.origin);
+    await writeFile(box.sourceFile, "current declared replacement\n");
+    let source = box.origin, invoked = 0;
+    const outside = { sourcePath: box.forbidden, sourceRoot: path.dirname(box.forbidden) };
+    if (attack === "clone") source = Object.assign(structuredClone(initial), outside);
+    if (attack === "manual-label") source = { ...initial, ...outside };
+    if (attack === "mutation") Object.assign(source, outside);
+    if (attack === "proxy") source = new Proxy(source, { get(target, key, receiver) { invoked++; return Reflect.get(target, key, receiver); } });
+    if (attack === "prototype-derived") source = Object.create(source) as ResourceCandidate;
+    if (attack === "custom-prototype") Object.setPrototypeOf(source, { marker: "different prototype" });
+    if (attack === "accessor-switch" || attack === "accessor-same") {
+      Object.defineProperty(source, "sourcePath", { enumerable: true, get: () => { invoked++; return attack === "accessor-switch" && invoked > 1 ? box.forbidden : initial.sourcePath; } });
+    }
+    if (attack === "nonenumerable-field") Object.defineProperty(source, "sourcePath", { enumerable: false, value: initial.sourcePath });
+    if (attack === "extra-symbol") Object.defineProperty(source, Symbol("hidden"), { value: initial });
+    if (attack === "nested-mutation" && source.destination.kind === "project") source.destination.path = ".pi/skills/unreviewed";
+    if (attack === "nested-prototype") Object.setPrototypeOf(source.destination, { marker: "nested prototype" });
+    if (attack === "nested-toJSON") Object.defineProperty(source.destination, "toJSON", { enumerable: false, value: () => initial.destination });
+    if (attack === "nested-accessor") Object.defineProperty(source.destination, "path", { enumerable: true, get: () => { invoked++; return ".pi/skills/unreviewed"; } });
+    if (attack === "nested-proxy") source.destination = new Proxy(source.destination, { get(target, key, receiver) { invoked++; return Reflect.get(target, key, receiver); } });
+    const before = await box.custody();
+    let outcome = "rejected", error = "";
+    try { await box.refresh.prepareRefresh(box.libraryDir, box.item.id, source); outcome = "PREPARED tampered origin"; }
+    catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
+    const after = await box.custody(); await originEvidence(box, attack, { outcome, error, invoked, before, after });
+    assert.equal(outcome, "rejected", "altered origin must reject, not silently prepare the internal original");
+    assert.deepEqual(after, before);
+    assert.equal(invoked, 0, "authority capture must not invoke caller accessors or proxy traps");
+  });
+}
+
+test("origin-fix1 R5 genuine declared source binds invocation capture and fixed secret bytes", async () => {
+  const box = await originFixture(), expected = Buffer.from("apiKey=sk_live_originFIXED123456789\n");
+  await writeFile(box.sourceFile, expected); await chmod(box.sourceFile, 0o751);
+  const before = await loadCatalog(box.libraryDir), initial = structuredClone(box.origin);
+  // Invocation synchronously captures before any lock/read await. Later caller
+  // mutations must not redirect the same prepare; its source bytes then freeze.
+  const pending = box.refresh.prepareRefresh(box.libraryDir, box.item.id, box.origin);
+  Object.assign(box.origin, { sourcePath: box.forbidden, sourceRoot: path.dirname(box.forbidden) });
+  box.origin.destination = { kind: "global-only" };
+  const token = await pending, view = box.refresh.readRefresh(token);
+  assert.deepEqual(view.source, initial);
+  assert.deepEqual(view.sensitivePaths, ["SKILL.md"]);
+  assert.ok(!JSON.stringify(view.diffs).includes("sk_live_"));
+  const unchanged = await box.custody();
+  await assert.rejects(box.refresh.commitRefresh(token, { reviewId: token.reviewId, confirmed: true, approvedSensitivePaths: [] }), /approval/i);
+  assert.deepEqual(await box.custody(), unchanged);
+  await writeFile(box.sourceFile, "later unapproved original bytes\n");
+  const originals = await box.custody();
+  const saved = await box.refresh.commitRefresh(token, approval(box.refresh, token));
+  const after = await box.custody();
+  assert.deepEqual(after.approvedSource, originals.approvedSource); assert.deepEqual(after.outside, originals.outside); assert.deepEqual(after.project, originals.project);
+  assert.deepEqual(await readFile(box.file), expected);
+  assert.deepEqual((await readSnapshotFiles(box.libraryDir, saved))[0]!.bytes, expected);
+  assert.equal(saved.files[0]!.sha256, createHash("sha256").update(expected).digest("hex"));
+  assert.equal(saved.files[0]!.mode, 0o751); assert.equal((await lstat(box.file)).mode & 0o777, 0o600);
+  assert.deepEqual({ ...saved, files: [] }, { ...box.item, files: [] });
+  assert.deepEqual((await loadCatalog(box.libraryDir)).groups, before.groups);
+  await assert.rejects(box.refresh.commitRefresh(token, approval(box.refresh, token)), /already/i);
+  await originEvidence(box, "genuine-positive", { before, after, fixedHex: expected.toString("hex"), descriptorMode: saved.files[0]!.mode, physicalMode: (await lstat(box.file)).mode & 0o777 });
+});
