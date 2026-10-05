@@ -20,12 +20,34 @@ Usage:
 
 Commands:
   setup              Search explicitly selected locations and save copied resources
-  manage             Select saved copies by name; masked view, edit, rename, groups, apply
+  manage             Select saved copies by name; masked view, edit, rename, refresh, groups, apply
   groups             Manage groups interactively; without a TTY, list groups only
   list               List saved snapshots without modifying the library
   apply <group>      Review and apply one group to the current directory or target
   apply --dry-run    Show the masked plan without changing project files
   help               Show this help
+
+Manage requires an interactive stdin/stdout TTY; UUID input is not required.
+Resource names and group names are unique in separate library-wide namespaces:
+trim, NFKC, Unicode 17 default full case folding, then NFKC. Legacy duplicate
+names require manual resolution; only listing, masked viewing and resolution
+are allowed until resolved. Display name changes leave contents not rewritten
+and are separate from destination changes.
+
+Edit only existing UTF-8 saved files, at most 1_000_000 bytes; binary and unsupported
+encodings are rejected. Ctrl-S submits for diff review, not immediate saving;
+Esc / Ctrl-C cancels. Enter inserts a newline, arrows move, PgUp/PgDn scroll;
+bracketed paste supports multiple lines. Suspected sensitive raw text can expose
+secrets on the screen, scrollback or recordings: individual approval to expose
+is separate from approval to save. Fixed bytes are inspected before saving;
+each suspected sensitive file requires fresh individual approval.
+
+Refresh can reselect a same-kind source with explicit read permission; the whole
+saved copy is replaced after masked diff and individual file approvals. Copi-only edits
+will be lost. Originals are not written back. No history, restore or automatic merge
+is provided. Private saved files are 0600; apply reproduces the original source mode.
+File addition, deletion and internal rename through text editing, and applying
+global settings, are outside scope.
 
 Interactive changes require a TTY. Setup searches only locations explicitly selected
 and confirmed in the wizard. Directories named auth are excluded entirely; copied

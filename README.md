@@ -16,6 +16,7 @@ For a local checkout, run `npm install --ignore-scripts`, `npm run build`, then 
 
 ```text
 copi setup
+copi manage
 copi groups
 copi list
 copi apply <group> [target]
@@ -25,13 +26,38 @@ copi help
 
 `setup` requires an interactive terminal. It asks which locations may be searched and asks for explicit authorization before searching. Selecting the entire `HOME` is broad: it can inspect supported resources throughout that directory, including Pi profiles and the configured Pi agent directory. Selecting the current project scopes discovery to that project. The wizard then lets you choose individual resources, review masked previews, assign each saved resource to one or more groups, and confirm before anything is copied into the library. Declining authorization performs no search.
 
+`manage` requires both stdin and stdout to be an interactive TTY. Choose saved resources and groups by name; UUID input is not required and normal screens identify resources by display name, kind, groups and destination. It provides masked viewing, terminal text editing, display-name changes, separate destination changes, source refresh, group management and apply. Running without arguments, or with `help`, `--help` or `-h`, still shows help.
+
+Resource display names and group names are each unique across the library, in separate namespaces. Comparison uses `trim → NFKC → Unicode 17.0.0 default full case folding → NFKC` (not locale-specific); display names and body text are not automatically normalized or rewritten. For example, `Ａ` and `a`, or `Straße` and `STRASSE`, conflict within one namespace. Legacy duplicate catalogs remain readable: use **Resolve name conflicts** to rename them manually. Until resolved, only listing, masked viewing and conflict resolution are allowed; no automatic renaming occurs.
+
 `groups` lists groups in a non-interactive terminal; group changes require a TTY and are saved only after confirmation. `list` is read-only. `apply --dry-run` prints the planned paths, masked text diffs, and warnings without changing the target. A real apply requires a TTY and confirmation.
 
-Groups contain resource IDs, not merged documents. The same saved resource may belong to multiple groups. `copi` copies files byte-for-byte; it does not split, rewrite, merge, or run resource contents. It does not install dependencies or apply global-only resources to a project. Review every proposed change.
+Groups contain resource IDs, not merged documents. The same saved resource may belong to multiple groups. Import and apply copy files byte-for-byte; they do not automatically split, rewrite, merge, or run resource contents. It does not install dependencies or apply global-only resources to a project. Review every proposed change.
+
+## Editing and refreshing saved copies
+
+A typical flow is `setup` → `manage` → select a resource by name → **Edit saved text** → **Rename display name** → **Refresh from source** → **Manage groups** → **Apply group**. Each change has its own review/confirmation; selecting a menu entry is not permission to save.
+
+The terminal editor works only on existing registered UTF-8 files inside the saved copy, up to **1_000_000 bytes** (1 MB), including the resulting edited bytes. Binary/NUL content, unsupported encodings and larger files are refused with a reason. It supports Japanese text, multiline bracketed paste, blank lines, cursor movement and scrolling:
+
+- `Ctrl-S`: submit the in-memory text for masked diff review; this does **not** save yet.
+- `Esc`, `Ctrl-C` or `Ctrl-D`: cancel; interruption leaves unconfirmed changes unsaved.
+- `Enter`: newline; arrow keys: move; `Home` / `End`: line start/end.
+- `Ctrl-Home` / `Ctrl-End`: document start/end; `PgUp` / `PgDn`: scroll; Backspace / Delete: remove text.
+
+Saving requires diff approval, fresh approval for each detected sensitive file in the fixed prepared bytes, and final confirmation. Normal views and diffs are masked. Before editing a detected sensitive file, a separate individual approval warns that its **raw text** may expose secrets on the screen, scrollback or terminal recordings. That exposure approval is not save approval. Detection is heuristic and may miss secrets. A checksum mismatch or concurrent change stops saving rather than silently repairing or overwriting the saved copy.
+
+Renaming changes the display name only: the internal ID, file names, body (including embedded agent names), destination and group references stay unchanged. Destination changes are a separate operation. Text editing cannot add/delete files or rename internal files.
+
+Refresh reads an explicitly permitted same-kind source (a directory tree for a skill; a regular file for other kinds). If the original is unavailable, select a new absolute source path or cancel; the saved copy remains available. No HOME or parent tree is searched implicitly. Registered package origins can be rediscovered only in explicitly selected and authorized locations; arbitrary source paths gain no exclusion exception. After masked diff review, inspection and individual sensitive-file approvals, refresh replaces the **whole** saved copy, including bundle file additions/removals and mode changes. All copi-only edits are lost, not merged. ID, display name, savedAt, destination and **all** group memberships are retained. Neither editing nor refresh writes back to the original.
+
+There is **no change history, restore feature or automatic merge**. Private apply backups for replaced project files are not saved-copy version history. Applying global settings, automatic dependency installation and content transformation remain outside scope.
+
+Japanese/paste/caret functionality is covered by automated CLI/PTY tests; real-device IME, paste and visual caret-width verification is outside this acceptance scope and has not been performed. The minimum Node 22.19.0 version itself and other operating systems have not been verified by these checks.
 
 ## Private storage and sensitive data
 
-Snapshots and the catalog are stored under `~/.copi/` with owner-only directory/file permissions. `copi` copies the selected source into its library; it does not modify or delete the original. Snapshots remain available if the original is later removed. The copied content retains its original license and ownership; the MIT license for `copi` does not apply to imported resources.
+Snapshots and the catalog are stored under `~/.copi/` with owner-only directory/file permissions: saved files are private `0600`. Original source modes are retained separately in snapshot descriptors/catalog reads and reproduced at the apply destination, not on the private saved inode. `copi` copies the selected source into its library; it does not modify or delete the original. Snapshots remain available if the original is later removed. The copied content retains its original license and ownership; the MIT license for `copi` does not apply to imported resources.
 
 Entire directories named `auth` are excluded; authentication-specific code may be missing, but other supported files in the resource are retained. Files named `auth.json`, `mcp-auth.json`, or `oauth.json`, `.env*` paths (including `.envrc` and `.env-production`), and repository/dependency/cache/history paths such as `.git`, `node_modules`, `.cache`, `.npm`, `cache`, `caches`, `history`, and `sessions` are excluded by the current resource filters. Do not use `copi` as a substitute for reviewing the files selected for copying.
 

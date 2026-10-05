@@ -35,6 +35,41 @@ function runCli(box: Sandbox, args: string[], entryPoint = path.resolve("dist/sr
   });
 }
 
+test("manage help explains saved-copy boundaries and all help aliases stay read-only", async (t) => {
+  const box = await sandbox(t);
+  let canonical: string | undefined;
+  for (const args of [[], ["help"], ["--help"], ["-h"], ["manage", "--help"], ["manage", "-h"], ["setup", "--help"], ["groups", "-h"], ["list", "--help"], ["apply", "--help"]]) {
+    const run = spawnSync(process.execPath, [path.resolve("dist/src/cli.js"), ...args], {
+      cwd: box.project,
+      env: { ...process.env, HOME: box.home, PI_CODING_AGENT_DIR: box.agent,
+        TMPDIR: process.env.TMPDIR, NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE, NPM_CONFIG_USERCONFIG: "/dev/null" },
+      encoding: "utf8", timeout: 15_000,
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.signal, null);
+    assert.equal(run.stderr, "");
+    canonical ??= run.stdout;
+    assert.equal(run.stdout, canonical, `help alias ${args.join(" ")}`);
+  }
+  assert.ok(canonical);
+  for (const meaning of [
+    /manage[\s\S]*names?[\s\S]*UUID.*not required/i,
+    /unique[\s\S]*NFKC[\s\S]*Unicode 17[\s\S]*full case folding/i,
+    /duplicate[\s\S]*manual/i,
+    /existing UTF-8[\s\S]*1_000_000 bytes[\s\S]*binary[\s\S]*unsupported/i,
+    /Ctrl-S[\s\S]*Esc[\s\S]*Ctrl-C/,
+    /raw text[\s\S]*screen[\s\S]*individual approval[\s\S]*save/i,
+    /fixed bytes[\s\S]*each suspected sensitive file/i,
+    /refresh[\s\S]*reselect[\s\S]*whole[\s\S]*copi-only edits/i,
+    /display name[\s\S]*contents.*not rewritten/i,
+    /original[\s\S]*not written back/i,
+    /0600[\s\S]*apply[\s\S]*source mode/i,
+    /no history[\s\S]*restore[\s\S]*automatic merge/i,
+    /file addition[\s\S]*deletion[\s\S]*internal rename[\s\S]*global settings/i,
+  ]) assert.match(canonical, meaning);
+  await assert.rejects(readFile(path.join(box.library, "catalog.json")), { code: "ENOENT" });
+});
+
 test("help and list are read-only commands under a synthetic home", async (t) => {
   const box = await sandbox(t);
   const help = runCli(box, ["--help"]);
