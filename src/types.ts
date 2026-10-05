@@ -47,7 +47,11 @@ export interface SnapshotFileContents extends SnapshotFile {
   bytes: Buffer;
 }
 
-export interface SavedItem {
+export type ContentLocation =
+  | { kind: "file"; path: string }
+  | { kind: "tree"; path: string };
+
+export interface LegacySavedItem {
   id: string;
   kind: ResourceKind;
   source: string;
@@ -59,6 +63,10 @@ export interface SavedItem {
   files: SnapshotFile[];
 }
 
+export interface SavedItem extends LegacySavedItem {
+  content: ContentLocation;
+}
+
 export interface Group {
   id: string;
   name: string;
@@ -66,7 +74,15 @@ export interface Group {
 }
 
 export interface Catalog {
-  version: 1;
+  version: 2;
   items: SavedItem[];
   groups: Group[];
 }
+
+export interface LegacyCatalog {
+  version: 1;
+  items: LegacySavedItem[];
+  groups: Group[];
+}
+
+export type StoredCatalog = Catalog | LegacyCatalog;
