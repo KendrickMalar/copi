@@ -11,7 +11,9 @@ export type { Step };
 export async function integrationBox(): Promise<Box & { sourcePath: string; target: string }> {
   const assigned = await realpath(process.env.TMPDIR!);
   assert.ok(assigned === "/private/tmp/copi-issue1-coder3.v57BLf/tmp" ||
-    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp", "integration needs an explicitly assigned canonical TMPDIR");
+    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp", "integration needs an explicitly assigned canonical TMPDIR");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-manage-integration-")));
   assert.equal(path.dirname(root), assigned);
   const home = path.join(root, "home"), agent = path.join(home, ".pi/agent"), cwd = path.join(root, "project");

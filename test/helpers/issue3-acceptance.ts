@@ -13,14 +13,33 @@ export const answer = (message: string, text = "y\r"): Step => ({ wait: message,
 export const finish = select("Manage saved resources", 4);
 export const route = (index: number): Step[] => [select("Manage saved resources"), select("Select saved resource"), select("Resource action", index)];
 
-// This suite has exactly one assigned canonical runtime. Retain every new fixture.
+// Retain every new fixture; accept only complete, explicitly assigned runtimes.
 export async function box() {
-  assert.equal(process.env.HOME, "/tmp/copi-issue1-tester3.3V4nH5/home");
-  assert.equal(process.env.PI_CODING_AGENT_DIR, `${process.env.HOME}/.pi/agent`);
-  assert.equal(process.env.NPM_CONFIG_CACHE, "/tmp/copi-issue1-tester3.3V4nH5/npm-cache");
-  assert.equal(process.env.NPM_CONFIG_USERCONFIG, "/dev/null");
+  const envHome = process.env.HOME;
+  const envAgent = process.env.PI_CODING_AGENT_DIR;
+  const envCache = process.env.NPM_CONFIG_CACHE;
   const assigned = await realpath(process.env.TMPDIR!);
-  assert.equal(assigned, "/private/tmp/copi-issue1-tester3.3V4nH5/tmp");
+  const legacy = {
+    home: "/tmp/copi-issue1-tester3.3V4nH5/home",
+    cache: "/tmp/copi-issue1-tester3.3V4nH5/npm-cache",
+    tmp: "/private/tmp/copi-issue1-tester3.3V4nH5/tmp",
+  };
+  const sandboxes = [
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp",
+    },
+  ];
+  const matches = (runtime: { home: string; cache: string; tmp: string }) =>
+    envHome === runtime.home && envAgent === `${runtime.home}/.pi/agent` && envCache === runtime.cache && assigned === runtime.tmp;
+  assert.ok(matches(legacy) || sandboxes.some(matches), "I3 requires one exactly assigned isolated environment");
+  assert.equal(process.env.NPM_CONFIG_USERCONFIG, "/dev/null");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-i3-independent-")));
   assert.equal(path.dirname(root), assigned);
   const home = path.join(root, "home"), agent = path.join(home, ".pi/agent"), cwd = path.join(root, "project");

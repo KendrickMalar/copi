@@ -17,7 +17,9 @@ export async function fixture(files: Record<string, string | Buffer> = { "SKILL.
   assert.ok(assigned === "/private/tmp/copi-issue1-coder4.G6vORm/tmp" ||
     assigned === "/private/tmp/copi-issue1-tester4.G7sT9W/tmp" ||
     assigned === "/private/tmp/copi-issue1-coder3.v57BLf/tmp" ||
-    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp", "Fixtures require an exactly approved canonical TMPDIR.");
+    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp", "Fixtures require an exactly approved canonical TMPDIR.");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-r4-independent-")));
   assert.equal(path.dirname(root), assigned, "fixtures must stay directly under assigned TMPDIR");
   const home = path.join(root, "home"), agent = path.join(home, ".pi/agent"), cwd = path.join(root, "project"), source = path.join(root, "source"), tmp = path.join(root, "tmp"), cache = path.join(root, "cache");

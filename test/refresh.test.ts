@@ -219,7 +219,9 @@ async function originFixture() {
   assert.ok(assigned === "/private/tmp/copi-issue1-coder4.G6vORm/tmp" ||
     assigned === "/private/tmp/copi-issue1-tester4.G7sT9W/tmp" ||
     assigned === "/private/tmp/copi-issue1-coder3.v57BLf/tmp" ||
-    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp", "Origin fixtures require an exactly approved canonical TMPDIR.");
+    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp", "Origin fixtures require an exactly approved canonical TMPDIR.");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-origin-fix1-")));
   const homeDir = path.join(root, "home"), agentDir = path.join(homeDir, ".pi/agent"), projectDir = path.join(root, "project");
   const packageRoot = path.join(agentDir, "npm/node_modules/declared-origin"), sourcePath = path.join(packageRoot, "skills/declared");
