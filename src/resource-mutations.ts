@@ -38,11 +38,6 @@ function assertKnownLayout(item: SavedItem, files: readonly SnapshotFileContents
   if (item.content.kind === "file" && (files.length !== 1 || files[0]?.path !== path.posix.basename(item.content.path))) {
     throw new Error("Registered sources file must resolve to its single catalog path.");
   }
-  for (const descriptor of item.files) {
-    const file = current.get(descriptor.path);
-    if (!file) throw new Error(`Registered sources file is missing: ${descriptor.path}.`);
-    if (file.sha256 !== descriptor.sha256) throw new Error(`Snapshot checksum mismatch for ${descriptor.path}; reload and inspect the saved source before editing.`);
-  }
 }
 
 function editState(edit: PreparedSavedEdit): EditState {

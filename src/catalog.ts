@@ -393,6 +393,7 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
 
 async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[], approvedSensitivePaths: readonly string[]): Promise<SavedItem> {
   const preflight = await loadCatalog(libraryDir);
+  assertModernCatalog(preflight);
   assertNoNameConflicts(preflight);
   assertNameAvailable(preflight, "item", candidate.name);
   const groupIds = [...new Set(requestedGroupIds)];
@@ -401,15 +402,28 @@ async function storePreparedResource(libraryDir: string, candidate: ResourceCand
     if (!session) throw new Error("Missing storage session.");
     const revision = await session.capture();
     const catalog = await loadCatalogUnlocked(session.root);
+    assertModernCatalog(catalog);
     assertNoNameConflicts(catalog);
     assertNameAvailable(catalog, "item", candidate.name);
     for (const saved of catalog.items) await readSnapshotFilesUnlocked(session.root, catalog, saved);
     const groups = new Map(catalog.groups.map((group) => [group.id, group]));
     if (groupIds.some((id) => !groups.has(id))) throw new Error("Cannot import a resource into an unknown group.");
+    const id = randomUUID();
+    let content: SavedItem["content"];
+    if (candidate.kind === "skill") {
+      content = { kind: "tree", path: `sources/${id}` };
+    } else {
+      const sourceFile = sourceFiles[0];
+      if (sourceFiles.length !== 1 || !sourceFile || sourceFile.path !== path.posix.basename(sourceFile.path)) {
+        throw new Error("Non-skill resources must be imported from one regular source file.");
+      }
+      content = { kind: "file", path: `sources/${id}/${sourceFile.path}` };
+    }
     const item: SavedItem = {
-      id: randomUUID(), kind: candidate.kind, source: candidate.source, scope: candidate.scope,
+      id, kind: candidate.kind, source: candidate.source, scope: candidate.scope,
       sourcePath: candidate.sourcePath, destination: { ...candidate.destination }, name: candidate.name.trim(), savedAt: new Date().toISOString(),
       files: sourceFiles.map((file) => ({ path: file.path, mode: file.mode, sha256: createHash("sha256").update(file.bytes).digest("hex") })),
+      content,
     };
     catalog.items.push(item);
     for (const groupId of groupIds) groups.get(groupId)?.itemIds.push(item.id);
