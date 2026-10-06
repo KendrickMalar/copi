@@ -85,6 +85,15 @@ export function readStorageReview(review: StorageReview): StorageReviewView {
   if (!state) throw new Error("Invalid prepared storage review token.");
   return { sensitivePaths: [...state.sensitivePaths], warnings: structuredClone(state.warnings) };
 }
+/** @internal Returns a detached copy for the caller's private diff state, never a public review view. */
+export function readStorageBeforeReviewFiles(review: StorageReview, itemId: string): readonly StorageFile[] {
+  const state = reviews.get(review);
+  const before = state?.before;
+  if (!state || !before || before.used) throw new Error("Storage before-review files are unavailable.");
+  const item = before.items.find((entry) => entry.itemId === itemId);
+  if (!item) throw new Error("Storage before-review does not contain this source item.");
+  return item.files.map((file) => ({ path: file.path, mode: file.mode, bytes: Buffer.from(file.bytes) }));
+}
 function omittedSourcePaths(state: ReviewState, previous: Catalog, next: Catalog): string[] {
   const replacementIds = new Set(state.replacements.map((replacement) => replacement.itemId));
   const nextById = new Map(next.items.map((item) => [item.id, item]));
@@ -393,8 +402,8 @@ async function validateSourcesTransition(root: string, previous: Catalog, next: 
     }
     const target = nextItem.content.path;
     if (!safeStoragePath(target) || !target.startsWith("sources/") || privateStoragePath(target)) throw new Error("Unsafe registered sources content target.");
-    const expectedItem = { ...oldItem, files: nextItem.files };
-    if (JSON.stringify(expectedItem) !== JSON.stringify(nextItem)) throw new Error("A sources content replacement may update only its reviewed file descriptors.");
+    const expectedItem = { ...oldItem, source: nextItem.source, scope: nextItem.scope, sourcePath: nextItem.sourcePath, files: nextItem.files };
+    if (JSON.stringify(expectedItem) !== JSON.stringify(nextItem)) throw new Error("A sources content replacement may update only its source metadata and reviewed file descriptors.");
 
     if (nextItem.content.kind === "file") {
       const basename = path.posix.basename(target);
@@ -473,8 +482,8 @@ function validateSourcesCatalogTransition(previous: Catalog | null, next: Catalo
     if (additions.length > 0) throw new Error("New-item journal cannot also replace existing source content.");
     if (oldItem.content.kind !== operation.kind || nextItem.content.kind !== operation.kind ||
         oldItem.content.path !== operation.target || nextItem.content.path !== operation.target ||
-        JSON.stringify({ ...oldItem, files: nextItem.files }) !== JSON.stringify(nextItem)) {
-      throw new Error("Sources journal operation does not match a descriptor-only update to its registered content root.");
+        JSON.stringify({ ...oldItem, source: nextItem.source, scope: nextItem.scope, sourcePath: nextItem.sourcePath, files: nextItem.files }) !== JSON.stringify(nextItem)) {
+      throw new Error("Sources journal operation does not match a source-metadata and descriptor update to its registered content root.");
     }
     if (operation.kind === "file") {
       const oldFile = oldItem.files[0];
