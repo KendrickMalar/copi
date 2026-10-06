@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile 
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { prepareResource } from "../src/catalog.ts";
+import { prepareResource, readSnapshotFiles } from "../src/catalog.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, prepareSavedReplacement, readSavedChange, readSavedEdit } from "../src/resource-mutations.ts";
 import { commitRefresh, prepareRefresh, readRefresh, type PreparedRefresh } from "../src/refresh.ts";
 import { StorageTransactions, storageTransactions } from "../src/storage-transaction.ts";
@@ -124,11 +124,16 @@ test("failed refresh commit rolls back the reviewed source tree and source metad
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
 });
 
-test("canceling a reviewed omission preserves the raw v2 source and catalog", async (t) => {
+test("canceling after a direct current edit preserves its bytes and raw catalog", async (t) => {
   const box = await fixture(t);
+  const direct = Buffer.from("manual current bytes before edit\n");
+  await writeFile(path.join(box.itemRoot, "SKILL.md"), direct);
   const rawCatalog = await readFile(path.join(box.libraryDir, "catalog.json"));
-  const change = await prepareSavedReplacement(box.libraryDir, itemId, box.prepared);
+  const edit = await prepareSavedEdit(box.libraryDir, itemId, "SKILL.md");
+  assert.deepEqual(readSavedEdit(edit).file.bytes, direct);
+  const change = await prepareSavedChange(edit, Buffer.from("Copi proposed bytes\n"));
   await assert.rejects(commitSavedChange(change, { ...approval(readSavedChange(change)), confirmed: false }), /confirm|cancel/i);
+  assert.deepEqual(await readFile(path.join(box.itemRoot, "SKILL.md")), direct);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "ordinary.md")), box.ordinary);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "asset.bin")), box.binary);
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), rawCatalog);
@@ -151,17 +156,77 @@ test("before secret bytes stay masked and next secret still requires separate ap
   assert.deepEqual(await readFile(path.join(box.itemRoot, "SKILL.md")), Buffer.from(nextSecret));
 });
 
-test("prepared edit uses the current v2 included files and preserves ordinary children", async (t) => {
+test("prepared edit reviews current direct bytes even when their descriptor SHA is old", async (t) => {
   const box = await fixture(t);
+  const direct = Buffer.from("# Manual current edit\n");
+  await writeFile(path.join(box.itemRoot, "SKILL.md"), direct);
   const edit = await prepareSavedEdit(box.libraryDir, itemId, "SKILL.md");
-  assert.deepEqual(readSavedEdit(edit).file.bytes, Buffer.from("# Before\n"));
-  const change = await prepareSavedChange(edit, Buffer.from("# Direct edit\n"));
+  const editView = readSavedEdit(edit);
+  assert.deepEqual(editView.file.bytes, direct);
+  assert.equal(editView.file.sha256, digest(direct));
+  const originalSkillDescriptor = editView.item.files.find((file) => file.path === "SKILL.md");
+  assert.ok(originalSkillDescriptor);
+  assert.equal(originalSkillDescriptor.sha256, digest(Buffer.from("# Before\n")));
+  const proposed = Buffer.from("# Copi reviewed edit\n");
+  const change = await prepareSavedChange(edit, proposed);
   const view = readSavedChange(change);
+  const skillDiff = view.diffs.find((entry) => entry.path === "SKILL.md");
+  assert.ok(skillDiff);
+  assert.ok(skillDiff.diff.includes("# Manual current edit"));
+  assert.ok(!skillDiff.diff.includes("# Before"));
+  const reviewedSkillDescriptor = view.item.files.find((file) => file.path === "SKILL.md");
+  assert.ok(reviewedSkillDescriptor);
+  assert.equal(reviewedSkillDescriptor.sha256, digest(proposed));
   assert.ok(!JSON.stringify(view).includes("sk_live_beforesecret123456"));
   await commitSavedChange(change, approval(view));
   assert.deepEqual(await readFile(path.join(box.itemRoot, "ordinary.md")), box.ordinary);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "asset.bin")), box.binary);
-  assert.deepEqual(await readFile(path.join(box.itemRoot, "SKILL.md")), Buffer.from("# Direct edit\n"));
+  assert.deepEqual(await readFile(path.join(box.itemRoot, "SKILL.md")), proposed);
+});
+
+test("tree edit treats additions and missing past descriptors as current included content", async (t) => {
+  const box = await fixture(t);
+  const direct = Buffer.from("# Current skill bytes\n");
+  await writeFile(path.join(box.itemRoot, "SKILL.md"), direct);
+  const removedBytes = Buffer.from("manually removed past descriptor\n");
+  await mkdir(path.join(box.itemRoot, "docs"));
+  await writeFile(path.join(box.itemRoot, "docs", "removed.md"), removedBytes);
+  await writeFile(path.join(box.itemRoot, "docs", "kept.md"), "current sibling\n");
+  box.catalog.items[0]!.files.push({ path: "docs/removed.md", mode: 0o600, sha256: digest(removedBytes) });
+  await writeFile(path.join(box.libraryDir, "catalog.json"), `${JSON.stringify(box.catalog, null, 2)}\n`);
+  await rm(path.join(box.itemRoot, "docs", "removed.md"));
+  const addedBytes = Buffer.from("ordinary current addition\n");
+  await writeFile(path.join(box.itemRoot, "added.md"), addedBytes, { mode: 0o640 });
+
+  const edit = await prepareSavedEdit(box.libraryDir, itemId, "SKILL.md");
+  assert.deepEqual(readSavedEdit(edit).file.bytes, direct);
+  const change = await prepareSavedChange(edit, Buffer.from("# Reviewed current tree\n"));
+  const view = readSavedChange(change);
+  assert.ok(view.item.files.some((file) => file.path === "added.md" && file.mode === 0o640));
+  assert.ok(view.item.files.some((file) => file.path === "docs/kept.md"));
+  assert.ok(!view.item.files.some((file) => file.path === "docs/removed.md"));
+  await commitSavedChange(change, approval(view));
+  assert.deepEqual(await readFile(path.join(box.itemRoot, "added.md")), addedBytes);
+  assert.deepEqual(await readFile(path.join(box.itemRoot, "docs", "kept.md"), "utf8"), "current sibling\n");
+  const savedFiles = await readSnapshotFiles(box.libraryDir, view.item);
+  assert.deepEqual(savedFiles.map((file) => file.path).sort((left, right) => left.localeCompare(right)), ["SKILL.md", "added.md", "asset.bin", "docs/kept.md", "ordinary.md"].sort((left, right) => left.localeCompare(right)));
+});
+
+test("previewed saved edit rejects a later direct file edit without replacing it", async (t) => {
+  const box = await fileFixture(t);
+  const initial = Buffer.from("direct before preview\n");
+  await writeFile(path.join(box.itemRoot, "AGENTS.md"), initial);
+  const rawCatalog = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const edit = await prepareSavedEdit(box.libraryDir, box.itemId, "AGENTS.md");
+  assert.deepEqual(readSavedEdit(edit).file.bytes, initial);
+  const change = await prepareSavedChange(edit, Buffer.from("reviewed preview bytes\n"));
+  const external = Buffer.from("direct edit after preview\n");
+  await writeFile(path.join(box.itemRoot, "AGENTS.md"), external);
+  await assert.rejects(commitSavedChange(change, approval(readSavedChange(change))), /changed|revision|before-reviewed/i);
+  assert.deepEqual(await readFile(path.join(box.itemRoot, "AGENTS.md")), external);
+  assert.deepEqual(await readFile(path.join(box.itemRoot, "neighbor.txt")), box.neighbor);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), rawCatalog);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
 });
 
 test("single-file v2 edits leave adjacent unregistered storage files outside the content boundary", async (t) => {

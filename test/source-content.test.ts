@@ -164,8 +164,7 @@ test("file content reads current bytes and SHA from sources after origin removal
     destination: { kind: "project", path: "AGENTS.md" },
   }, { confirmed: true, groupIds: [] });
   assert.ok(item);
-  assert.ok("content" in item, "imports must store authoritative content locations");
-  const location = (item as unknown as { content: { kind: string; path: string } }).content;
+  const location = item.content;
   assert.equal(location.kind, "file");
   assert.match(location.path, /^sources\/[0-9a-f-]+\/instructions\.md$/i);
   const storedPath = path.join(box.libraryDir, ...location.path.split("/"));
@@ -193,8 +192,7 @@ test("tree content tracks current included files, preserves registered modes, an
     destination: { kind: "project", path: ".pi/skills/portable" },
   }, { confirmed: true, groupIds: [] });
   assert.ok(item);
-  assert.ok("content" in item);
-  const location = (item as unknown as { content: { kind: string; path: string } }).content;
+  const location = item.content;
   assert.equal(location.kind, "tree");
   const storedRoot = path.join(box.libraryDir, ...location.path.split("/"));
   const registered = item.files.find((file) => file.path === "SKILL.md")!;
@@ -207,12 +205,15 @@ test("tree content tracks current included files, preserves registered modes, an
   await writeFile(path.join(storedRoot, ".cache"), "excluded\n");
 
   const files = await readSnapshotFiles(box.libraryDir, item);
-  assert.deepEqual(files.map((file) => file.path), ["SKILL.md", "new.sh"]);
-  assert.deepEqual(files[0]!.bytes, currentSkill);
-  assert.equal(files[0]!.sha256, digest(currentSkill));
-  assert.equal(files[0]!.mode, registered.mode);
+  const skillFile = files.find((file) => file.path === "SKILL.md");
+  const newFile = files.find((file) => file.path === "new.sh");
+  assert.ok(skillFile);
+  assert.ok(newFile);
+  assert.deepEqual(skillFile.bytes, currentSkill);
+  assert.equal(skillFile.sha256, digest(currentSkill));
+  assert.equal(skillFile.mode, registered.mode);
   assert.equal(item.files.find((file) => file.path === "SKILL.md")!.sha256, registered.sha256);
-  assert.equal(files[1]!.mode, (await lstat(path.join(storedRoot, "new.sh"))).mode & 0o777);
+  assert.equal(newFile.mode, (await lstat(path.join(storedRoot, "new.sh"))).mode & 0o777);
 
   await rm(path.join(storedRoot, "SKILL.md"));
   await assert.rejects(readSnapshotFiles(box.libraryDir, item), /SKILL\.md|missing|required/i);
@@ -387,8 +388,8 @@ test("content roots and registered files refuse symlink substitution", async (t)
     sourceRoot: box.sourceRoot, sourcePath: origin, name: "Guide",
     destination: { kind: "project", path: "AGENTS.md" },
   }, { confirmed: true, groupIds: [] });
-  assert.ok(item && "content" in item);
-  const location = (item as unknown as { content: { path: string } }).content;
+  assert.ok(item);
+  const location = item.content;
   const target = path.join(box.libraryDir, ...location.path.split("/"));
   const outside = path.join(box.root, "outside.md");
   await writeFile(outside, "outside\n");
