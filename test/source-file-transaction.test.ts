@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -240,6 +240,91 @@ test("v2 recovery refuses a symlink stage and preserves the outside inode", asyn
   assert.equal(await readFile(outside, "utf8"), "outside bytes\n");
   assert.ok((await lstat(stage)).isSymbolicLink());
   assert.ok(await lstat(lock));
+});
+
+test("v2 recovery refuses unknown lock artifacts and preserves their bytes before cleanup", async (t) => {
+  for (const checkpoint of ["journal", "catalog-renamed"] as const) {
+    for (const entry of ["next-99", "old-99", "displaced-99", "orphan.bin"] as const) {
+      await t.test(`${checkpoint}/${entry}`, async (st) => {
+        const box = await crashedFixture(st, checkpoint);
+        const lock = path.join(box.libraryDir, ".copi-transaction");
+        const artifact = path.join(lock, entry);
+        const artifactBytes = Buffer.from(`unrecognized ${entry} bytes\n`);
+        await writeFile(artifact, artifactBytes, { mode: 0o600 });
+
+        await assert.rejects(recover(box), /unknown/i);
+
+        assert.deepEqual(await readFile(artifact), artifactBytes);
+        assert.ok((await lstat(lock)).isDirectory());
+        assert.ok((await lstat(path.join(lock, "journal.json"))).isFile());
+        assert.equal(await readFile(box.coderPath, "utf8"), checkpoint === "journal" ? "old coder\n" : "edited coder\n");
+        assert.equal(await readFile(box.testerPath, "utf8"), "neighbor tester\n");
+        assert.equal(await readFile(box.notePath, "utf8"), "unregistered note\n");
+        assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), checkpoint === "journal" ? box.catalog : box.next);
+      });
+    }
+  }
+});
+
+test("v1 legacy journal recovery still restores its original snapshot and catalog", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "copi-v1-recovery-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const libraryDir = path.join(temporaryRoot, ".copi");
+  await mkdir(libraryDir, { mode: 0o700 });
+  const canonicalLibrary = await realpath(libraryDir);
+  const lock = path.join(canonicalLibrary, ".copi-transaction");
+  const itemDirectory = path.join(canonicalLibrary, "items", coderId);
+  const oldBytes = Buffer.from("legacy old snapshot\n");
+  const newBytes = Buffer.from("legacy new snapshot\n");
+  const oldItem = {
+    id: coderId,
+    kind: "subagent" as const,
+    source: "fixture",
+    scope: "project" as const,
+    sourcePath: "/deleted/origin/coder.md",
+    destination: { kind: "project" as const, path: "agents/coder.md" },
+    name: "Coder",
+    savedAt: "2026-10-05T00:00:00.000Z",
+    files: [{ path: "coder.md", mode: 0o600, sha256: digest(oldBytes) }],
+  };
+  const nextItem = structuredClone(oldItem);
+  nextItem.files[0]!.sha256 = digest(newBytes);
+  const oldCatalog = { version: 1 as const, items: [oldItem], groups: [] };
+  const nextCatalog = { version: 1 as const, items: [nextItem], groups: [] };
+  const oldCatalogBytes = Buffer.from(JSON.stringify(oldCatalog));
+  const nextCatalogBytes = Buffer.from(JSON.stringify(nextCatalog));
+  const snapshotTree = (bytes: Buffer) => digest(JSON.stringify([
+    { path: ".", kind: "directory", value: "", mode: 0o700 },
+    { path: "files", kind: "directory", value: "", mode: 0o700 },
+    { path: "files/coder.md", kind: "file", value: digest(bytes), mode: 0o600 },
+  ]));
+
+  await mkdir(path.join(itemDirectory, "files"), { recursive: true, mode: 0o700 });
+  await writeFile(path.join(itemDirectory, "files", "coder.md"), newBytes, { mode: 0o600 });
+  await writeFile(path.join(canonicalLibrary, "catalog.json"), oldCatalogBytes, { mode: 0o600 });
+  await mkdir(lock, { mode: 0o700 });
+  await mkdir(path.join(lock, "old-0", "files"), { recursive: true, mode: 0o700 });
+  await writeFile(path.join(lock, "old-0", "files", "coder.md"), oldBytes, { mode: 0o600 });
+  await writeFile(path.join(lock, "old-catalog"), oldCatalogBytes, { mode: 0o600 });
+  await writeFile(path.join(lock, "next-catalog"), nextCatalogBytes, { mode: 0o600 });
+  await writeFile(path.join(lock, "owner.json"), JSON.stringify({ version: 1, pid: 99_999_999, host: os.hostname(), token: coderId }), { mode: 0o600 });
+  const journal = {
+    version: 1 as const,
+    root: canonicalLibrary,
+    token: coderId,
+    oldCatalog: digest(oldCatalogBytes),
+    newCatalog: digest(nextCatalogBytes),
+    operations: [{ itemId: coderId, oldTree: snapshotTree(oldBytes), newTree: snapshotTree(newBytes) }],
+  };
+  const journalBytes = Buffer.from(JSON.stringify(journal));
+  await writeFile(path.join(lock, "journal.json"), journalBytes, { mode: 0o600 });
+  await writeFile(path.join(lock, "journal.digest"), digest(journalBytes), { mode: 0o600 });
+
+  await new StorageTransactions({ waitMilliseconds: 100 }).run(canonicalLibrary, false, async () => {});
+
+  assert.deepEqual(await readFile(path.join(itemDirectory, "files", "coder.md")), oldBytes);
+  assert.deepEqual(await readFile(path.join(canonicalLibrary, "catalog.json")), oldCatalogBytes);
+  await assert.rejects(lstat(lock), { code: "ENOENT" });
 });
 
 test("v2 staged file is private and secret approval remains opaque and per-file", async (t) => {

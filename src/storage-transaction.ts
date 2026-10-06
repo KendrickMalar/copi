@@ -639,8 +639,13 @@ export class StorageSession {
   }
   private async recoverSources(journal: SourcesStorageJournal, rollback: boolean): Promise<void> {
     const allowedEntries = new Set(["owner.json", "journal.json", "journal.digest", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "finalized.json", "finalized.digest"]);
+    for (const index of journal.operations.keys()) {
+      allowedEntries.add(`next-${index}`);
+      allowedEntries.add(`old-${index}`);
+      allowedEntries.add(`displaced-${index}`);
+    }
     const lockEntries = await readdir(this.lock);
-    if (lockEntries.some((entry) => !allowedEntries.has(entry) && !/^next-\d+$/.test(entry) && !/^old-\d+$/.test(entry) && !/^displaced-\d+$/.test(entry))) {
+    if (lockEntries.some((entry) => !allowedEntries.has(entry))) {
       throw new Error("Unknown files in v2 sources transaction lock; inspect before recovery.");
     }
     const rawNext = await checkedFile(path.join(this.lock, "next-catalog"));
