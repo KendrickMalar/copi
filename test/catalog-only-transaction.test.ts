@@ -70,6 +70,59 @@ async function killChild(child: ChildProcessWithoutNullStreams): Promise<void> {
   await new Promise<void>((resolve) => child.once("close", () => resolve()));
 }
 
+async function commitRawCatalogOnly(libraryDir: string, rawCatalog: Buffer): Promise<void> {
+  await new StorageTransactions().run(libraryDir, true, async (session) => {
+    assert.ok(session);
+    await session.commit(await session.capture(), rawCatalog);
+  });
+}
+
+function rawCatalogWithUnknown(value: Catalog, location: readonly (string | number)[]): Buffer {
+  const raw: unknown = JSON.parse(catalogBytes(value).toString("utf8"));
+  let current = raw;
+  for (const segment of location.slice(0, -1)) {
+    if (typeof segment === "number") {
+      if (!Array.isArray(current) || !Object.hasOwn(current, segment)) throw new Error("Invalid synthetic catalog property path.");
+      current = current[segment];
+    } else {
+      if (typeof current !== "object" || current === null || Array.isArray(current) || !Object.hasOwn(current, segment)) throw new Error("Invalid synthetic catalog property path.");
+      current = (current as Record<string, unknown>)[segment];
+    }
+  }
+  const key = location.at(-1);
+  if (typeof key !== "string" || typeof current !== "object" || current === null || Array.isArray(current)) throw new Error("Invalid synthetic catalog property path.");
+  (current as Record<string, unknown>)[key] = "synthetic-extra";
+  return Buffer.from(`${JSON.stringify(raw, null, 4)}\n`, "utf8");
+}
+
+function reverseObjectKeyOrder(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeyOrder);
+  if (typeof value !== "object" || value === null) return value;
+  const entries = Object.entries(value as Record<string, unknown>).reverse();
+  return Object.fromEntries(entries.map(([key, child]) => [key, reverseObjectKeyOrder(child)]));
+}
+
+async function pauseWriterAtJournal(libraryDir: string, next: Catalog): Promise<string> {
+  const writer = catalogOnlyChild(libraryDir, next, "journal");
+  try {
+    await childPaused(writer);
+    writer.kill("SIGKILL");
+    await new Promise<void>((resolve) => writer.once("close", () => resolve()));
+  } finally {
+    if (writer.exitCode === null && writer.signalCode === null) await killChild(writer);
+  }
+  return path.join(libraryDir, ".copi-transaction");
+}
+
+async function rebindJournalCatalog(lock: string, field: "oldCatalog" | "newCatalog", catalog: Buffer): Promise<void> {
+  const journalPath = path.join(lock, "journal.json");
+  const journal = JSON.parse(await readFile(journalPath, "utf8")) as Record<string, unknown>;
+  journal[field] = digest(catalog);
+  const bytes = Buffer.from(JSON.stringify(journal), "utf8");
+  await writeFile(journalPath, bytes);
+  await writeFile(path.join(lock, "journal.digest"), digest(bytes));
+}
+
 async function recover(libraryDir: string): Promise<void> {
   await new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {});
 }
@@ -188,6 +241,59 @@ test("catalog-only rollback restores the held old catalog inode", async (t) => {
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
 });
 
+for (const unknownField of [
+  { label: "top-level", path: ["unexpectedMetadata"] },
+  { label: "item", path: ["items", 0, "unexpectedMetadata"] },
+  { label: "group", path: ["groups", 0, "unexpectedMetadata"] },
+  { label: "file descriptor", path: ["items", 0, "files", 0, "unexpectedMetadata"] },
+  { label: "content descriptor", path: ["items", 0, "content", "unexpectedMetadata"] },
+  { label: "destination descriptor", path: ["items", 0, "destination", "unexpectedMetadata"] },
+] as const) {
+  test(`catalog-only raw commit rejects unknown ${unknownField.label} properties`, async (t) => {
+    const box = await sandbox(t);
+    const saved = item();
+    const old = catalog([saved], [{ id: "daily", name: "Daily", itemIds: [] }]);
+    const oldBytes = await storeCatalog(box.libraryDir, old);
+    const next = structuredClone(old);
+    next.items[0]!.name = "Renamed while testing raw metadata";
+    const rawNext = rawCatalogWithUnknown(next, unknownField.path);
+
+    await assert.rejects(commitRawCatalogOnly(box.libraryDir, rawNext), /unknown|unexpected|canonical|catalog field/i);
+    assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), oldBytes);
+    await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+  });
+}
+
+test("catalog-only raw commit rejects unknown properties in the existing catalog", async (t) => {
+  const box = await sandbox(t);
+  const old = catalog([item()], [{ id: "daily", name: "Daily", itemIds: [] }]);
+  const rawOld = rawCatalogWithUnknown(old, ["items", 0, "files", 0, "unexpectedMetadata"]);
+  await mkdir(box.libraryDir, { recursive: true });
+  await writeFile(path.join(box.libraryDir, "catalog.json"), rawOld);
+  const next = structuredClone(old);
+  next.items[0]!.name = "Renamed while testing raw old catalog";
+
+  await assert.rejects(commitRawCatalogOnly(box.libraryDir, catalogBytes(next)), /unknown|unexpected|canonical|catalog field/i);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), rawOld);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
+test("catalog-only accepts raw JSON whitespace and reordered object keys", async (t) => {
+  const box = await sandbox(t);
+  const old = catalog([item()], [{ id: "daily", name: "Daily", itemIds: [] }]);
+  const rawOld = Buffer.from(`${JSON.stringify(reverseObjectKeyOrder(old), null, 6)}\n`, "utf8");
+  await mkdir(box.libraryDir, { recursive: true });
+  await writeFile(path.join(box.libraryDir, "catalog.json"), rawOld);
+  const next = structuredClone(old);
+  next.items[0]!.name = "Renamed with reordered JSON";
+  next.groups[0]!.name = "Daily reviewed";
+  const rawNext = Buffer.from(`${JSON.stringify(reverseObjectKeyOrder(next), null, 4)}\n`, "utf8");
+
+  await commitRawCatalogOnly(box.libraryDir, rawNext);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), rawNext);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
 test("catalog-only rejects item/content, group-reference, destination, and duplicate-name hitchhiking", async (t) => {
   const box = await sandbox(t);
   const first = item();
@@ -277,6 +383,44 @@ for (const corruption of ["unknown stage", "altered digest", "foreign owner nonc
     assert.ok(await lstat(lock));
   });
 }
+
+test("catalog-only recovery retains a raw next catalog with an unknown property even when journal hashes match", async (t) => {
+  const box = await sandbox(t);
+  const old = catalog([item()], [{ id: "daily", name: "Daily", itemIds: [] }]);
+  const oldBytes = await storeCatalog(box.libraryDir, old);
+  const next = structuredClone(old);
+  next.items[0]!.name = "Unknown raw next metadata";
+  const lock = await pauseWriterAtJournal(box.libraryDir, next);
+  const rawNext = rawCatalogWithUnknown(next, ["items", 0, "files", 0, "unexpectedMetadata"]);
+  await writeFile(path.join(lock, "next-catalog"), rawNext);
+  await rebindJournalCatalog(lock, "newCatalog", rawNext);
+  const journalBytes = await readFile(path.join(lock, "journal.json"));
+
+  await assert.rejects(recover(box.libraryDir), /unknown|unexpected|canonical|catalog field/i);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), oldBytes);
+  assert.deepEqual(await readFile(path.join(lock, "next-catalog")), rawNext);
+  assert.deepEqual(await readFile(path.join(lock, "journal.json")), journalBytes);
+  assert.equal((await readFile(path.join(lock, "journal.digest"), "utf8")), digest(journalBytes));
+});
+
+test("catalog-only recovery retains a raw old catalog with an unknown property", async (t) => {
+  const box = await sandbox(t);
+  const old = catalog([item()], [{ id: "daily", name: "Daily", itemIds: [] }]);
+  await storeCatalog(box.libraryDir, old);
+  const next = structuredClone(old);
+  next.items[0]!.name = "Unknown raw old metadata";
+  const lock = await pauseWriterAtJournal(box.libraryDir, next);
+  const rawOld = rawCatalogWithUnknown(old, ["groups", 0, "unexpectedMetadata"]);
+  await writeFile(path.join(lock, "old-catalog"), rawOld);
+  await rebindJournalCatalog(lock, "oldCatalog", rawOld);
+  const journalBytes = await readFile(path.join(lock, "journal.json"));
+
+  await assert.rejects(recover(box.libraryDir), /unknown|unexpected|canonical|catalog field/i);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), rawOld);
+  assert.deepEqual(await readFile(path.join(lock, "old-catalog")), rawOld);
+  assert.deepEqual(await readFile(path.join(lock, "journal.json")), journalBytes);
+  assert.equal((await readFile(path.join(lock, "journal.digest"), "utf8")), digest(journalBytes));
+});
 
 test("catalog-only commit stops before catalog installation when sources root appears during staging", async (t) => {
   const box = await sandbox(t);

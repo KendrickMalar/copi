@@ -488,6 +488,27 @@ async function validateSourcesTransition(root: string, previous: Catalog, next: 
   return operations;
 }
 
+function sameJsonShape(value: unknown, canonical: unknown): boolean {
+  if (Array.isArray(canonical)) {
+    return Array.isArray(value) && value.length === canonical.length && canonical.every((entry, index) => sameJsonShape(value[index], entry));
+  }
+  if (canonical !== null && typeof canonical === "object") {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const valueRecord = value as Record<string, unknown>;
+    const canonicalRecord = canonical as Record<string, unknown>;
+    const keys = Object.keys(canonicalRecord);
+    return Object.keys(valueRecord).length === keys.length &&
+      keys.every((key) => Object.hasOwn(valueRecord, key) && sameJsonShape(valueRecord[key], canonicalRecord[key]));
+  }
+  return Object.is(value, canonical);
+}
+
+function assertCanonicalStoredCatalog(raw: unknown, canonical: Catalog): void {
+  if (!sameJsonShape(raw, canonical)) {
+    throw new Error("Catalog contains unknown or non-canonical stored fields; preserving its original bytes.");
+  }
+}
+
 function validateCatalogOnlyTransition(previous: Catalog, next: Catalog): void {
   assertNoNameConflicts(next);
   if (next.items.length !== previous.items.length) throw new Error("A catalog-only transaction cannot add, remove, or reorder source items.");
@@ -1394,12 +1415,16 @@ export class StorageSession {
     replacements = prepared.replacements;
     await this.assertLease();
     await this.assertRevision(expected);
-    const previousStored = expected.catalog === null ? { version: 2 as const, items: [], groups: [] } : parseStoredCatalog(JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown);
-    const nextStored = parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown);
+    const previousRaw = expected.catalog === null ? undefined : JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown;
+    const previousStored = previousRaw === undefined ? { version: 2 as const, items: [], groups: [] } : parseStoredCatalog(previousRaw);
+    const nextRaw = JSON.parse(catalog.toString("utf8")) as unknown;
+    const nextStored = parseStoredCatalog(nextRaw);
     if (expected.format !== "v2" || previousStored.version !== 2 || nextStored.version !== 2) throw new Error("Ordinary storage commits require catalog v2; explicitly migrate legacy v1 storage first.");
     assertModernCatalog(previousStored);
     assertModernCatalog(nextStored);
     if (replacements.length === 0) {
+      if (previousRaw !== undefined) assertCanonicalStoredCatalog(previousRaw, previousStored);
+      assertCanonicalStoredCatalog(nextRaw, nextStored);
       await this.#commitCatalogOnly(expected, previousStored, nextStored, catalog);
       return;
     }
@@ -2227,17 +2252,21 @@ export class StorageSession {
     const rawNext = await checkedFile(path.join(this.lock, "next-catalog"));
     const nextStat = await statMaybe(path.join(this.lock, "next-catalog"));
     if (!rawNext || !nextStat || hash(rawNext) !== journal.newCatalog) throw new Error("Catalog-only next catalog is missing or altered; preserve the journal and remaining artifacts for manual inspection with a newly verified recovery build.");
-    const nextStored = parseStoredCatalog(JSON.parse(rawNext.toString("utf8")) as unknown);
+    const rawNextValue = JSON.parse(rawNext.toString("utf8")) as unknown;
+    const nextStored = parseStoredCatalog(rawNextValue);
     if (nextStored.version !== 2) throw new Error("Catalog-only recovery requires a v2 catalog.");
     assertModernCatalog(nextStored);
+    assertCanonicalStoredCatalog(rawNextValue, nextStored);
     const oldPath = path.join(this.lock, "old-catalog");
     const rawOld = journal.oldCatalog === null ? undefined : await checkedFile(oldPath);
     const oldStat = journal.oldCatalog === null ? undefined : await statMaybe(oldPath);
     if (journal.oldCatalog === null ? entries.has("old-catalog") : !rawOld || !oldStat || hash(rawOld) !== journal.oldCatalog) {
       throw new Error("Catalog-only old catalog is missing or altered.");
     }
-    const previousStored = rawOld ? parseStoredCatalog(JSON.parse(rawOld.toString("utf8")) as unknown) : null;
+    const rawOldValue = rawOld ? JSON.parse(rawOld.toString("utf8")) as unknown : undefined;
+    const previousStored = rawOldValue === undefined ? null : parseStoredCatalog(rawOldValue);
     if (previousStored && previousStored.version !== 2) throw new Error("Catalog-only recovery cannot use a legacy v1 catalog.");
+    if (previousStored?.version === 2) assertCanonicalStoredCatalog(rawOldValue, previousStored);
     const previous = previousStored?.version === 2 ? previousStored : { version: 2 as const, items: [], groups: [] };
     validateCatalogOnlyTransition(previous, nextStored);
 
