@@ -16,6 +16,7 @@ export interface SourcesStorageJournal {
   token: string;
   oldCatalog: string | null;
   newCatalog: string;
+  stableSourcesTree: string;
   operations: { itemId: string; target: string; kind: "file" | "tree"; oldTree: string | null; newTree: string }[];
 }
 
@@ -93,10 +94,10 @@ function assertNoTargetOverlap(targets: readonly string[]): void {
 }
 
 export function parseStorageJournal(value: unknown, expected: { root: string; token: string }): StorageJournal {
-  if (!isRecord(value) || !hasExactKeys(value, ["version", "root", "token", "oldCatalog", "newCatalog", "operations"])) {
-    throw new Error("Invalid storage journal object.");
-  }
-  if (value.version !== 1 && value.version !== 2) throw new Error("Unsupported storage journal version.");
+  if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) throw new Error("Unsupported or invalid storage journal version.");
+  const commonKeys = ["version", "root", "token", "oldCatalog", "newCatalog", "operations"];
+  const expectedKeys = value.version === 1 ? commonKeys : [...commonKeys, "stableSourcesTree"];
+  if (!hasExactKeys(value, expectedKeys)) throw new Error("Invalid storage journal object.");
   assertCommonJournal(value, expected);
 
   if (value.version === 1) {
@@ -122,6 +123,7 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
     };
   }
 
+  if (!isSha256(value.stableSourcesTree)) throw new Error("Invalid stable sources tree commitment in v2 storage journal.");
   const operations: SourcesStorageJournal["operations"] = [];
   for (const valueOperation of value.operations) {
     if (!isRecord(valueOperation) || !hasExactKeys(valueOperation, ["itemId", "target", "kind", "oldTree", "newTree"])) {
@@ -149,6 +151,7 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
     token: value.token,
     oldCatalog: value.oldCatalog,
     newCatalog: value.newCatalog,
+    stableSourcesTree: value.stableSourcesTree,
     operations,
   };
 }

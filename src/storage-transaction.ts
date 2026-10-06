@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
+import { readSourceContent } from "./source-content.ts";
+import { parseStorageJournal, validateSourcesJournalTargets, type SourcesStorageJournal } from "./storage-journal.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
-import type { Catalog, InspectionWarning, SavedItem, SnapshotFile } from "./types.ts";
+import type { Catalog, InspectionWarning, SavedItem } from "./types.ts";
 
 const lockName = ".copi-transaction";
 const privateNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions", "auth.json", "mcp-auth.json", "oauth.json"]);
@@ -35,8 +37,7 @@ interface SessionLease {
 }
 // Only run/recoverDead issue leases. Public constructor calls cannot register themselves.
 const sessionLeases = new WeakMap<StorageSession, SessionLease>();
-interface JournalOperation { itemId: string; oldTree: string | null; newTree: string }
-interface Journal { version: 1; root: string; token: string; oldCatalog: string | null; newCatalog: string; operations: JournalOperation[] }
+type SourcesOperation = SourcesStorageJournal["operations"][number];
 
 export function safeStoragePath(value: string): boolean {
   return typeof value === "string" && value.length > 0 && !value.includes("\\") && !value.includes("\0") && !path.posix.isAbsolute(value) && value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
@@ -105,7 +106,7 @@ async function checkedDirectory(target: string): Promise<boolean> {
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Unsafe symbolic link or non-directory in copi storage: ${target}`);
   return true;
 }
-async function tree(target: string, replacements?: ReadonlyMap<string, string>, includeIdentity = false): Promise<string | null> {
+async function tree(target: string, replacements?: ReadonlyMap<string, string>, includeIdentity = false, omittedPaths: ReadonlySet<string> = new Set()): Promise<string | null> {
   if (!await statMaybe(target)) return null;
   const entries: TreeEntry[] = [];
   async function visit(current: string, relative: string): Promise<void> {
@@ -115,26 +116,21 @@ async function tree(target: string, replacements?: ReadonlyMap<string, string>, 
     else if (stat.isDirectory()) {
       entries.push({ path: relative, kind: "directory", value: "", mode: stat.mode & 0o777, ...identity });
       const names = await readdir(current);
-      const atRoot = relative === "." && replacements;
-      for (const entry of [...new Set([...names, ...(atRoot ? replacements.keys() : [])])].sort()) {
-        await visit(atRoot ? replacements.get(entry) ?? path.join(current, entry) : path.join(current, entry), path.posix.join(relative, entry));
+      const prefix = relative === "." ? "" : `${relative}/`;
+      const mappedChildren = [...(replacements?.keys() ?? [])]
+        .filter((mapped) => path.posix.dirname(mapped) === (relative === "." ? "." : relative))
+        .map((mapped) => path.posix.basename(mapped));
+      for (const entry of [...new Set([...names, ...mappedChildren])].sort()) {
+        const childRelative = `${prefix}${entry}`;
+        if (omittedPaths.has(childRelative)) continue;
+        const replacement = replacements?.get(childRelative);
+        await visit(replacement ?? path.join(current, entry), childRelative);
       }
     } else if (stat.isFile()) entries.push({ path: relative, kind: "file", value: hash(await readFile(current)), mode: stat.mode & 0o777, ...identity });
     else throw new Error("Unsupported special file in copi storage.");
   }
   await visit(target, ".");
   return hash(JSON.stringify(entries));
-}
-async function snapshotBytes(root: string, item: SavedItem, file: SnapshotFile): Promise<Buffer> {
-  const parents = ["items", item.id, "files", ...file.path.split("/").slice(0, -1)];
-  let directory = root;
-  for (const segment of parents) {
-    directory = path.join(directory, segment);
-    if (!await checkedDirectory(directory)) throw new Error("Snapshot contains a missing directory.");
-  }
-  const bytes = await checkedFile(path.join(directory, path.posix.basename(file.path)));
-  if (!bytes || hash(bytes) !== file.sha256) throw new Error(`Snapshot checksum mismatch for ${file.path}; saved bytes were manually changed or damaged. Automatic checksum repair is refused.`);
-  return bytes;
 }
 function validateMutationNames(previous: Catalog, next: Catalog, replacements: readonly StorageReplacement[]): void {
   const conflicts = findNameConflicts(previous);
@@ -158,24 +154,97 @@ function validateMutationNames(previous: Catalog, next: Catalog, replacements: r
   }
   if (JSON.stringify(restored) !== JSON.stringify(previous)) throw new Error("Conflict resolution must preserve all metadata, files and group references.");
 }
-async function validateCommitCatalogs(root: string, previous: Catalog, next: Catalog, replacements: readonly StorageReplacement[]): Promise<void> {
-  validateMutationNames(previous, next, replacements);
-  for (const item of previous.items) for (const file of item.files) await snapshotBytes(root, item, file);
-  for (const item of next.items) {
-    const old = previous.items.find((entry) => entry.id === item.id);
-    if (old?.destination.kind === "global-only" && item.destination.kind !== "global-only") throw new Error("A reference-only/global-only resource cannot become project-applicable.");
-    if (item.destination.kind === "project" && JSON.stringify(old?.destination) !== JSON.stringify(item.destination) && privateStoragePath(item.destination.path)) throw new Error("Unsafe private/excluded resource destination.");
-    if (replacements.some((replacement) => replacement.itemId === item.id)) continue;
-    const newlyRegistered: StorageFile[] = [];
-    for (const file of item.files) {
-      const bytes = await snapshotBytes(root, item, file);
-      if (!old?.files.some((entry) => JSON.stringify(entry) === JSON.stringify(file))) {
-        if (privateStoragePath(file.path)) throw new Error("Private/excluded paths cannot be registered through a catalog save.");
-        newlyRegistered.push({ ...file, bytes });
-      }
-    }
-    if (newlyRegistered.length > 0 && inspectFixedResource({ candidate: { ...item, sourceRoot: path.dirname(item.sourcePath) }, files: newlyRegistered, excludedPaths: [] }).sensitivePaths.length > 0) throw new Error("Registering sensitive content requires a prepared storage inspection and individual approval, not a catalog-only update.");
+async function checkedSourceFileTarget(root: string, target: string, allowMissing = false): Promise<string | undefined> {
+  if (!safeStoragePath(target) || !target.startsWith("sources/") || privateStoragePath(target)) throw new Error("Unsafe registered sources file target.");
+  const segments = target.split("/");
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    current = path.join(current, segment);
+    const stat = await statMaybe(current);
+    if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Registered sources file has a missing, unsafe, or symbolic-link parent directory.");
   }
+  const absolute = path.join(current, segments.at(-1)!);
+  const stat = await statMaybe(absolute);
+  if (!stat && allowMissing) return undefined;
+  if (!stat || !stat.isFile() || stat.isSymbolicLink()) throw new Error("Registered sources content must be a regular non-symlink file.");
+  return absolute;
+}
+
+async function validateSourcesTransition(root: string, previous: Catalog, next: Catalog, replacements: readonly StorageReplacement[]): Promise<SourcesOperation[]> {
+  validateMutationNames(previous, next, replacements);
+  if (previous.items.length !== next.items.length || JSON.stringify(previous.groups) !== JSON.stringify(next.groups)) {
+    throw new Error("This sources transaction only replaces registered file content; catalog membership and groups must remain unchanged.");
+  }
+  const replacementById = new Map<string, StorageReplacement>();
+  for (const replacement of replacements) {
+    if (!itemPattern.test(replacement.itemId) || replacementById.has(replacement.itemId)) throw new Error("Duplicate or invalid sources replacement item.");
+    replacementById.set(replacement.itemId, replacement);
+  }
+  const operations: SourcesOperation[] = [];
+  for (const [index, oldItem] of previous.items.entries()) {
+    const nextItem = next.items[index];
+    if (!nextItem || nextItem.id !== oldItem.id) throw new Error("Sources replacement must preserve catalog item order and identity.");
+    const replacement = replacementById.get(oldItem.id);
+    if (!replacement) {
+      if (JSON.stringify(nextItem) !== JSON.stringify(oldItem)) throw new Error("Unreplaced catalog items must remain byte-for-byte unchanged.");
+      continue;
+    }
+    if (oldItem.content.kind !== "file" || nextItem.content.kind !== "file" || oldItem.content.path !== nextItem.content.path) {
+      throw new Error("Only an existing registered content.kind=file at its original target may be replaced.");
+    }
+    const target = nextItem.content.path;
+    const basename = path.posix.basename(target);
+    const oldFile = oldItem.files[0];
+    const nextFile = nextItem.files[0];
+    const file = replacement.files[0];
+    if (replacement.files.length !== 1 || oldItem.files.length !== 1 || nextItem.files.length !== 1 || !oldFile || !nextFile || !file ||
+        file.path !== basename || nextFile.path !== basename || oldFile.path !== basename ||
+        file.mode !== oldFile.mode || nextFile.mode !== oldFile.mode || nextFile.sha256 !== hash(file.bytes) ||
+        !safeStoragePath(target) || !target.startsWith("sources/") || privateStoragePath(target) || privateStoragePath(file.path)) {
+      throw new Error("A sources file replacement must contain exactly the registered basename and preserve its approved mode and catalog checksum.");
+    }
+    const expectedItem = { ...oldItem, files: nextItem.files };
+    if (JSON.stringify(expectedItem) !== JSON.stringify(nextItem)) throw new Error("A file replacement may update only its registered file checksum.");
+    const currentFiles = await readSourceContent(root, oldItem);
+    if (currentFiles.length !== 1 || currentFiles[0]!.path !== basename) throw new Error("Registered sources file did not resolve to exactly its catalog basename.");
+    await checkedSourceFileTarget(root, target);
+    operations.push({ itemId: oldItem.id, target, kind: "file", oldTree: null, newTree: "0".repeat(64) });
+  }
+  if (replacementById.size !== operations.length) throw new Error("A sources replacement refers to an unknown catalog item.");
+  return operations;
+}
+
+function validateSourcesCatalogTransition(previous: Catalog | null, next: Catalog, operations: readonly SourcesOperation[]): void {
+  if (previous === null) {
+    if (operations.length > 0 || next.items.length > 0 || next.groups.length > 0) throw new Error("A v2 file replacement requires an existing catalog item and registered sources file.");
+    return;
+  }
+  if (previous.items.length !== next.items.length || JSON.stringify(previous.groups) !== JSON.stringify(next.groups)) throw new Error("Sources journal catalogs changed membership or groups outside a registered file replacement.");
+  const byId = new Map(operations.map((operation) => [operation.itemId, operation]));
+  for (const [index, oldItem] of previous.items.entries()) {
+    const nextItem = next.items[index];
+    if (!nextItem || nextItem.id !== oldItem.id) throw new Error("Sources journal catalogs changed item order or identity.");
+    const operation = byId.get(oldItem.id);
+    if (!operation) {
+      if (JSON.stringify(nextItem) !== JSON.stringify(oldItem)) throw new Error("Sources journal contains an unrecorded catalog item change.");
+      continue;
+    }
+    const oldFile = oldItem.files[0];
+    const nextFile = nextItem.files[0];
+    if (oldItem.content.kind !== "file" || nextItem.content.kind !== "file" || oldItem.content.path !== operation.target || nextItem.content.path !== operation.target ||
+        !oldFile || !nextFile || oldItem.files.length !== 1 || nextItem.files.length !== 1 || oldFile.path !== path.posix.basename(operation.target) ||
+        nextFile.path !== oldFile.path || nextFile.mode !== oldFile.mode || JSON.stringify({ ...oldItem, files: nextItem.files }) !== JSON.stringify(nextItem)) {
+      throw new Error("Sources journal operation does not represent a checksum-only update to its registered file.");
+    }
+  }
+  if (byId.size !== operations.length) throw new Error("Sources journal refers to an unknown catalog item.");
+}
+
+async function sourceFileTreeIfPresent(target: string): Promise<string | null> {
+  const stat = await statMaybe(target);
+  if (!stat) return null;
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("Sources transaction target, stage, or backup is not a regular file.");
+  return tree(target, undefined, true);
 }
 
 async function syncDirectory(target: string): Promise<void> {
@@ -271,17 +340,6 @@ async function inFlightCheckpoint(callback: StorageOptions["checkpoint"], contro
     if (!control.recovering || !control.signal.aborted) throw error;
   } finally { control.signal.removeEventListener("abort", abort); }
 }
-async function stageParent(filesRoot: string, filePath: string): Promise<string> {
-  await directoryIdentity(filesRoot);
-  let parent = filesRoot;
-  for (const segment of filePath.split("/").slice(0, -1)) {
-    const next = path.join(parent, segment);
-    if (!await checkedDirectory(next)) await mkdir(next, { mode: 0o700 });
-    parent = next;
-  }
-  return parent;
-}
-
 /** @internal Generalized fixed-byte persistence adapter. Inspection/approval are enforced here too; instance-bound faults cannot disable checks. */
 export class StorageTransactions {
   constructor(private readonly options: StorageOptions = {}) {}
@@ -415,124 +473,150 @@ export class StorageSession {
     if (expected.format !== "v2" || previousStored.version !== 2 || nextStored.version !== 2) throw new Error("Ordinary storage commits require catalog v2; explicitly migrate legacy v1 storage first.");
     assertModernCatalog(previousStored);
     assertModernCatalog(nextStored);
-    const previous = previousStored;
-    const next = nextStored;
-    await validateCommitCatalogs(this.root, previous, next, replacements);
-    const operations: JournalOperation[] = [];
-    if (new Set(replacements.map((replacement) => replacement.itemId)).size !== replacements.length) throw new Error("Duplicate snapshot replacement.");
-    for (const [index, replacement] of replacements.entries()) {
-      if (!itemPattern.test(replacement.itemId)) throw new Error("Invalid snapshot identifier.");
-      const target = path.join(this.root, "items", replacement.itemId);
-      if (await statMaybe(target)) await checkedDirectory(target);
+    await this.#commitSources(expected, previousStored, nextStored, catalog, replacements);
+  }
+  async #commitSources(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer, replacements: readonly StorageReplacement[]): Promise<void> {
+    const operations = await validateSourcesTransition(this.root, previous, next, replacements);
+    const sourcesRoot = path.join(this.root, "sources");
+    const targets = new Set(operations.map((operation) => operation.target.slice("sources/".length)));
+    const stableSourcesTree = operations.length > 0
+      ? await tree(sourcesRoot, undefined, true, targets)
+      : await tree(sourcesRoot, undefined, true);
+    if (stableSourcesTree === null) throw new Error("Registered sources root is missing.");
+    await this.assertRevision(expected);
+
+    for (const [index, operation] of operations.entries()) {
+      const target = await checkedSourceFileTarget(this.root, operation.target);
+      if (!target) throw new Error("Registered sources file disappeared before staging.");
       const stage = path.join(this.lock, `next-${index}`);
-      await this.assertLease();
-      await mkdir(stage, { mode: 0o700 });
-      await mkdir(path.join(stage, "files"), { mode: 0o700 });
-      for (const file of replacement.files) {
-        await this.assertLease();
-        if (!safeStoragePath(file.path)) throw new Error("Unsafe relative snapshot path.");
-        const parent = await stageParent(path.join(stage, "files"), file.path);
-        await this.assertLease();
-        const handle = await open(path.join(parent, path.posix.basename(file.path)), "wx", 0o600);
-        try {
-          await handle.writeFile(file.bytes);
-          await this.checkpoint?.("stage-write", this.root);
-          await this.assertLease();
-          await this.checkpoint?.("stage-sync", this.root);
-          await this.assertLease();
-          await handle.sync();
-        } finally { await handle.close(); }
-        const stored = await checkedFile(path.join(parent, path.posix.basename(file.path)));
-        if (!stored || !stored.equals(file.bytes)) throw new Error("Staged bytes changed from the fixed inspected bytes; refusing save.");
-      }
-      operations.push({ itemId: replacement.itemId, oldTree: await tree(target), newTree: (await tree(stage))! });
+      await this.assertLease(false);
+      const handle = await open(stage, "wx", 0o600);
+      try {
+        await handle.writeFile(replacements.find((replacement) => replacement.itemId === operation.itemId)!.files[0]!.bytes);
+        await this.checkpoint?.("stage-write", this.root);
+        await this.assertLease(false);
+        await this.checkpoint?.("stage-sync", this.root);
+        await this.assertLease(false);
+        await handle.sync();
+      } finally { await handle.close(); }
+      const staged = await checkedFile(stage);
+      const replacement = replacements.find((entry) => entry.itemId === operation.itemId)!;
+      if (!staged || !staged.equals(replacement.files[0]!.bytes)) throw new Error("Staged sources bytes changed from the fixed inspected bytes; refusing save.");
+      const oldTree = await tree(target, undefined, true);
+      const newTree = await tree(stage, undefined, true);
+      if (oldTree === null || newTree === null) throw new Error("Registered sources file or its private stage disappeared.");
+      operations[index] = { ...operation, oldTree, newTree };
     }
-    await this.assertLease();
-    const catalogHandle = await open(path.join(this.lock, "next-catalog"), "wx", 0o600);
+
+    const catalogStage = path.join(this.lock, "next-catalog");
+    await this.assertLease(false);
+    const catalogHandle = await open(catalogStage, "wx", 0o600);
     try {
       await catalogHandle.writeFile(catalog);
       await this.checkpoint?.("stage-write", this.root);
-      await this.assertLease();
+      await this.assertLease(false);
       await this.checkpoint?.("stage-sync", this.root);
-      await this.assertLease();
+      await this.assertLease(false);
       await catalogHandle.sync();
     } finally { await catalogHandle.close(); }
-    const stagedCatalog = await checkedFile(path.join(this.lock, "next-catalog"));
-    if (!stagedCatalog || !stagedCatalog.equals(catalog)) throw new Error("Staged catalog changed before commit; refusing live snapshot renames.");
-    await this.assertLease();
+    const stagedCatalog = await checkedFile(catalogStage);
+    if (!stagedCatalog || !stagedCatalog.equals(catalog)) throw new Error("Staged catalog changed before sources swap; refusing commit.");
+    await this.assertLease(false);
     if (expected.catalog !== null) await writePrivate(path.join(this.lock, "old-catalog"), Buffer.from(expected.catalog, "base64"));
-    const journal: Journal = { version: 1, root: this.root, token: this.token, oldCatalog: expected.catalog === null ? null : hash(Buffer.from(expected.catalog, "base64")), newCatalog: hash(catalog), operations };
-    await writePrivate(path.join(this.lock, "journal.tmp"), JSON.stringify(journal));
+    const journal: SourcesStorageJournal = {
+      version: 2,
+      root: this.root,
+      token: this.token,
+      oldCatalog: expected.catalog === null ? null : hash(Buffer.from(expected.catalog, "base64")),
+      newCatalog: hash(catalog),
+      stableSourcesTree,
+      operations,
+    };
+    const journalBytes = Buffer.from(JSON.stringify(journal));
+    await writePrivate(path.join(this.lock, "journal.tmp"), journalBytes);
     await rename(path.join(this.lock, "journal.tmp"), path.join(this.lock, "journal.json"));
-    await writePrivate(path.join(this.lock, "journal.digest"), hash(JSON.stringify(journal)));
+    await writePrivate(path.join(this.lock, "journal.digest"), hash(journalBytes));
     await syncDirectory(this.lock);
     try {
       await this.checkpoint?.("journal", this.root);
-      await this.assertLease();
-      const writtenJournal = await checkedFile(path.join(this.lock, "journal.json"));
-      const writtenDigest = await checkedFile(path.join(this.lock, "journal.digest"));
-      if (!writtenJournal || hash(writtenJournal) !== hash(JSON.stringify(journal)) || writtenDigest?.toString("utf8") !== hash(writtenJournal)) throw new Error("Transaction journal changed before commit; refusing snapshot renames.");
+      await this.assertLease(false);
+      const rawJournal = await checkedFile(path.join(this.lock, "journal.json"));
+      const journalDigest = await checkedFile(path.join(this.lock, "journal.digest"));
+      if (!rawJournal || !rawJournal.equals(journalBytes) || !journalDigest || journalDigest.toString("utf8") !== hash(rawJournal)) throw new Error("Sources journal or raw digest changed before swap; refusing commit.");
       await this.assertRevision(expected);
-      if (operations.length > 0 && !await checkedDirectory(path.join(this.root, "items"))) await mkdir(path.join(this.root, "items"), { mode: 0o700 });
-      const expectedNextTree = await tree(path.join(this.root, "items"), new Map(operations.map((operation, index) => [operation.itemId, path.join(this.lock, `next-${index}`)])));
+      const previousSourcesTree = await tree(sourcesRoot, undefined, true);
+      if (previousSourcesTree !== expected.tree) throw new Error("Sources changed after capture; refusing swap.");
+      const stageByTarget = new Map(operations.map((operation, index) => [operation.target.slice("sources/".length), path.join(this.lock, `next-${index}`)]));
+      const expectedNextTree = await tree(sourcesRoot, stageByTarget, true);
+      if (expectedNextTree === null) throw new Error("Cannot compute the expected sources tree.");
+      validateSourcesJournalTargets(journal, previous, next);
+
       for (const [index, operation] of operations.entries()) {
-        const target = path.join(this.root, "items", operation.itemId);
+        const target = await checkedSourceFileTarget(this.root, operation.target);
+        if (!target) throw new Error("Registered sources file disappeared during commit.");
+        const oldPath = path.join(this.lock, `old-${index}`);
         await this.checkpoint?.("before-swap", this.root);
-        await this.assertLease();
-        if (await tree(target) !== operation.oldTree) throw new Error("Saved snapshot changed during commit; refusing overwrite.");
-        if (operation.oldTree !== null) await rename(target, path.join(this.lock, `old-${index}`));
+        await this.assertLease(false);
+        if (await tree(target, undefined, true) !== operation.oldTree) throw new Error("Registered sources file changed during commit; refusing overwrite.");
+        await rename(target, oldPath);
         await this.checkpoint?.("old-renamed", this.root);
-        await this.assertLease();
-        if (await tree(path.join(this.lock, `old-${index}`)) !== operation.oldTree) throw new Error("Original saved bytes changed in the moved snapshot; retained external bytes instead of deleting them.");
-        if (await statMaybe(target)) throw new Error("An external file appeared during commit; refusing overwrite.");
-        if (await tree(path.join(this.lock, `next-${index}`)) !== operation.newTree) throw new Error("Staged bytes changed during commit; refusing save.");
-        await rename(path.join(this.lock, `next-${index}`), target);
+        await this.assertLease(false);
+        if (await tree(oldPath, undefined, true) !== operation.oldTree) throw new Error("Original sources inode changed after rename; retained external bytes instead of deleting them.");
+        if (await statMaybe(target)) throw new Error("A file appeared at the registered sources target during commit.");
+        const stage = path.join(this.lock, `next-${index}`);
+        if (await checkedFile(stage) === undefined || await tree(stage, undefined, true) !== operation.newTree) throw new Error("Private sources stage changed during commit.");
+        await rename(stage, target);
         await this.checkpoint?.("new-renamed", this.root);
-        await this.assertLease();
+        await this.assertLease(false);
       }
       await this.checkpoint?.("before-catalog", this.root);
-      await this.assertLease();
-      if (await tree(path.join(this.root, "items")) !== expectedNextTree) throw new Error("Saved bytes or another item changed during commit; refusing catalog update.");
+      await this.assertLease(false);
+      if (await tree(sourcesRoot, undefined, true) !== expectedNextTree || await tree(sourcesRoot, undefined, true, targets) !== stableSourcesTree) throw new Error("Sources tree or an adjacent/unregistered inode changed during swap; refusing catalog update.");
       const actual = await checkedFile(path.join(this.root, "catalog.json"));
-      if ((actual ? hash(actual) : null) !== journal.oldCatalog) throw new Error("Catalog changed during commit; refusing overwrite.");
-      for (const operation of operations) if (await tree(path.join(this.root, "items", operation.itemId)) !== operation.newTree) throw new Error("Saved bytes changed during commit; refusing catalog update.");
-      await this.assertOldSnapshots(operations);
-      if (!(await checkedFile(path.join(this.lock, "next-catalog")))?.equals(catalog)) throw new Error("Staged catalog changed during commit; refusing save.");
-      const destination = path.join(this.root, "catalog.json");
-      const held = path.join(this.lock, "held-catalog");
-      if (await statMaybe(held)) throw new Error("Unexpected held catalog; refusing overwrite.");
-      if (actual) await rename(destination, held);
+      if ((actual ? hash(actual) : null) !== journal.oldCatalog) throw new Error("Catalog changed during sources commit; refusing overwrite.");
+      for (const [index, operation] of operations.entries()) {
+        const target = await checkedSourceFileTarget(this.root, operation.target);
+        if (!target || await tree(target, undefined, true) !== operation.newTree) throw new Error("Registered sources file changed before catalog update.");
+        if (await tree(path.join(this.lock, `old-${index}`), undefined, true) !== operation.oldTree) throw new Error("Original sources inode changed; retaining the external bytes.");
+      }
+      if (!(await checkedFile(catalogStage))?.equals(catalog)) throw new Error("Staged catalog changed before commit.");
+      const catalogPath = path.join(this.root, "catalog.json");
+      const heldPath = path.join(this.lock, "held-catalog");
+      const beforeCatalogStat = await statMaybe(catalogPath);
+      if (beforeCatalogStat && expected.catalogIdentity !== `${beforeCatalogStat.dev}:${beforeCatalogStat.ino}`) throw new Error("Original catalog inode changed before it was held.");
+      if (await statMaybe(heldPath)) throw new Error("Unexpected held catalog; refusing overwrite.");
+      if (actual) await rename(catalogPath, heldPath);
       await this.checkpoint?.("catalog-held", this.root);
-      await this.assertLease();
-      const original = await checkedFile(held);
-      if ((original ? hash(original) : null) !== journal.oldCatalog) throw new Error("Original catalog changed in its held inode; retained external bytes instead of deleting them.");
-      // link() atomically refuses an externally recreated catalog.json; rename() could overwrite it.
-      await link(path.join(this.lock, "next-catalog"), destination);
+      await this.assertLease(false);
+      const held = await checkedFile(heldPath);
+      if ((held ? hash(held) : null) !== journal.oldCatalog) throw new Error("Original catalog changed in its held inode; retained external bytes.");
+      const heldStat = await statMaybe(heldPath);
+      if (heldStat && expected.catalogIdentity !== `${heldStat.dev}:${heldStat.ino}`) throw new Error("Original held catalog inode changed; retained it.");
+      await link(catalogStage, catalogPath);
       await this.checkpoint?.("catalog-renamed", this.root);
-      await this.assertLease();
+      await this.assertLease(false);
       await this.checkpoint?.("directory-sync", this.root);
-      await this.assertLease();
-      if (operations.length > 0) await syncDirectory(path.join(this.root, "items"));
+      await this.assertLease(false);
+      for (const operation of operations) {
+        const target = await checkedSourceFileTarget(this.root, operation.target);
+        if (target) await syncDirectory(path.dirname(target));
+      }
       await syncDirectory(this.root);
       await this.checkpoint?.("committed", this.root);
-      await this.assertLease();
-      if (await tree(path.join(this.root, "items")) !== expectedNextTree || hash((await checkedFile(path.join(this.root, "catalog.json")))!) !== journal.newCatalog) throw new Error("Saved library changed during commit finalization.");
-      await this.assertOldSnapshots(operations);
-      const originalAtFinish = await checkedFile(held);
-      if ((originalAtFinish ? hash(originalAtFinish) : null) !== journal.oldCatalog) throw new Error("Original held catalog changed during finalization; retained external bytes.");
+      await this.assertLease(false);
+      if (await tree(sourcesRoot, undefined, true) !== expectedNextTree || await tree(sourcesRoot, undefined, true, targets) !== stableSourcesTree || hash((await checkedFile(catalogPath))!) !== journal.newCatalog) throw new Error("Sources library changed during commit finalization.");
+      for (const [index, operation] of operations.entries()) if (await tree(path.join(this.lock, `old-${index}`), undefined, true) !== operation.oldTree) throw new Error("Original sources inode changed during finalization; retaining external bytes.");
+      const heldAtFinish = await checkedFile(heldPath);
+      const heldAtFinishStat = await statMaybe(heldPath);
+      if ((heldAtFinish ? hash(heldAtFinish) : null) !== journal.oldCatalog || (heldAtFinishStat && expected.catalogIdentity !== `${heldAtFinishStat.dev}:${heldAtFinishStat.ino}`)) throw new Error("Original held catalog changed during finalization; retaining external bytes.");
       await this.markFinalized();
       await rm(path.join(this.lock, "journal.json"));
       await this.checkpoint?.("finalized", this.root);
     } catch (error) {
       const operation = sessionLeases.get(this)?.operation;
-      if (operation) operation.recovering = true; // Cancellation never bypasses real owner/path/integrity validation.
-      try { await this.recover(true); } catch (recoveryError) { throw new Error("Copi transaction could not safely recover an external change; retained private journal, no external bytes were overwritten.", { cause: new AggregateError([error, recoveryError]) }); }
+      if (operation) operation.recovering = true;
+      try { await this.recover(true); } catch (recoveryError) { throw new Error("Copi sources transaction could not safely recover an external change; retained private journal and source bytes.", { cause: new AggregateError([error, recoveryError]) }); }
       throw error;
-    }
-  }
-  private async assertOldSnapshots(operations: readonly JournalOperation[]): Promise<void> {
-    for (const [index, operation] of operations.entries()) {
-      if (await tree(path.join(this.lock, `old-${index}`)) !== operation.oldTree) throw new Error("Original saved bytes changed in a moved snapshot; retained external bytes instead of deleting them.");
     }
   }
   private async markFinalized(): Promise<void> {
@@ -553,6 +637,143 @@ export class StorageSession {
     if (value.version !== 1 || value.root !== this.root || value.token !== this.token || value.catalog !== catalog || value.tree !== revision.tree) throw new Error("Finalized transaction state was changed externally; refusing cleanup or rollback.");
     return true;
   }
+  private async recoverSources(journal: SourcesStorageJournal, rollback: boolean): Promise<void> {
+    const allowedEntries = new Set(["owner.json", "journal.json", "journal.digest", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "finalized.json", "finalized.digest"]);
+    const lockEntries = await readdir(this.lock);
+    if (lockEntries.some((entry) => !allowedEntries.has(entry) && !/^next-\d+$/.test(entry) && !/^old-\d+$/.test(entry) && !/^displaced-\d+$/.test(entry))) {
+      throw new Error("Unknown files in v2 sources transaction lock; inspect before recovery.");
+    }
+    const rawNext = await checkedFile(path.join(this.lock, "next-catalog"));
+    if (!rawNext || hash(rawNext) !== journal.newCatalog) throw new Error("V2 journal next catalog is missing or altered.");
+    const nextStored = parseStoredCatalog(JSON.parse(rawNext.toString("utf8")) as unknown);
+    assertModernCatalog(nextStored);
+    const rawOld = journal.oldCatalog === null ? undefined : await checkedFile(path.join(this.lock, "old-catalog"));
+    if (journal.oldCatalog !== null && (!rawOld || hash(rawOld) !== journal.oldCatalog)) throw new Error("V2 journal old catalog is missing or altered.");
+    if (journal.oldCatalog === null && await statMaybe(path.join(this.lock, "old-catalog"))) throw new Error("Unexpected old catalog for an initially absent v2 catalog.");
+    const previousStored = rawOld ? parseStoredCatalog(JSON.parse(rawOld.toString("utf8")) as unknown) : null;
+    if (previousStored && previousStored.version !== 2) throw new Error("V2 source recovery cannot use a legacy v1 catalog.");
+    const previous = previousStored?.version === 2 ? previousStored : null;
+    validateSourcesJournalTargets(journal, previous, nextStored);
+    validateSourcesCatalogTransition(previous, nextStored, journal.operations);
+    if (journal.operations.some((operation) => operation.kind !== "file" || operation.oldTree === null)) throw new Error("This v2 recovery slice only accepts existing registered file replacements.");
+
+    const rollbackMarker = await checkedFile(path.join(this.lock, "rollback.json"));
+    if (rollbackMarker) {
+      if (rollbackMarker.toString("utf8") !== this.token) throw new Error("Invalid rollback recovery marker; refusing v2 recovery.");
+      rollback = true;
+    }
+    const currentCatalog = await checkedFile(path.join(this.root, "catalog.json"));
+    const currentHash = currentCatalog ? hash(currentCatalog) : null;
+    const heldPath = path.join(this.lock, "held-catalog");
+    const held = await checkedFile(heldPath);
+    const heldHash = held ? hash(held) : null;
+    if (held && heldHash !== journal.oldCatalog) throw new Error("Original v2 catalog changed in its held inode; refusing recovery.");
+    const catalogInTransit = currentHash === null && journal.oldCatalog !== null && heldHash === journal.oldCatalog;
+    if (currentHash !== journal.oldCatalog && currentHash !== journal.newCatalog && !catalogInTransit) throw new Error("V2 catalog changed externally; refusing recovery.");
+    const committed = currentHash === journal.newCatalog;
+    if (committed && journal.oldCatalog !== null && heldHash !== journal.oldCatalog) throw new Error("Original v2 held catalog is missing; refusing recovery.");
+    const displacedCatalog = await checkedFile(path.join(this.lock, "displaced-catalog"));
+    if (displacedCatalog && hash(displacedCatalog) !== journal.newCatalog) throw new Error("Displaced v2 catalog was changed externally.");
+    if (committed && (hash(currentCatalog!) !== journal.newCatalog || !rawNext.equals(currentCatalog!))) throw new Error("Current v2 catalog does not match its staged next catalog.");
+
+    const targets = new Set(journal.operations.map((operation) => operation.target.slice("sources/".length)));
+    const sourcesRoot = path.join(this.root, "sources");
+    const stableNow = await tree(sourcesRoot, undefined, true, targets);
+    if (stableNow === null) throw new Error("V2 sources root disappeared during recovery.");
+    const stableMatches = stableNow === journal.stableSourcesTree;
+    const states: Array<{ operation: SourcesOperation; current: string | null; backup: string | null; stage: string | null; displaced: string | null; target: string }> = [];
+    for (const [index, operation] of journal.operations.entries()) {
+      const target = path.join(this.root, ...operation.target.split("/"));
+      await checkedSourceFileTarget(this.root, operation.target, true);
+      const current = await sourceFileTreeIfPresent(target);
+      const backup = await sourceFileTreeIfPresent(path.join(this.lock, `old-${index}`));
+      const stage = await sourceFileTreeIfPresent(path.join(this.lock, `next-${index}`));
+      const displaced = await sourceFileTreeIfPresent(path.join(this.lock, `displaced-${index}`));
+      if (current !== operation.oldTree && current !== operation.newTree && !(current === null && backup === operation.oldTree && (stage === operation.newTree || displaced === operation.newTree))) throw new Error("V2 registered sources bytes or inode changed externally; refusing recovery.");
+      if (displaced !== null && displaced !== operation.newTree) throw new Error("V2 displaced sources inode was changed externally.");
+      if (backup !== null && backup !== operation.oldTree) throw new Error("V2 original sources inode is missing or altered.");
+      if (stage !== null && stage !== operation.newTree) throw new Error("V2 private stage is altered or unsafe.");
+      if (Number(current === operation.oldTree) + Number(backup === operation.oldTree) !== 1) throw new Error("V2 recovery does not have exactly one checked original sources inode.");
+      if (Number(current === operation.newTree) + Number(stage === operation.newTree) + Number(displaced === operation.newTree) !== 1) throw new Error("V2 recovery does not have exactly one checked replacement inode.");
+      if (committed && !rollback && current !== operation.newTree) throw new Error("Committed v2 sources file is missing or altered.");
+      if ((!committed || rollback) && current !== operation.oldTree && backup !== operation.oldTree) throw new Error("V2 rollback bytes are missing.");
+      const nextItem = nextStored.items.find((item) => item.id === operation.itemId)!;
+      const nextFile = nextItem.files[0]!;
+      const newPath = current === operation.newTree ? target : stage === operation.newTree ? path.join(this.lock, `next-${index}`) : path.join(this.lock, `displaced-${index}`);
+      if (hash(await readFile(newPath)) !== nextFile.sha256) throw new Error("V2 replacement bytes do not match the new catalog descriptor.");
+      states.push({ operation, current, backup, stage, displaced, target });
+    }
+
+    if (await this.verifyFinalized()) {
+      if (!committed || !stableMatches || states.some((state) => state.current !== state.operation.newTree)) throw new Error("Finalized v2 transaction no longer matches its checked source tree.");
+      await rm(path.join(this.lock, "journal.json"));
+      return;
+    }
+    if (committed && !rollback) {
+      if (!stableMatches) throw new Error("Unregistered or adjacent sources changed; refusing to finalize v2 commit.");
+      await this.markFinalized();
+      await rm(path.join(this.lock, "journal.json"));
+      return;
+    }
+
+    if (journal.oldCatalog === null) throw new Error("V2 file replacement rollback requires its original catalog.");
+    if (!rollbackMarker) { await writePrivate(path.join(this.lock, "rollback.json"), this.token); await syncDirectory(this.lock); }
+    await this.checkpoint?.("rollback-started", this.root);
+    for (const [index, state] of states.entries()) {
+      const { operation, target } = state;
+      await this.assertLease(false);
+      const current = await sourceFileTreeIfPresent(target);
+      if (current === operation.oldTree) continue;
+      if (current !== null) {
+        const displacedPath = path.join(this.lock, `displaced-${index}`);
+        if (current !== operation.newTree || await statMaybe(displacedPath)) throw new Error("V2 live sources target changed during rollback; preserving the inode.");
+        await rename(target, displacedPath);
+        if (await sourceFileTreeIfPresent(displacedPath) !== operation.newTree) throw new Error("V2 replacement inode changed while being displaced; preserving it.");
+        await this.checkpoint?.("rollback-displaced", this.root);
+      }
+      await this.assertLease(false);
+      if (await statMaybe(target)) throw new Error("An external file appeared at the v2 sources target during rollback.");
+      const original = path.join(this.lock, `old-${index}`);
+      if (await sourceFileTreeIfPresent(original) !== operation.oldTree) throw new Error("V2 original sources inode changed before restoration; preserving it.");
+      await rename(original, target);
+      await syncDirectory(path.dirname(target));
+      await this.checkpoint?.("rollback-restored", this.root);
+      await this.assertLease(false);
+    }
+    if (committed || catalogInTransit) {
+      const catalogPath = path.join(this.root, "catalog.json");
+      if (committed) {
+        const displacedPath = path.join(this.lock, "displaced-catalog");
+        if (await statMaybe(displacedPath)) throw new Error("Unexpected displaced catalog during v2 rollback.");
+        await rename(catalogPath, displacedPath);
+        if ((await checkedFile(displacedPath) && hash((await checkedFile(displacedPath))!)) !== journal.newCatalog) throw new Error("V2 displaced catalog changed during rollback; preserving it.");
+        await this.checkpoint?.("rollback-catalog-held", this.root);
+      }
+      if (rawOld) {
+        await this.assertLease(false);
+        const checkedHeld = await checkedFile(heldPath);
+        if (!checkedHeld || hash(checkedHeld) !== journal.oldCatalog) throw new Error("V2 original held catalog is missing or altered.");
+        if (await statMaybe(catalogPath)) throw new Error("An external catalog appeared during v2 rollback.");
+        await link(heldPath, catalogPath);
+      }
+    }
+    for (const [index, operation] of journal.operations.entries()) {
+      const current = await checkedSourceFileTarget(this.root, operation.target);
+      if (!current || await sourceFileTreeIfPresent(current) !== operation.oldTree) throw new Error("V2 rollback did not restore the checked original inode.");
+      for (const [prefix, expectedTree] of [["next", operation.newTree], ["displaced", operation.newTree], ["old", operation.oldTree]] as const) {
+        const leftover = await sourceFileTreeIfPresent(path.join(this.lock, `${prefix}-${index}`));
+        if (leftover !== null && leftover !== expectedTree) throw new Error("V2 retained source stage or backup changed during recovery.");
+      }
+    }
+    if (stableNow !== await tree(sourcesRoot, undefined, true, targets)) throw new Error("Adjacent or unregistered sources changed during v2 rollback; retaining the journal.");
+    if (!stableMatches) throw new Error("Adjacent or unregistered sources changed during v2 transaction; checked targets rolled back, journal retained.");
+    const restoredCatalog = await checkedFile(path.join(this.root, "catalog.json"));
+    if (!restoredCatalog || hash(restoredCatalog) !== journal.oldCatalog) throw new Error("V2 rollback failed to restore the exact original catalog.");
+    await syncDirectory(this.root);
+    await this.markFinalized();
+    await rm(path.join(this.lock, "journal.json"));
+    await this.checkpoint?.("rollback-finalized", this.root);
+  }
   async recover(rollback: boolean): Promise<void> {
     await this.assertLease();
     const raw = await checkedFile(path.join(this.lock, "journal.json"));
@@ -564,8 +785,9 @@ export class StorageSession {
     }
     const digest = await checkedFile(path.join(this.lock, "journal.digest"));
     if (!digest || digest.toString("utf8") !== hash(raw)) throw new Error("Transaction journal is missing integrity information or was altered; refusing recovery.");
-    const journal = JSON.parse(raw.toString("utf8")) as Journal;
-    if (journal.version !== 1 || journal.root !== this.root || journal.token !== this.token || !Array.isArray(journal.operations) || journal.operations.some((operation) => !itemPattern.test(operation.itemId) || typeof operation.newTree !== "string" || (operation.oldTree !== null && typeof operation.oldTree !== "string")) || new Set(journal.operations.map((operation) => operation.itemId)).size !== journal.operations.length || typeof journal.newCatalog !== "string" || (journal.oldCatalog !== null && typeof journal.oldCatalog !== "string")) throw new Error("Invalid copi transaction recovery journal; refusing recovery.");
+    const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
+    if (parsed.version === 2) { await this.recoverSources(parsed, rollback); return; }
+    const journal = parsed;
     if (await this.verifyFinalized()) { await rm(path.join(this.lock, "journal.json")); return; }
     const rollbackMarker = await checkedFile(path.join(this.lock, "rollback.json"));
     if (rollbackMarker) {

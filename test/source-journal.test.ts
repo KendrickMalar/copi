@@ -38,6 +38,7 @@ function sourcesJournal(): SourcesStorageJournal {
     token,
     oldCatalog: digest,
     newCatalog: otherDigest,
+    stableSourcesTree: digest,
     operations: [
       { itemId: idOne, target: "sources/instructions.md", kind: "file", oldTree: digest, newTree: otherDigest },
       { itemId: idTwo, target: "sources/skill", kind: "tree", oldTree: null, newTree: digest },
@@ -121,6 +122,7 @@ test("rejects malformed SHA-256 catalog and tree commitments for both journal ve
     { ...v1, operations: [{ ...v1.operations[0]!, oldTree: "" }] },
     { ...v2, newCatalog: "f".repeat(65) },
     { ...v2, oldCatalog: "G".repeat(64) },
+    { ...v2, stableSourcesTree: "not-a-digest" },
     { ...v2, operations: [{ ...v2.operations[0]!, newTree: "g".repeat(64) }, v2.operations[1]!] },
     { ...v2, operations: [{ ...v2.operations[0]!, oldTree: "" }, v2.operations[1]!] },
   ];
