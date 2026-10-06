@@ -39,6 +39,9 @@ function sourcesJournal(): SourcesStorageJournal {
     oldCatalog: digest,
     newCatalog: otherDigest,
     stableSourcesTree: digest,
+    stableSourcesTreeNext: digest,
+    nextSourcesTree: otherDigest,
+    ownedDirectories: [],
     operations: [
       { itemId: idOne, target: "sources/instructions.md", kind: "file", oldTree: digest, newTree: otherDigest },
       { itemId: idTwo, target: "sources/skill", kind: "tree", oldTree: null, newTree: digest },
@@ -84,6 +87,34 @@ test("accepts and deep-copies v2 sources targets without aliasing caller objects
   assert.notEqual(parsed, value);
   assert.notEqual(parsed.operations, value.operations);
   for (const index of value.operations.keys()) assert.notEqual(parsed.operations[index], value.operations[index]);
+});
+
+test("accepts new-file custody metadata only for its addition operation in a mixed v2 journal", async () => {
+  const { parseStorageJournal, validateSourcesJournalTargets } = await loadCodec();
+  const base = sourcesJournal();
+  const newFileTarget = `sources/${idTwo}/notes.md`;
+  const journal: SourcesStorageJournal = {
+    ...base,
+    operations: [
+      base.operations[0]!,
+      { itemId: idTwo, target: newFileTarget, kind: "file", oldTree: null, newTree: digest },
+    ],
+    ownedDirectories: [{ path: `sources/${idTwo}`, stage: "next-1", dev: 7, ino: 9 }],
+  };
+  const parsed = parseStorageJournal(journal, expected);
+  assert.deepEqual(parsed, journal);
+  assert.equal(parsed.operations[0]!.oldTree, digest);
+  assert.equal(parsed.operations[1]!.oldTree, null);
+
+  const previous = catalog([savedItem(idOne, { kind: "file", path: "sources/instructions.md" })]);
+  const next = catalog([...previous.items, savedItem(idTwo, { kind: "file", path: newFileTarget })]);
+  assert.doesNotThrow(() => validateSourcesJournalTargets(parsed, previous, next));
+
+  const custodyAssignedToReplacement = {
+    ...journal,
+    ownedDirectories: [{ path: `sources/${idOne}`, stage: "next-0", dev: 7, ino: 9 }],
+  };
+  assert.throws(() => parseStorageJournal(custodyAssignedToReplacement, expected));
 });
 
 test("rejects unknown versions, non-object envelopes, bad root/token, and malformed operation arrays", async () => {

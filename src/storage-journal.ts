@@ -155,7 +155,7 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
   assertUniqueItemIds(operations.map((operation) => operation.itemId));
   assertNoTargetOverlap(operations.map((operation) => operation.target));
   const hasNewTargets = operations.some((operation) => operation.oldTree === null);
-  if (hasAdditionMetadata !== hasNewTargets || (hasNewTargets && operations.some((operation) => operation.oldTree !== null))) {
+  if (hasAdditionMetadata !== hasNewTargets) {
     throw new Error("V2 new-target journal metadata does not match its operations.");
   }
   if (!hasAdditionMetadata) {
@@ -202,7 +202,7 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
     throw new Error("Absent v2 sources root has no recorded private creation stage.");
   }
   for (const [index, operation] of operations.entries()) {
-    if (operation.kind !== "file") continue;
+    if (operation.kind !== "file" || operation.oldTree !== null) continue;
     const parent = ownedDirectories.find((directory) => directory.path === `sources/${operation.itemId}`);
     const expectedStage = value.stableSourcesTree === "absent" ? "next-sources" : `next-${index}`;
     if (!parent || parent.stage !== expectedStage) throw new Error("New file operation is missing its exact private parent-directory custody record.");
