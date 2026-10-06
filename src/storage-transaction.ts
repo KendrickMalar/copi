@@ -659,7 +659,7 @@ async function checkedSourcesOperationTarget(root: string, operation: SourcesOpe
   return target;
 }
 
-interface StoredTreeFile { path: string; sha256: string }
+interface StoredTreeFile { path: string; mode: number; sha256: string }
 async function strictTreeFiles(root: string): Promise<StoredTreeFile[]> {
   await assertNoExcludedTreeNodes(root);
   const files: StoredTreeFile[] = [];
@@ -680,7 +680,7 @@ async function strictTreeFiles(root: string): Promise<StoredTreeFile[]> {
             before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || before.mode !== after.mode) {
           throw new Error("Sources tree file changed while it was being inspected.");
         }
-        files.push({ path: relativePath, sha256: hash(bytes) });
+        files.push({ path: relativePath, mode: after.mode & 0o777, sha256: hash(bytes) });
       } else throw new Error("Sources tree contains an unsupported special file.");
     }
     const afterDirectory = await lstat(directory);
@@ -693,10 +693,13 @@ async function strictTreeFiles(root: string): Promise<StoredTreeFile[]> {
   return files.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-async function assertTreeMatchesDescriptors(root: string, descriptors: SavedItem["files"]): Promise<void> {
+async function assertTreeMatchesDescriptors(root: string, descriptors: SavedItem["files"], verifyModes = false): Promise<void> {
   const actual = await strictTreeFiles(root);
-  const expected = descriptors.map(({ path: filePath, sha256 }) => ({ path: filePath, sha256 })).sort((left, right) => left.path.localeCompare(right.path));
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error("Staged sources tree files do not match the next catalog descriptors.");
+  const expected = descriptors.map(({ path: filePath, mode, sha256 }) => verifyModes
+    ? { path: filePath, mode, sha256 }
+    : { path: filePath, sha256 }).sort((left, right) => left.path.localeCompare(right.path));
+  const observed = verifyModes ? actual : actual.map(({ path: filePath, sha256 }) => ({ path: filePath, sha256 }));
+  if (JSON.stringify(observed) !== JSON.stringify(expected)) throw new Error("Staged sources tree files do not match the next catalog descriptors.");
 }
 
 interface TreeCleanupNode { path: string; kind: "file" | "directory"; identity: DirectoryIdentity; mode: number; commitment?: string }
@@ -1635,8 +1638,15 @@ export class StorageSession {
       await this.assertLease(false);
       await this.checkpoint?.("stage-sync", this.root);
       await this.assertLease(false);
-      const allDescriptors = additions.flatMap((item) => item.files.map((file) => ({ path: `${item.id}/${file.path}`, sha256: file.sha256 })));
-      await assertTreeMatchesDescriptors(nextSourcesStage, allDescriptors);
+      const expectedHashes = new Map<string, string>(additions.flatMap((item) => item.files.map((file) => [`${item.id}/${file.path}`, file.sha256] as const)));
+      // Private stored modes differ from the catalog's original source/apply modes; capture the staged snapshot itself.
+      const currentSnapshotFiles = await strictTreeFiles(nextSourcesStage);
+      const allDescriptors = currentSnapshotFiles.map((file) => {
+        if (expectedHashes.get(file.path) !== file.sha256) throw new Error("Staged sources files do not match the next catalog checksums.");
+        return { path: file.path, mode: file.mode, sha256: file.sha256 };
+      });
+      if (allDescriptors.length !== expectedHashes.size) throw new Error("Staged sources tree does not match the next catalog file set.");
+      await assertTreeMatchesDescriptors(nextSourcesStage, allDescriptors, true);
       for (const [index, operation] of operations.entries()) {
         const item = additions.find((entry) => entry.id === operation.itemId)!;
         const stageTarget = path.join(nextSourcesStage, ...sourcesRelativeTarget(operation).split("/"));
