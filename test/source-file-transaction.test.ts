@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -52,6 +52,14 @@ async function fixture(t: test.TestContext) {
 }
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+async function atomicReplace(target: string, bytes: Buffer): Promise<{ dev: number; ino: number }> {
+  const temporary = `${target}.editor-${randomUUID()}`;
+  await writeFile(temporary, bytes, { mode: 0o600 });
+  await rename(temporary, target);
+  const stat = await lstat(target);
+  return { dev: stat.dev, ino: stat.ino };
+}
 
 async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
   const kernel = new StorageTransactions(checkpoint === undefined ? {} : { checkpoint });
@@ -137,6 +145,35 @@ test("v2 rollback restores the original file inode and leaves adjacent sources u
   assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "sources"]);
 });
 
+test("file transactions can commit twice after a direct edit and leave no lock residue", async (t) => {
+  const box = await fixture(t);
+  await commit(box);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+  const manual = Buffer.from("directly edited after first commit\n");
+  await writeFile(box.coderPath, manual);
+  const reviewed = Buffer.from("second reviewed version\n");
+  box.next.items[0]!.files[0]!.sha256 = digest(reviewed);
+  box.replacements[0]!.files[0]!.bytes = reviewed;
+  await commit(box);
+  assert.deepEqual(await readFile(box.coderPath), reviewed);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
+test("SIGKILL during source-file rollback recovery can be recovered again", async (t) => {
+  const box = await fixture(t);
+  const moduleUrl = new URL("../src/storage-transaction.ts", import.meta.url).href;
+  const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`).toString("base64");
+  const code = `import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
+const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point==='before-catalog')throw new Error('start rollback');if(point==='rollback-restored'){console.log('ROLLBACK_PAUSED');setInterval(()=>{},1000);await new Promise(()=>{});}}});
+await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]));`;
+  const writer = spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", code], { env: process.env });
+  await stopAt(writer, "ROLLBACK_PAUSED");
+  await recover(box);
+  assert.equal(await readFile(box.coderPath, "utf8"), "old coder\n");
+  assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.catalog);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
 test("v2 journal recovery rolls an interrupted file swap back without changing neighbors", async (t) => {
   const box = await crashedFixture(t, "new-renamed");
   await recover(box);
@@ -169,6 +206,31 @@ test("v2 commit keeps direct pre-capture edits as the old source revision and in
   assert.equal(await readFile(box.coderPath, "utf8"), "approved after manual edit\n");
 });
 
+test("v2 commit rejects stale same-inode and atomic edits made after capture", async (t) => {
+  for (const edit of ["same-inode", "atomic-replace"] as const) {
+    await t.test(edit, async (st) => {
+      const box = await fixture(st);
+      const external = Buffer.from(`external after capture ${edit}\n`);
+      let externalIdentity: { dev: number; ino: number } | undefined;
+      const kernel = new StorageTransactions();
+      await kernel.run(box.libraryDir, false, async (session) => {
+        assert.ok(session);
+        const revision = await session.capture();
+        if (edit === "same-inode") await writeFile(box.coderPath, external);
+        else externalIdentity = await atomicReplace(box.coderPath, external);
+        await assert.rejects(session.commit(revision, Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements), /changed|revision/i);
+      });
+      assert.deepEqual(await readFile(box.coderPath), external);
+      if (externalIdentity) {
+        const stat = await lstat(box.coderPath);
+        assert.equal(`${stat.dev}:${stat.ino}`, `${externalIdentity.dev}:${externalIdentity.ino}`);
+      }
+      assert.deepEqual(await readFile(box.catalogPath), Buffer.from(`${JSON.stringify(box.catalog, null, 2)}\n`));
+      await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+    });
+  }
+});
+
 test("v2 commit rejects and preserves same-inode external edits at before-swap, old-renamed, and before-catalog", async (t) => {
   for (const checkpoint of ["before-swap", "old-renamed", "before-catalog"] as const) {
     await t.test(checkpoint, async (st) => {
@@ -186,6 +248,79 @@ test("v2 commit rejects and preserves same-inode external edits at before-swap, 
       const preserved = await Promise.all(possible.map((file) => readFile(file, "utf8").catch(() => "")));
       assert.ok(preserved.includes(external), `external same-inode bytes were lost at ${checkpoint}`);
       assert.equal(await readFile(box.testerPath, "utf8"), "neighbor tester\n");
+    });
+  }
+});
+
+test("v2 commit preserves atomic editor replacements at each live file swap boundary", async (t) => {
+  for (const checkpoint of ["before-swap", "old-renamed", "before-catalog"] as const) {
+    await t.test(checkpoint, async (st) => {
+      const box = await fixture(st);
+      const external = Buffer.from(`atomic external ${checkpoint}\n`);
+      const original = await lstat(box.coderPath);
+      let externalIdentity: { dev: number; ino: number } | undefined;
+      await assert.rejects(commit(box, async (point) => {
+        if (point !== checkpoint) return;
+        if (checkpoint === "old-renamed") {
+          // An editor saving by rename creates a new live path while the prior inode is held.
+          externalIdentity = await atomicReplace(box.coderPath, external);
+        } else externalIdentity = await atomicReplace(box.coderPath, external);
+        throw new Error(`atomic editor save at ${checkpoint}`);
+      }), /atomic editor save|changed|external|recover/i);
+      const current = await lstat(box.coderPath);
+      assert.equal(`${current.dev}:${current.ino}`, `${externalIdentity!.dev}:${externalIdentity!.ino}`);
+      assert.deepEqual(await readFile(box.coderPath), external);
+      if (checkpoint !== "before-swap") {
+        const held = await lstat(path.join(box.libraryDir, ".copi-transaction", "old-0"));
+        assert.equal(`${held.dev}:${held.ino}`, `${original.dev}:${original.ino}`);
+      }
+      assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction", "journal.json")));
+      assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.catalog);
+    });
+  }
+});
+
+test("v2 commit preserves a normal edit made at finalized and retains its journal", async (t) => {
+  for (const edit of ["same-inode", "atomic-replace"] as const) {
+    await t.test(edit, async (st) => {
+      const box = await fixture(st);
+      const external = Buffer.from(`external finalized ${edit}\n`);
+      let externalIdentity: { dev: number; ino: number } | undefined;
+      await assert.rejects(commit(box, async (point) => {
+        if (point !== "finalized") return;
+        if (edit === "same-inode") await writeFile(box.coderPath, external);
+        else externalIdentity = await atomicReplace(box.coderPath, external);
+      }), /changed|finalized|external|cleanup|recovery/i);
+      assert.deepEqual(await readFile(box.coderPath), external);
+      if (externalIdentity) {
+        const stat = await lstat(box.coderPath);
+        assert.equal(`${stat.dev}:${stat.ino}`, `${externalIdentity.dev}:${externalIdentity.ino}`);
+      }
+      assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.next);
+      assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction", "journal.json")));
+    });
+  }
+});
+
+test("finalized cleanup preserves direct and atomic edits to the held original inode", async (t) => {
+  for (const edit of ["same-inode", "atomic-replace"] as const) {
+    await t.test(edit, async (st) => {
+      const box = await fixture(st);
+      const held = path.join(box.libraryDir, ".copi-transaction", "old-0");
+      const original = await lstat(box.coderPath);
+      const external = Buffer.from(`external held artifact ${edit}\n`);
+      let externalIdentity: { dev: number; ino: number } | undefined;
+      await assert.rejects(commit(box, async (point) => {
+        if (point !== "finalized") return;
+        if (edit === "same-inode") await writeFile(held, external);
+        else externalIdentity = await atomicReplace(held, external);
+      }), /changed|cleanup|external|recovery/i);
+      const retained = await lstat(held);
+      if (externalIdentity) assert.equal(`${retained.dev}:${retained.ino}`, `${externalIdentity.dev}:${externalIdentity.ino}`);
+      else assert.equal(`${retained.dev}:${retained.ino}`, `${original.dev}:${original.ino}`);
+      assert.deepEqual(await readFile(held), external);
+      assert.equal(await readFile(box.coderPath, "utf8"), "edited coder\n");
+      assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction", "journal.json")));
     });
   }
 });
@@ -277,7 +412,7 @@ test("normal finalized cleanup refuses and preserves unknown lock artifacts", as
 
   await assert.rejects(commit(box, async (point, root) => {
     if (point === "finalized") await writeFile(path.join(root, ".copi-transaction", "next-99"), orphanBytes, { mode: 0o600 });
-  }), /unknown|artifact|cleanup/i);
+  }), /unknown|artifact|cleanup|recover/i);
 
   assert.deepEqual(await readFile(orphanPath), orphanBytes);
   assert.equal(await readFile(box.coderPath, "utf8"), "edited coder\n");

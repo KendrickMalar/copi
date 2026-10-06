@@ -168,6 +168,81 @@ test("registered tree replacement stages fixed included files and swaps only tha
   assert.deepEqual((await readdir(box.sources)).sort(), [skillId, "neighbor", "unregistered"]);
 });
 
+test("tree replacement refuses to delete an unregistered ordinary child that predates capture", async (t) => {
+  const box = await fixture(t);
+  const unreviewedPath = path.join(box.skillRoot, "notes.md");
+  const unreviewed = Buffer.from("ordinary unregistered child\\n");
+  await writeFile(unreviewedPath, unreviewed, { mode: 0o600 });
+  await assert.rejects(commit(box), /unreviewed|unregistered|ordinary child/i);
+  assert.deepEqual(await readFile(unreviewedPath), unreviewed);
+  assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), box.initialSkill);
+  assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.catalog);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
+test("an ordinary tree child is replaced only when its bytes are included in the reviewed content", async (t) => {
+  const box = await fixture(t);
+  const reviewedPath = path.join(box.skillRoot, "notes.md");
+  const reviewedBytes = Buffer.from("reviewed ordinary child\\n");
+  await writeFile(reviewedPath, "unreviewed current version\\n", { mode: 0o600 });
+  box.next.items[0]!.files.push({ path: "notes.md", mode: 0o600, sha256: digest(reviewedBytes) });
+  box.replacements[0]!.files.push({ path: "notes.md", mode: 0o600, bytes: reviewedBytes });
+  await commit(box);
+  assert.deepEqual(await readFile(reviewedPath), reviewedBytes);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
+test("tree edits after capture are rejected before any transaction is written", async (t) => {
+  const box = await fixture(t);
+  const kernel = new StorageTransactions();
+  await kernel.run(box.libraryDir, false, async (session) => {
+    assert.ok(session);
+    const revision = await session.capture();
+    await writeFile(path.join(box.skillRoot, "after-capture.md"), "external after capture\\n", { mode: 0o600 });
+    await assert.rejects(session.commit(revision, Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements), /changed|unreviewed|tree/i);
+  });
+  assert.equal(await readFile(path.join(box.skillRoot, "after-capture.md"), "utf8"), "external after capture\\n");
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
+test("tree child additions and deletions at swap and finalization checkpoints are preserved with the journal", async (t) => {
+  for (const checkpoint of ["before-swap", "old-renamed", "before-catalog", "finalized"] as const) {
+    for (const edit of ["add", "delete"] as const) {
+      await t.test(`${checkpoint}/${edit}`, async (st) => {
+        const box = await fixture(st);
+        const editedRoot = checkpoint === "old-renamed"
+          ? path.join(box.libraryDir, ".copi-transaction", "old-0")
+          : box.skillRoot;
+        const addedPath = path.join(editedRoot, `external-${checkpoint}.md`);
+        const deletedPath = path.join(editedRoot, checkpoint === "before-swap" || checkpoint === "old-renamed" ? "docs/removed.md" : "docs/added.md");
+        const addedBytes = Buffer.from(`ordinary child added at ${checkpoint}\\n`);
+        await assert.rejects(commit(box, async (point) => {
+          if (point !== checkpoint) return;
+          if (edit === "add") await writeFile(addedPath, addedBytes, { mode: 0o600 });
+          else await rm(deletedPath);
+          if (checkpoint !== "finalized") throw new Error(`external tree ${edit} at ${checkpoint}`);
+        }), /changed|external|recover|tree|finalized/i);
+        if (edit === "add") assert.deepEqual(await readFile(addedPath), addedBytes);
+        else await assert.rejects(lstat(deletedPath), { code: "ENOENT" });
+        assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction", "journal.json")));
+        assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), checkpoint === "finalized" ? box.next : box.catalog);
+      });
+    }
+  }
+});
+
+test("tree replacement reoperation after normal success leaves no transaction lock", async (t) => {
+  const box = await fixture(t);
+  await commit(box);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+  const second = Buffer.from("second reviewed skill\\n");
+  box.next.items[0]!.files = [{ path: "SKILL.md", mode: 0o755, sha256: digest(second) }];
+  box.replacements[0]!.files = [{ path: "SKILL.md", mode: 0o755, bytes: second }];
+  await commit(box);
+  assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), second);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
 test("tree replacement cancellation restores the original root and preserves sibling trees", async (t) => {
   const box = await fixture(t);
   const rootBefore = await lstat(box.skillRoot);
@@ -287,7 +362,7 @@ test("finalized tree cleanup preserves unknown files added to the retained old r
   const unknownPath = path.join(box.libraryDir, ".copi-transaction", "old-0", "private-note.md");
   await assert.rejects(commit(box, async (point) => {
     if (point === "finalized") await writeFile(unknownPath, unknown, { mode: 0o600 });
-  }), /changed|cleanup|preserv/i);
+  }), /changed|cleanup|preserv|recover/i);
   assert.deepEqual(await readFile(unknownPath), unknown);
   assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), box.skillBytes);
   assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction")));
@@ -307,7 +382,7 @@ test("finalized cleanup manifest binds private artifact kind to the tree operati
     const bytes = Buffer.from(JSON.stringify(record));
     await writeFile(manifestPath, bytes);
     await writeFile(path.join(lock, "finalized.digest"), digest(bytes));
-  }), /manifest|kind|cleanup/i);
+  }), /manifest|kind|cleanup|recover/i);
   assert.equal(await readFile(path.join(box.libraryDir, ".copi-transaction", "old-0", "SKILL.md"), "utf8"), "# Original skill\n");
   assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction")));
 });

@@ -415,6 +415,21 @@ test("an unknown staged artifact blocks new-target recovery and remains untouche
   assert.deepEqual(await readdir(path.join(box.libraryDir, "sources")).catch(() => []), []);
 });
 
+test("successive file and tree new-target commits clean up fully and remain reusable", async (t) => {
+  const box = await fixture(t, { version: 2, items: [], groups: [] }, true);
+  const file = newFile("FirstNewTarget");
+  await commitNewItem(box.libraryDir, file.item, file.files);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+
+  const tree = newTree("SecondNewTarget");
+  await commitNewItem(box.libraryDir, tree.item, tree.files);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+  const catalog = JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")) as Catalog;
+  assert.deepEqual(catalog.items.map((item) => item.id), [file.item.id, tree.item.id]);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, ...file.item.content.path.split("/"))), file.files[0]!.bytes);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, ...tree.item.content.path.split("/"), "SKILL.md")), tree.files[0]!.bytes);
+});
+
 test("SIGKILL after new-target rename rolls back; SIGKILL after catalog rename finalizes the new item", async (t) => {
   const rollbackBox = await fixture(t);
   const rollbackItem = newFile("CrashRollback");

@@ -333,6 +333,11 @@ async function validateSourcesTransition(root: string, previous: Catalog, next: 
     await assertNoExcludedTreeNodes(targetPath);
     const currentFiles = await readSourceContent(root, oldItem);
     if (!currentFiles.some((file) => file.path === "SKILL.md")) throw new Error("Registered skill tree is missing its required root SKILL.md.");
+    const previouslyRegistered = new Set(oldItem.files.map((file) => file.path));
+    const explicitlyReviewed = new Set(nextItem.files.map((file) => file.path));
+    if (currentFiles.some((file) => !previouslyRegistered.has(file.path) && !explicitlyReviewed.has(file.path))) {
+      throw new Error("Registered sources tree contains an unreviewed ordinary child; explicitly review it before replacement.");
+    }
     operations.push({ itemId: oldItem.id, target, kind: "tree", oldTree: null, newTree: "0".repeat(64) });
   }
   for (const item of additions) {
@@ -1264,8 +1269,8 @@ export class StorageSession {
       if ((heldAtFinish ? hash(heldAtFinish) : null) !== journal.oldCatalog || (heldAtFinishStat && expected.catalogIdentity !== `${heldAtFinishStat.dev}:${heldAtFinishStat.ino}`)) throw new Error("Original held catalog changed during finalization; retaining external bytes.");
       const cleanup = await createFinalizedCleanup(this.lock, journal, journalBytes);
       await this.markFinalized(cleanup);
-      await rm(path.join(this.lock, "journal.json"));
       await this.checkpoint?.("finalized", this.root);
+      await this.recover(false);
     } catch (error) {
       const operation = sessionLeases.get(this)?.operation;
       if (operation) operation.recovering = true;
@@ -1450,8 +1455,8 @@ export class StorageSession {
       if ((heldAtFinish ? hash(heldAtFinish) : null) !== journal.oldCatalog || (heldAtFinishStat && expected.catalogIdentity !== `${heldAtFinishStat.dev}:${heldAtFinishStat.ino}`)) throw new Error("Original held catalog changed during finalization; retaining external bytes.");
       const cleanup = await createFinalizedCleanup(this.lock, journal, journalBytes);
       await this.markFinalized(cleanup);
-      await rm(path.join(this.lock, "journal.json"));
       await this.checkpoint?.("finalized", this.root);
+      await this.recover(false);
     } catch (error) {
       const operation = sessionLeases.get(this)?.operation;
       if (operation) operation.recovering = true;
