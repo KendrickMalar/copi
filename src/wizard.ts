@@ -1,7 +1,7 @@
 import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, text as clackText } from "@clack/prompts";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import { importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
+import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
@@ -484,6 +484,7 @@ export async function runGroupManager(libraryDir: string): Promise<void> {
       return;
     }
     if (action === "done") break;
+    assertModernCatalog(catalog);
     if (action === "create") {
       const name = await askForGroupName("New group name");
       if (name === undefined) {
@@ -536,6 +537,7 @@ export async function runGroupManager(libraryDir: string): Promise<void> {
     outro("Group changes were not saved.");
     return;
   }
+  assertModernCatalog(catalog);
   await saveCatalog(libraryDir, catalog);
   outro("Group changes saved.");
 }
