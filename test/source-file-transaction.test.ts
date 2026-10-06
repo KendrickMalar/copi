@@ -61,11 +61,15 @@ async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root
   });
 }
 
-function child(box: Fixture, checkpoint: string): ChildProcessWithoutNullStreams {
+function child(box: Fixture, checkpoint: string, orphanName?: string): ChildProcessWithoutNullStreams {
   const moduleUrl = new URL("../src/storage-transaction.ts", import.meta.url).href;
   const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`).toString("base64");
-  const code = `import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
-const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}) { console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});
+  const orphanBytes = Buffer.from("unknown cleanup bytes\\n").toString("base64");
+  const orphanWrite = orphanName
+    ? `await writeFile(${JSON.stringify(path.join(box.libraryDir, ".copi-transaction", orphanName))},Buffer.from(${JSON.stringify(orphanBytes)},'base64'));`
+    : "";
+  const code = `import {writeFile} from 'node:fs/promises'; import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
+const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}) { ${orphanWrite} console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});
 await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]));`;
   return spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", code], { env: process.env });
 }
@@ -90,9 +94,9 @@ async function stopAt(childProcess: ChildProcessWithoutNullStreams, marker = "PA
   });
 }
 
-async function crashedFixture(t: test.TestContext, checkpoint: string) {
+async function crashedFixture(t: test.TestContext, checkpoint: string, orphanName?: string) {
   const box = await fixture(t);
-  const writer = child(box, checkpoint);
+  const writer = child(box, checkpoint, orphanName);
   await stopAt(writer);
   return box;
 }
@@ -264,6 +268,34 @@ test("v2 recovery refuses unknown lock artifacts and preserves their bytes befor
       });
     }
   }
+});
+
+test("normal finalized cleanup refuses and preserves unknown lock artifacts", async (t) => {
+  const box = await fixture(t);
+  const orphanPath = path.join(box.libraryDir, ".copi-transaction", "next-99");
+  const orphanBytes = Buffer.from("unknown cleanup bytes\\n");
+
+  await assert.rejects(commit(box, async (point, root) => {
+    if (point === "finalized") await writeFile(path.join(root, ".copi-transaction", "next-99"), orphanBytes, { mode: 0o600 });
+  }), /unknown|artifact|cleanup/i);
+
+  assert.deepEqual(await readFile(orphanPath), orphanBytes);
+  assert.equal(await readFile(box.coderPath, "utf8"), "edited coder\n");
+  assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.next);
+  assert.ok((await lstat(path.join(box.libraryDir, ".copi-transaction"))).isDirectory());
+});
+
+test("recovery after a crash with a removed journal preserves unknown finalized artifacts", async (t) => {
+  const box = await crashedFixture(t, "finalized", "next-99");
+  const orphanPath = path.join(box.libraryDir, ".copi-transaction", "next-99");
+  const orphanBytes = Buffer.from("unknown cleanup bytes\\n");
+
+  await assert.rejects(recover(box), /unknown|artifact|cleanup/i);
+
+  assert.deepEqual(await readFile(orphanPath), orphanBytes);
+  assert.equal(await readFile(box.coderPath, "utf8"), "edited coder\n");
+  assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.next);
+  assert.ok((await lstat(path.join(box.libraryDir, ".copi-transaction"))).isDirectory());
 });
 
 test("v1 legacy journal recovery still restores its original snapshot and catalog", async (t) => {

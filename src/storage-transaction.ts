@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -32,12 +32,15 @@ interface InFlightControl { signal: AbortSignal; recovering: boolean }
 interface SessionLease {
   root: string; lock: string; owner: Owner;
   stop: AbortController; pending: Set<Promise<void>>; operation?: InFlightControl;
+  unjournaledArtifacts: Map<string, { identity: DirectoryIdentity; sha256: string }>;
   rootIdentity: DirectoryIdentity; lockIdentity: DirectoryIdentity;
   recoveryClaim?: { path: string; identity: DirectoryIdentity };
 }
 // Only run/recoverDead issue leases. Public constructor calls cannot register themselves.
 const sessionLeases = new WeakMap<StorageSession, SessionLease>();
 type SourcesOperation = SourcesStorageJournal["operations"][number];
+interface FinalizedCleanupArtifact { name: string; kind: "file" | "source-file"; commitment: string }
+interface FinalizedCleanupManifest { version: 1; root: string; token: string; operationCount: number; artifacts: FinalizedCleanupArtifact[] }
 
 export function safeStoragePath(value: string): boolean {
   return typeof value === "string" && value.length > 0 && !value.includes("\\") && !value.includes("\0") && !path.posix.isAbsolute(value) && value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
@@ -247,12 +250,176 @@ async function sourceFileTreeIfPresent(target: string): Promise<string | null> {
   return tree(target, undefined, true);
 }
 
+const finalizedFileArtifacts = new Set(["journal.digest", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json"]);
+function v2LockEntries(journal: SourcesStorageJournal): Set<string> {
+  const entries = new Set(["owner.json", "journal.json", "journal.digest", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "finalized.json", "finalized.digest"]);
+  for (const index of journal.operations.keys()) {
+    entries.add(`next-${index}`);
+    entries.add(`old-${index}`);
+    entries.add(`displaced-${index}`);
+  }
+  return entries;
+}
+function parseFinalizedCleanup(value: unknown, expected: { root: string; token: string }): FinalizedCleanupManifest {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Finalized v2 cleanup manifest is malformed; refusing cleanup.");
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== 5 || !["version", "root", "token", "operationCount", "artifacts"].every((key) => Object.hasOwn(record, key)) ||
+      record.version !== 1 || record.root !== expected.root || record.token !== expected.token ||
+      !Number.isSafeInteger(record.operationCount) || (record.operationCount as number) < 0 || !Array.isArray(record.artifacts)) {
+    throw new Error("Finalized v2 cleanup manifest is malformed or belongs to another session.");
+  }
+  const artifacts: FinalizedCleanupArtifact[] = [];
+  const names = new Set<string>();
+  for (const valueArtifact of record.artifacts) {
+    if (typeof valueArtifact !== "object" || valueArtifact === null || Array.isArray(valueArtifact)) throw new Error("Finalized v2 cleanup artifact is malformed.");
+    const artifact = valueArtifact as Record<string, unknown>;
+    const artifactKeys = Object.keys(artifact);
+    if (artifactKeys.length !== 3 || !["name", "kind", "commitment"].every((key) => Object.hasOwn(artifact, key)) ||
+        typeof artifact.name !== "string" || typeof artifact.commitment !== "string" || !/^[0-9a-f]{64}$/.test(artifact.commitment) || names.has(artifact.name)) {
+      throw new Error("Finalized v2 cleanup artifact is malformed or duplicated.");
+    }
+    const indexMatch = /^(next|old|displaced)-(0|[1-9][0-9]*)$/.exec(artifact.name);
+    const index = indexMatch ? Number(indexMatch[2]) : -1;
+    const expectedKind = finalizedFileArtifacts.has(artifact.name) ? "file" : indexMatch && Number.isSafeInteger(index) && index < (record.operationCount as number) ? "source-file" : undefined;
+    if (!expectedKind || artifact.kind !== expectedKind) throw new Error("Finalized v2 cleanup artifact name is not bound to its operation count.");
+    names.add(artifact.name);
+    artifacts.push({ name: artifact.name, kind: expectedKind, commitment: artifact.commitment });
+  }
+  return { version: 1, root: expected.root, token: expected.token, operationCount: record.operationCount as number, artifacts };
+}
+async function captureStorageRevision(root: string): Promise<StorageRevision> {
+  const catalogPath = path.join(root, "catalog.json");
+  const before = await statMaybe(catalogPath);
+  const catalog = await checkedFile(catalogPath);
+  const after = await statMaybe(catalogPath);
+  const beforeIdentity = before ? `${before.dev}:${before.ino}` : null;
+  const catalogIdentity = after ? `${after.dev}:${after.ino}` : null;
+  if (beforeIdentity !== catalogIdentity) throw new Error("Copi catalog changed while capturing its revision.");
+  const format = catalog === undefined ? "v2" : parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown).version === 1 ? "v1" : "v2";
+  return Object.freeze({
+    root,
+    catalog: catalog?.toString("base64") ?? null,
+    catalogIdentity,
+    format,
+    tree: await tree(path.join(root, format === "v2" ? "sources" : "items"), undefined, format === "v2") ?? "absent",
+  });
+}
+async function readFinalizedMetadata(root: string, lock: string, token: string, revision: StorageRevision): Promise<{ format: "v1" | "v2"; cleanup?: FinalizedCleanupManifest } | undefined> {
+  const raw = await checkedFile(path.join(lock, "finalized.json"));
+  if (!raw) {
+    if (await statMaybe(path.join(lock, "finalized.digest"))) throw new Error("Finalized transaction digest exists without its record; refusing cleanup.");
+    return undefined;
+  }
+  const digest = await checkedFile(path.join(lock, "finalized.digest"));
+  if (!digest || digest.toString("utf8") !== hash(raw)) throw new Error("Finalized transaction information is missing or altered; inspect the private journal.");
+  const value = JSON.parse(raw.toString("utf8")) as Record<string, unknown>;
+  const catalog = revision.catalog === null ? null : hash(Buffer.from(revision.catalog, "base64"));
+  if (value.version !== 1 || value.root !== root || value.token !== token || value.catalog !== catalog || value.tree !== revision.tree) throw new Error("Finalized transaction state was changed externally; refusing cleanup or rollback.");
+  const cleanup = Object.hasOwn(value, "cleanup") ? parseFinalizedCleanup(value.cleanup, { root, token }) : undefined;
+  return { format: revision.format, ...(cleanup ? { cleanup } : {}) };
+}
+async function createFinalizedCleanup(lock: string, journal: SourcesStorageJournal, rawJournal: Buffer): Promise<FinalizedCleanupManifest> {
+  const allowed = v2LockEntries(journal);
+  const entries = await readdir(lock);
+  if (entries.some((entry) => !allowed.has(entry))) throw new Error("Unknown files in v2 sources transaction lock; refusing finalized cleanup.");
+  const storedJournal = await checkedFile(path.join(lock, "journal.json"));
+  const journalDigest = await checkedFile(path.join(lock, "journal.digest"));
+  if (!storedJournal?.equals(rawJournal) || !journalDigest || journalDigest.toString("utf8") !== hash(rawJournal)) throw new Error("V2 journal changed before cleanup custody was recorded.");
+  const artifacts: FinalizedCleanupArtifact[] = [];
+  const present = new Set(entries);
+  for (const name of entries) {
+    if (name === "owner.json" || name === "journal.json" || name === "finalized.json" || name === "finalized.digest") continue;
+    if (name === "journal.digest") {
+      artifacts.push({ name, kind: "file", commitment: hash(journalDigest) });
+      continue;
+    }
+    if (finalizedFileArtifacts.has(name)) {
+      const file = await checkedFile(path.join(lock, name));
+      const expected = name === "next-catalog" ? journal.newCatalog
+        : name === "old-catalog" || name === "held-catalog" ? journal.oldCatalog
+          : name === "displaced-catalog" ? journal.newCatalog
+            : journal.token;
+      if (!file || (name === "rollback.json" ? file.toString("utf8") !== expected : hash(file) !== expected)) throw new Error(`Finalized v2 cleanup artifact ${name} changed.`);
+      artifacts.push({ name, kind: "file", commitment: hash(file) });
+      continue;
+    }
+    const match = /^(next|old|displaced)-(0|[1-9][0-9]*)$/.exec(name);
+    if (!match) throw new Error("Unknown file in v2 sources transaction lock; refusing finalized cleanup.");
+    const index = Number(match[2]);
+    const operation = journal.operations[index];
+    if (!operation || String(index) !== match[2]) throw new Error("Unknown v2 operation index in finalized cleanup.");
+    const expected = match[1] === "old" ? operation.oldTree : operation.newTree;
+    const actual = await sourceFileTreeIfPresent(path.join(lock, name));
+    if (actual === null || actual !== expected) throw new Error(`Finalized v2 cleanup artifact ${name} changed.`);
+    artifacts.push({ name, kind: "source-file", commitment: actual });
+  }
+  if (!present.has("next-catalog") || !present.has("journal.digest") ||
+      (journal.oldCatalog === null ? present.has("old-catalog") : !present.has("old-catalog"))) throw new Error("Required v2 cleanup artifacts are missing.");
+  artifacts.sort((left, right) => left.name.localeCompare(right.name));
+  return { version: 1, root: journal.root, token: journal.token, operationCount: journal.operations.length, artifacts };
+}
+async function cleanupFinalizedSourcesLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
+  const revision = await captureStorageRevision(root);
+  if (revision.format !== "v2") throw new Error("V2 finalized cleanup found a legacy catalog; refusing cleanup.");
+  const metadata = await readFinalizedMetadata(root, lock, token, revision);
+  const manifest = metadata?.cleanup;
+  if (!manifest) throw new Error("V2 finalized cleanup custody information is missing; inspect the transaction lock.");
+  const expected = new Set(["owner.json", "finalized.json", "finalized.digest", ...manifest.artifacts.map((artifact) => artifact.name)]);
+  const entries = await readdir(lock);
+  if (entries.length !== expected.size || entries.some((entry) => !expected.has(entry))) throw new Error("Unknown or missing files in finalized v2 transaction lock; refusing cleanup.");
+  for (const artifact of manifest.artifacts) {
+    const target = path.join(lock, artifact.name);
+    if (artifact.kind === "file") {
+      const bytes = await checkedFile(target);
+      if (!bytes || hash(bytes) !== artifact.commitment) throw new Error(`Finalized v2 cleanup artifact ${artifact.name} changed; preserving it.`);
+    } else if (await sourceFileTreeIfPresent(target) !== artifact.commitment) {
+      throw new Error(`Finalized v2 cleanup artifact ${artifact.name} changed; preserving it.`);
+    }
+  }
+  await assertLeaseOwner(lease);
+  for (const artifact of manifest.artifacts) await unlink(path.join(lock, artifact.name));
+  await unlink(path.join(lock, "finalized.json"));
+  await unlink(path.join(lock, "finalized.digest"));
+  await unlink(path.join(lock, "owner.json"));
+  await rmdir(lock);
+  await syncDirectory(root);
+}
+async function cleanupUnjournaledLock(root: string, lock: string, lease: SessionLease): Promise<void> {
+  const expected = new Set(["owner.json", ...lease.unjournaledArtifacts.keys()]);
+  const entries = await readdir(lock);
+  if (entries.length !== expected.size || entries.some((entry) => !expected.has(entry))) throw new Error("Unknown files in an unjournaled transaction lock; refusing cleanup.");
+  for (const [name, artifact] of lease.unjournaledArtifacts) {
+    const target = path.join(lock, name);
+    const stat = await statMaybe(target);
+    const bytes = await checkedFile(target);
+    if (!stat || !bytes || !sameDirectory({ dev: stat.dev, ino: stat.ino }, artifact.identity) || hash(bytes) !== artifact.sha256) throw new Error(`Unjournaled artifact ${name} changed; preserving it.`);
+  }
+  await assertLeaseOwner(lease);
+  for (const name of lease.unjournaledArtifacts.keys()) await unlink(path.join(lock, name));
+  await unlink(path.join(lock, "owner.json"));
+  await rmdir(lock);
+  await syncDirectory(root);
+}
+async function cleanupTransactionLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
+  await assertLeaseOwner(lease);
+  const revision = await captureStorageRevision(root);
+  const finalized = await readFinalizedMetadata(root, lock, token, revision);
+  if (finalized?.format === "v2") await cleanupFinalizedSourcesLock(root, lock, token, lease);
+  else if (finalized?.format === "v1") { await rm(lock, { recursive: true }); await syncDirectory(root); }
+  else await cleanupUnjournaledLock(root, lock, lease);
+}
+
 async function syncDirectory(target: string): Promise<void> {
   const handle = await open(target, "r");
   try { await handle.sync(); } finally { await handle.close(); }
 }
 async function writePrivate(target: string, bytes: Buffer | string): Promise<void> {
   const handle = await open(target, "wx", 0o600);
+  try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+}
+async function replacePrivate(target: string, bytes: Buffer | string): Promise<void> {
+  const handle = await open(target, "w", 0o600);
   try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
 }
 async function canonicalRoot(libraryDir: string, create: boolean): Promise<string | undefined> {
@@ -308,7 +475,7 @@ function sameDirectory(left: DirectoryIdentity, right: DirectoryIdentity): boole
 }
 async function issueSessionLease(session: StorageSession, root: string, lock: string, owner: Owner, claim?: string): Promise<SessionLease> {
   const lease: SessionLease = {
-    root, lock, owner: { ...owner }, stop: new AbortController(), pending: new Set(),
+    root, lock, owner: { ...owner }, stop: new AbortController(), pending: new Set(), unjournaledArtifacts: new Map(),
     rootIdentity: await directoryIdentity(root), lockIdentity: await directoryIdentity(lock),
     ...(claim ? { recoveryClaim: { path: claim, identity: await directoryIdentity(claim) } } : {}),
   };
@@ -324,6 +491,19 @@ async function assertLeaseOwner(lease: SessionLease): Promise<void> {
   if (lease.recoveryClaim) {
     if (!sameDirectory(await directoryIdentity(lease.recoveryClaim.path), lease.recoveryClaim.identity) || alive(actual)) throw new Error("Copi recovery lease changed or its previous owner is active; refusing recovery.");
   } else if (actual.pid !== process.pid || actual.host !== os.hostname()) throw new Error("Copi session does not belong to this process and host.");
+}
+function rememberUnjournaledArtifact(session: StorageSession, name: string, identity: DirectoryIdentity, bytes: Buffer | string): void {
+  const lease = sessionLeases.get(session);
+  if (!lease) throw new Error("Invalid or expired copi storage session; refusing to track lock artifacts.");
+  lease.unjournaledArtifacts.set(name, { identity, sha256: hash(bytes) });
+}
+async function rememberUnjournaledFile(session: StorageSession, name: string, target: string, bytes: Buffer | string): Promise<void> {
+  const stat = await statMaybe(target);
+  if (!stat || !stat.isFile() || stat.isSymbolicLink()) throw new Error("Unsafe unjournaled transaction artifact; refusing cleanup.");
+  rememberUnjournaledArtifact(session, name, { dev: stat.dev, ino: stat.ino }, bytes);
+}
+function forgetUnjournaledArtifact(session: StorageSession, name: string): void {
+  sessionLeases.get(session)?.unjournaledArtifacts.delete(name);
 }
 async function inFlightCheckpoint(callback: StorageOptions["checkpoint"], control: InFlightControl, point: StorageCheckpoint, root: string): Promise<void> {
   if (control.signal.aborted) {
@@ -387,7 +567,7 @@ export class StorageTransactions {
         // A failed recovery deliberately retains all evidence, and prevents readers seeing mixed state.
         const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
         try { await handle.writeFile(JSON.stringify({ ...owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
-      } else { await rm(lock, { recursive: true }); await syncDirectory(root); }
+      } else { await cleanupTransactionLock(root, lock, owner.token, lease); }
     }
   }
   private async recoverDead(root: string, expected: Owner): Promise<void> {
@@ -404,8 +584,7 @@ export class StorageTransactions {
       try {
         await session.recover(false);
         await assertLeaseOwner(lease);
-        await rm(lock, { recursive: true });
-        await syncDirectory(root);
+        await cleanupTransactionLock(root, lock, current.token, lease);
       } finally { sessionLeases.delete(session); }
     } finally {
       if (await realpath(root) !== root || !sameDirectory(await directoryIdentity(root), rootIdentity) || !sameDirectory(await directoryIdentity(claim), claimIdentity)) throw new Error("Copi recovery claim or root changed; refusing cleanup.");
@@ -491,8 +670,11 @@ export class StorageSession {
       const stage = path.join(this.lock, `next-${index}`);
       await this.assertLease(false);
       const handle = await open(stage, "wx", 0o600);
+      const stageBytes = replacements.find((replacement) => replacement.itemId === operation.itemId)!.files[0]!.bytes;
       try {
-        await handle.writeFile(replacements.find((replacement) => replacement.itemId === operation.itemId)!.files[0]!.bytes);
+        const stageStat = await handle.stat();
+        rememberUnjournaledArtifact(this, `next-${index}`, { dev: stageStat.dev, ino: stageStat.ino }, stageBytes);
+        await handle.writeFile(stageBytes);
         await this.checkpoint?.("stage-write", this.root);
         await this.assertLease(false);
         await this.checkpoint?.("stage-sync", this.root);
@@ -512,6 +694,8 @@ export class StorageSession {
     await this.assertLease(false);
     const catalogHandle = await open(catalogStage, "wx", 0o600);
     try {
+      const catalogStat = await catalogHandle.stat();
+      rememberUnjournaledArtifact(this, "next-catalog", { dev: catalogStat.dev, ino: catalogStat.ino }, catalog);
       await catalogHandle.writeFile(catalog);
       await this.checkpoint?.("stage-write", this.root);
       await this.assertLease(false);
@@ -522,7 +706,12 @@ export class StorageSession {
     const stagedCatalog = await checkedFile(catalogStage);
     if (!stagedCatalog || !stagedCatalog.equals(catalog)) throw new Error("Staged catalog changed before sources swap; refusing commit.");
     await this.assertLease(false);
-    if (expected.catalog !== null) await writePrivate(path.join(this.lock, "old-catalog"), Buffer.from(expected.catalog, "base64"));
+    if (expected.catalog !== null) {
+      const oldCatalogPath = path.join(this.lock, "old-catalog");
+      const oldCatalogBytes = Buffer.from(expected.catalog, "base64");
+      await writePrivate(oldCatalogPath, oldCatalogBytes);
+      await rememberUnjournaledFile(this, "old-catalog", oldCatalogPath, oldCatalogBytes);
+    }
     const journal: SourcesStorageJournal = {
       version: 2,
       root: this.root,
@@ -533,8 +722,11 @@ export class StorageSession {
       operations,
     };
     const journalBytes = Buffer.from(JSON.stringify(journal));
-    await writePrivate(path.join(this.lock, "journal.tmp"), journalBytes);
-    await rename(path.join(this.lock, "journal.tmp"), path.join(this.lock, "journal.json"));
+    const journalTemp = path.join(this.lock, "journal.tmp");
+    await writePrivate(journalTemp, journalBytes);
+    await rememberUnjournaledFile(this, "journal.tmp", journalTemp, journalBytes);
+    await rename(journalTemp, path.join(this.lock, "journal.json"));
+    forgetUnjournaledArtifact(this, "journal.tmp");
     await writePrivate(path.join(this.lock, "journal.digest"), hash(journalBytes));
     await syncDirectory(this.lock);
     try {
@@ -609,7 +801,8 @@ export class StorageSession {
       const heldAtFinish = await checkedFile(heldPath);
       const heldAtFinishStat = await statMaybe(heldPath);
       if ((heldAtFinish ? hash(heldAtFinish) : null) !== journal.oldCatalog || (heldAtFinishStat && expected.catalogIdentity !== `${heldAtFinishStat.dev}:${heldAtFinishStat.ino}`)) throw new Error("Original held catalog changed during finalization; retaining external bytes.");
-      await this.markFinalized();
+      const cleanup = await createFinalizedCleanup(this.lock, journal, journalBytes);
+      await this.markFinalized(cleanup);
       await rm(path.join(this.lock, "journal.json"));
       await this.checkpoint?.("finalized", this.root);
     } catch (error) {
@@ -619,11 +812,36 @@ export class StorageSession {
       throw error;
     }
   }
-  private async markFinalized(): Promise<void> {
+  private async markFinalized(cleanup?: FinalizedCleanupManifest): Promise<void> {
     const revision = await this.capture();
-    const record = JSON.stringify({ version: 1, root: this.root, token: this.token, catalog: revision.catalog === null ? null : hash(Buffer.from(revision.catalog, "base64")), tree: revision.tree });
-    await writePrivate(path.join(this.lock, "finalized.json"), record);
-    await writePrivate(path.join(this.lock, "finalized.digest"), hash(record));
+    const value = {
+      version: 1,
+      root: this.root,
+      token: this.token,
+      catalog: revision.catalog === null ? null : hash(Buffer.from(revision.catalog, "base64")),
+      tree: revision.tree,
+      ...(cleanup ? { cleanup } : {}),
+    };
+    const record = Buffer.from(JSON.stringify(value));
+    const finalizedPath = path.join(this.lock, "finalized.json");
+    const digestPath = path.join(this.lock, "finalized.digest");
+    const existing = await checkedFile(finalizedPath);
+    if (existing) {
+      const existingDigest = await checkedFile(digestPath);
+      if (!existingDigest || existingDigest.toString("utf8") !== hash(existing)) throw new Error("Existing finalized transaction information is altered; refusing replacement.");
+      const oldValue = JSON.parse(existing.toString("utf8")) as Record<string, unknown>;
+      if (oldValue.version !== value.version || oldValue.root !== value.root || oldValue.token !== value.token || oldValue.catalog !== value.catalog || oldValue.tree !== value.tree) throw new Error("Existing finalized transaction state changed; refusing replacement.");
+      if (Object.hasOwn(oldValue, "cleanup")) {
+        if (JSON.stringify(oldValue.cleanup) !== JSON.stringify(cleanup)) throw new Error("Existing finalized cleanup custody record changed.");
+        return;
+      }
+      if (!cleanup) return;
+      await replacePrivate(finalizedPath, record);
+      await replacePrivate(digestPath, hash(record));
+    } else {
+      await writePrivate(finalizedPath, record);
+      await writePrivate(digestPath, hash(record));
+    }
     await syncDirectory(this.lock);
   }
   private async verifyFinalized(): Promise<boolean> {
@@ -637,13 +855,8 @@ export class StorageSession {
     if (value.version !== 1 || value.root !== this.root || value.token !== this.token || value.catalog !== catalog || value.tree !== revision.tree) throw new Error("Finalized transaction state was changed externally; refusing cleanup or rollback.");
     return true;
   }
-  private async recoverSources(journal: SourcesStorageJournal, rollback: boolean): Promise<void> {
-    const allowedEntries = new Set(["owner.json", "journal.json", "journal.digest", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "finalized.json", "finalized.digest"]);
-    for (const index of journal.operations.keys()) {
-      allowedEntries.add(`next-${index}`);
-      allowedEntries.add(`old-${index}`);
-      allowedEntries.add(`displaced-${index}`);
-    }
+  private async recoverSources(journal: SourcesStorageJournal, rollback: boolean, rawJournal: Buffer): Promise<void> {
+    const allowedEntries = v2LockEntries(journal);
     const lockEntries = await readdir(this.lock);
     if (lockEntries.some((entry) => !allowedEntries.has(entry))) {
       throw new Error("Unknown files in v2 sources transaction lock; inspect before recovery.");
@@ -711,12 +924,13 @@ export class StorageSession {
 
     if (await this.verifyFinalized()) {
       if (!committed || !stableMatches || states.some((state) => state.current !== state.operation.newTree)) throw new Error("Finalized v2 transaction no longer matches its checked source tree.");
+      await this.markFinalized(await createFinalizedCleanup(this.lock, journal, rawJournal));
       await rm(path.join(this.lock, "journal.json"));
       return;
     }
     if (committed && !rollback) {
       if (!stableMatches) throw new Error("Unregistered or adjacent sources changed; refusing to finalize v2 commit.");
-      await this.markFinalized();
+      await this.markFinalized(await createFinalizedCleanup(this.lock, journal, rawJournal));
       await rm(path.join(this.lock, "journal.json"));
       return;
     }
@@ -775,7 +989,7 @@ export class StorageSession {
     const restoredCatalog = await checkedFile(path.join(this.root, "catalog.json"));
     if (!restoredCatalog || hash(restoredCatalog) !== journal.oldCatalog) throw new Error("V2 rollback failed to restore the exact original catalog.");
     await syncDirectory(this.root);
-    await this.markFinalized();
+    await this.markFinalized(await createFinalizedCleanup(this.lock, journal, rawJournal));
     await rm(path.join(this.lock, "journal.json"));
     await this.checkpoint?.("rollback-finalized", this.root);
   }
@@ -785,13 +999,13 @@ export class StorageSession {
     if (!raw) {
       if (await this.verifyFinalized()) return;
       const entries = await readdir(this.lock);
-      if (entries.some((entry) => entry !== "owner.json" && entry !== "journal.tmp" && entry !== "next-catalog" && entry !== "old-catalog" && !/^next-\d+$/.test(entry))) throw new Error("Unknown files in dead copi transaction lock; inspect before recovery.");
-      return; // Journal precedes every live mutation; unjournalled stages are disposable.
+      if (entries.some((entry) => entry !== "owner.json")) throw new Error("Unjournaled files in dead copi transaction lock; inspect before recovery.");
+      return; // Without a journal or finalization custody record, retain every staged byte for inspection.
     }
     const digest = await checkedFile(path.join(this.lock, "journal.digest"));
     if (!digest || digest.toString("utf8") !== hash(raw)) throw new Error("Transaction journal is missing integrity information or was altered; refusing recovery.");
     const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
-    if (parsed.version === 2) { await this.recoverSources(parsed, rollback); return; }
+    if (parsed.version === 2) { await this.recoverSources(parsed, rollback, raw); return; }
     const journal = parsed;
     if (await this.verifyFinalized()) { await rm(path.join(this.lock, "journal.json")); return; }
     const rollbackMarker = await checkedFile(path.join(this.lock, "rollback.json"));
