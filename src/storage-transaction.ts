@@ -709,6 +709,14 @@ function parseFinalizedCleanup(value: unknown, expected: { root: string; token: 
   return { version: 1, root: expected.root, token: expected.token, operationCount: record.operationCount as number,
     ...(operationKinds ? { operationKinds } : {}), ...(operationStageKinds ? { operationStageKinds } : {}), artifacts };
 }
+function catalogFormat(catalog: Buffer | undefined): "v1" | "v2" {
+  if (catalog === undefined) return "v2";
+  try {
+    return parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown).version === 1 ? "v1" : "v2";
+  } catch (error) {
+    throw new Error("Invalid copi catalog while capturing storage revision.", { cause: error });
+  }
+}
 async function captureStorageRevision(root: string): Promise<StorageRevision> {
   const catalogPath = path.join(root, "catalog.json");
   const before = await statMaybe(catalogPath);
@@ -717,7 +725,7 @@ async function captureStorageRevision(root: string): Promise<StorageRevision> {
   const beforeIdentity = before ? `${before.dev}:${before.ino}` : null;
   const catalogIdentity = after ? `${after.dev}:${after.ino}` : null;
   if (beforeIdentity !== catalogIdentity) throw new Error("Copi catalog changed while capturing its revision.");
-  const format = catalog === undefined ? "v2" : parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown).version === 1 ? "v1" : "v2";
+  const format = catalogFormat(catalog);
   return Object.freeze({
     root,
     catalog: catalog?.toString("base64") ?? null,
@@ -859,6 +867,13 @@ async function cleanupUnjournaledLock(root: string, lock: string, lease: Session
 }
 async function cleanupTransactionLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
   await assertLeaseOwner(lease);
+  const entries = await readdir(lock);
+  if (entries.includes("journal.json")) throw new Error("A transaction journal remains after recovery; refusing cleanup.");
+  const hasFinalizedRecord = entries.includes("finalized.json") || entries.includes("finalized.digest");
+  if (!hasFinalizedRecord) {
+    await cleanupUnjournaledLock(root, lock, lease);
+    return;
+  }
   const revision = await captureStorageRevision(root);
   const finalized = await readFinalizedMetadata(root, lock, token, revision);
   if (finalized?.format === "v2") await cleanupFinalizedSourcesLock(root, lock, token, lease);
@@ -1035,16 +1050,27 @@ export class StorageTransactions {
     }
     const session = new StorageSession(root, lock, owner.token, this.options.checkpoint);
     const lease = await issueSessionLease(session, root, lock, owner);
-    try { return await operation(session); } finally {
+    let operationFailed = false;
+    let operationError: unknown;
+    try { return await operation(session); }
+    catch (error) { operationFailed = true; operationError = error; throw error; }
+    finally {
       sessionLeases.delete(session); // Reject new calls immediately; private in-flight leases are not exposed.
       lease.stop.abort(); // Interrupt checkpoints rather than waiting for caller-owned deferred values.
       await Promise.allSettled([...lease.pending]); // Finish safe rollback before cleanup/releasing the lock.
-      await assertLeaseOwner(lease);
-      if (await statMaybe(path.join(lock, "journal.json"))) {
-        // A failed recovery deliberately retains all evidence, and prevents readers seeing mixed state.
-        const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
-        try { await handle.writeFile(JSON.stringify({ ...owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
-      } else { await cleanupTransactionLock(root, lock, owner.token, lease); }
+      try {
+        await assertLeaseOwner(lease);
+        if (await statMaybe(path.join(lock, "journal.json"))) {
+          // A failed recovery deliberately retains all evidence, and prevents readers seeing mixed state.
+          const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
+          try { await handle.writeFile(JSON.stringify({ ...owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
+        } else { await cleanupTransactionLock(root, lock, owner.token, lease); }
+      } catch (cleanupError) {
+        if (!operationFailed) throw cleanupError;
+        const primary = operationError instanceof Error ? operationError.message : "Copi operation failed.";
+        const secondary = cleanupError instanceof Error ? cleanupError.message : "Safe cleanup was refused.";
+        throw new AggregateError([operationError, cleanupError], `${primary}; safe cleanup was refused: ${secondary}`);
+      }
     }
   }
   private async recoverDead(root: string, expected: Owner): Promise<void> {
@@ -1090,7 +1116,7 @@ export class StorageSession {
     const beforeIdentity = beforeCatalog ? `${beforeCatalog.dev}:${beforeCatalog.ino}` : null;
     const catalogIdentity = afterCatalog ? `${afterCatalog.dev}:${afterCatalog.ino}` : null;
     if (beforeIdentity !== catalogIdentity) throw new Error("Copi catalog changed while capturing its revision.");
-    const format = catalog === undefined ? "v2" : parseStoredCatalog(JSON.parse(catalog.toString("utf8")) as unknown).version === 1 ? "v1" : "v2";
+    const format = catalogFormat(catalog);
     const revision = Object.freeze({
       root: this.root,
       catalog: catalog?.toString("base64") ?? null,
