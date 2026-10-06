@@ -5,7 +5,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { StorageTransactions, prepareStorageReview, readStorageReview, type StorageCheckpoint } from "../src/storage-transaction.ts";
+import { StorageTransactions, readStorageReview, type StorageCheckpoint } from "../src/storage-transaction.ts";
 import type { Catalog, SavedItem } from "../src/types.ts";
 
 const skillId = "123e4567-e89b-42d3-a456-426614174000";
@@ -94,11 +94,26 @@ async function fixture(t: test.TestContext) {
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
-async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
+async function commitWithoutReview(box: Fixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
   const kernel = new StorageTransactions(checkpoint === undefined ? {} : { checkpoint });
   return kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements);
+  });
+}
+
+async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
+  const kernel = new StorageTransactions(checkpoint === undefined ? {} : { checkpoint });
+  const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`);
+  return kernel.run(box.libraryDir, false, async (session) => {
+    assert.ok(session);
+    const revision = await session.capture();
+    const review = await session.prepareSourcesReview(revision, catalogBytes, box.replacements);
+    const approvedSensitivePaths = readStorageReview(review).sensitivePaths;
+    await session.commit(revision, catalogBytes, box.replacements, {
+      review,
+      approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths },
+    });
   });
 }
 
@@ -108,7 +123,13 @@ function crashWriter(box: Fixture, checkpoint: StorageCheckpoint): ChildProcessW
   const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`).toString("base64");
   const code = `import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}){console.log('PAUSED');setInterval(()=>{},1000);await new Promise(()=>{});}}});
-await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(skillId)},files:[{path:'SKILL.md',mode:493,bytes:Buffer.from(${JSON.stringify(box.skillBytes.toString())})},{path:'docs/added.md',mode:416,bytes:Buffer.from(${JSON.stringify(box.addedBytes.toString())})}]}]));`;
+await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>{
+const revision=await session.capture();
+const catalog=Buffer.from(${JSON.stringify(catalogBytes)},'base64');
+const replacements=[{itemId:${JSON.stringify(skillId)},files:[{path:'SKILL.md',mode:493,bytes:Buffer.from(${JSON.stringify(box.skillBytes.toString())})},{path:'docs/added.md',mode:416,bytes:Buffer.from(${JSON.stringify(box.addedBytes.toString())})}]}];
+const review=await session.prepareSourcesReview(revision,catalog,replacements);
+await session.commit(revision,catalog,replacements,{review,approval:{reviewId:review.reviewId,confirmed:true,approvedSensitivePaths:[]}});
+});`;
   const options = sourceRun ? ["--experimental-transform-types", "--input-type=module", "-e", code] : ["--input-type=module", "-e", code];
   return spawn(process.execPath, options, { cwd: box.root, env: process.env });
 }
@@ -168,15 +189,50 @@ test("registered tree replacement stages fixed included files and swaps only tha
   assert.deepEqual((await readdir(box.sources)).sort(), [skillId, "neighbor", "unregistered"]);
 });
 
-test("tree replacement refuses to delete an unregistered ordinary child that predates capture", async (t) => {
+test("tree replacement refuses to delete an unregistered ordinary child without a before review", async (t) => {
   const box = await fixture(t);
+  const retainedBytes = Buffer.from("remove me\n");
+  box.next.items[0]!.files = [
+    { path: "SKILL.md", mode: 0o755, sha256: digest(box.skillBytes) },
+    { path: "docs/removed.md", mode: 0o600, sha256: digest(retainedBytes) },
+  ];
+  box.replacements[0]!.files = [
+    { path: "SKILL.md", mode: 0o755, bytes: box.skillBytes },
+    { path: "docs/removed.md", mode: 0o600, bytes: retainedBytes },
+  ];
   const unreviewedPath = path.join(box.skillRoot, "notes.md");
   const unreviewed = Buffer.from("ordinary unregistered child\\n");
   await writeFile(unreviewedPath, unreviewed, { mode: 0o600 });
-  await assert.rejects(commit(box), /unreviewed|unregistered|ordinary child/i);
+  await assert.rejects(commitWithoutReview(box), /unreviewed|unregistered|ordinary child/i);
   assert.deepEqual(await readFile(unreviewedPath), unreviewed);
   assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), box.initialSkill);
   assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.catalog);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
+test("confirmed opaque before review permits deleting captured ordinary tree children", async (t) => {
+  const box = await fixture(t);
+  const unregisteredPath = path.join(box.skillRoot, "notes.md");
+  const unregistered = Buffer.from("ordinary child captured privately before review\n");
+  await writeFile(unregisteredPath, unregistered, { mode: 0o600 });
+  const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`);
+  await new StorageTransactions().run(box.libraryDir, false, async (session) => {
+    assert.ok(session);
+    const revision = await session.capture();
+    const review = await session.prepareSourcesReview(revision, catalogBytes, box.replacements);
+    const view = readStorageReview(review);
+    assert.deepEqual(view.sensitivePaths, []);
+    assert.equal(JSON.stringify(view).includes(unregistered.toString()), false);
+    assert.deepEqual(Object.keys(review), ["reviewId"]);
+    await session.commit(revision, catalogBytes, box.replacements, {
+      review,
+      approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: view.sensitivePaths },
+    });
+  });
+  await assert.rejects(lstat(path.join(box.skillRoot, "docs", "removed.md")), { code: "ENOENT" });
+  await assert.rejects(lstat(unregisteredPath), { code: "ENOENT" });
+  assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), box.skillBytes);
+  assert.deepEqual(JSON.parse(await readFile(box.catalogPath, "utf8")), box.next);
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
 });
 
@@ -198,8 +254,14 @@ test("tree edits after capture are rejected before any transaction is written", 
   await kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     const revision = await session.capture();
+    const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`);
+    const review = await session.prepareSourcesReview(revision, catalogBytes, box.replacements);
+    const approvedSensitivePaths = readStorageReview(review).sensitivePaths;
     await writeFile(path.join(box.skillRoot, "after-capture.md"), "external after capture\\n", { mode: 0o600 });
-    await assert.rejects(session.commit(revision, Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements), /changed|unreviewed|tree/i);
+    await assert.rejects(session.commit(revision, catalogBytes, box.replacements, {
+      review,
+      approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths },
+    }), /changed|unreviewed|tree/i);
   });
   assert.equal(await readFile(path.join(box.skillRoot, "after-capture.md"), "utf8"), "external after capture\\n");
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
@@ -303,9 +365,7 @@ test("tree replacement requires opaque per-file approval for sensitive staged co
   box.next.items[0]!.files = [{ path: "SKILL.md", mode: 0o644, sha256: digest(secret) }];
   box.replacements[0]!.files = [{ path: "SKILL.md", mode: 0o644, bytes: secret }];
   const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`);
-  const review = prepareStorageReview(catalogBytes, box.replacements);
   const approvedSensitivePaths = [`${skillId}/SKILL.md`];
-  assert.deepEqual(readStorageReview(review).sensitivePaths, approvedSensitivePaths);
   let privateModes: number[] = [];
   const kernel = new StorageTransactions({ checkpoint: async (point, root) => {
     if (point !== "stage-write") return;
@@ -315,13 +375,16 @@ test("tree replacement requires opaque per-file approval for sensitive staged co
       (await lstat(path.join(stage, "SKILL.md"))).mode & 0o777,
     ];
   } });
-  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => {
-    assert.ok(session);
-    await session.commit(await session.capture(), catalogBytes, box.replacements);
-  }), /approval|inspection/i);
   await kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
-    await session.commit(await session.capture(), catalogBytes, box.replacements, {
+    const revision = await session.capture();
+    const review = await session.prepareSourcesReview(revision, catalogBytes, box.replacements);
+    assert.deepEqual(readStorageReview(review).sensitivePaths, approvedSensitivePaths);
+    await assert.rejects(session.commit(revision, catalogBytes, box.replacements, {
+      review,
+      approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [] },
+    }), /approval|inspection/i);
+    await session.commit(revision, catalogBytes, box.replacements, {
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths },
     });
