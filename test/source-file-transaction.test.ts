@@ -54,7 +54,7 @@ async function fixture(t: test.TestContext) {
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
-  const kernel = new StorageTransactions({ checkpoint });
+  const kernel = new StorageTransactions(checkpoint === undefined ? {} : { checkpoint });
   return kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements);
