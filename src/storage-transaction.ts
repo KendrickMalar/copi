@@ -6,7 +6,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
 import { readSourceContent } from "./source-content.ts";
-import { parseStorageJournal, validateSourcesJournalTargets, type SourcesStorageJournal } from "./storage-journal.ts";
+import { parseStorageJournal, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type SourcesStorageJournal } from "./storage-journal.ts";
 import { renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
@@ -225,6 +225,38 @@ async function tree(target: string, replacements?: ReadonlyMap<string, string>, 
   }
   await visit(target, ".");
   return hash(JSON.stringify(entries));
+}
+async function assertSafeCatalogOnlySourcesTree(target: string): Promise<void> {
+  const rootStat = await statMaybe(target);
+  if (!rootStat) return;
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("Catalog-only transaction found an unsafe sources root; preserving it.");
+  async function visit(directory: string): Promise<void> {
+    const before = await lstat(directory);
+    if (!before.isDirectory() || before.isSymbolicLink()) throw new Error("Catalog-only transaction found an unsafe sources directory; preserving it.");
+    const names = (await readdir(directory)).sort();
+    for (const name of names) {
+      const child = path.join(directory, name);
+      const stat = await lstat(child);
+      if (stat.isSymbolicLink()) throw new Error("Catalog-only transaction found a symbolic link in sources; preserving it.");
+      if (stat.isDirectory()) await visit(child);
+      else if (!stat.isFile()) throw new Error("Catalog-only transaction found a special sources node; preserving it.");
+    }
+    const after = await lstat(directory);
+    if (!after.isDirectory() || after.isSymbolicLink() || !sameDirectory({ dev: before.dev, ino: before.ino }, { dev: after.dev, ino: after.ino }) ||
+        JSON.stringify((await readdir(directory)).sort()) !== JSON.stringify(names)) {
+      throw new Error("Catalog-only sources tree changed while it was checked; preserving it.");
+    }
+  }
+  await visit(target);
+}
+async function catalogOnlySourcesTree(root: string): Promise<string> {
+  const target = path.join(root, "sources");
+  await assertSafeCatalogOnlySourcesTree(target);
+  const current = await tree(target, undefined, true) ?? "absent";
+  await assertSafeCatalogOnlySourcesTree(target);
+  const after = await tree(target, undefined, true) ?? "absent";
+  if (after !== current) throw new Error("Catalog-only sources tree changed while it was checked; preserving it.");
+  return current;
 }
 function validateMutationNames(previous: Catalog, next: Catalog, replacements: readonly StorageReplacement[]): void {
   const conflicts = findNameConflicts(previous);
@@ -456,6 +488,30 @@ async function validateSourcesTransition(root: string, previous: Catalog, next: 
   return operations;
 }
 
+function validateCatalogOnlyTransition(previous: Catalog, next: Catalog): void {
+  assertNoNameConflicts(next);
+  if (next.items.length !== previous.items.length) throw new Error("A catalog-only transaction cannot add, remove, or reorder source items.");
+  for (const [index, oldItem] of previous.items.entries()) {
+    const nextItem = next.items[index];
+    if (!nextItem || nextItem.id !== oldItem.id) throw new Error("A catalog-only transaction must preserve item order and identity.");
+    if (oldItem.destination.kind === "global-only" && nextItem.destination.kind === "project") {
+      throw new Error("A reference-only/global-only resource cannot become project-applicable.");
+    }
+    if (nextItem.destination.kind === "project" && privateStoragePath(nextItem.destination.path)) {
+      throw new Error("A catalog-only transaction cannot set a private or excluded destination.");
+    }
+    const permitted = { ...oldItem, name: nextItem.name, destination: nextItem.destination };
+    if (JSON.stringify(permitted) !== JSON.stringify(nextItem)) {
+      throw new Error("A catalog-only transaction may change only item names and legal destinations; source metadata, descriptors, and content are fixed.");
+    }
+  }
+  if (next.groups.length < previous.groups.length) throw new Error("A catalog-only transaction cannot remove groups.");
+  for (const [index, oldGroup] of previous.groups.entries()) {
+    const nextGroup = next.groups[index];
+    if (!nextGroup || nextGroup.id !== oldGroup.id) throw new Error("A catalog-only transaction must preserve existing group order and identity.");
+  }
+}
+
 function validateSourcesCatalogTransition(previous: Catalog | null, next: Catalog, operations: readonly SourcesOperation[]): void {
   const previousItems = previous?.items ?? [];
   const previousGroups = previous?.groups ?? [];
@@ -665,6 +721,82 @@ function v2LockEntries(journal: SourcesStorageJournal): Set<string> {
   }
   return entries;
 }
+function catalogOnlyLockEntries(): Set<string> {
+  return new Set(["owner.json", "journal.json", "journal.digest", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "finalized.json", "finalized.digest"]);
+}
+async function assertKnownCatalogOnlyLockEntries(lock: string): Promise<Set<string>> {
+  const entries = new Set(await readdir(lock));
+  if ([...entries].some((entry) => !catalogOnlyLockEntries().has(entry))) {
+    throw new Error("Unknown catalog-only transaction stage or artifact; preserving the lock and all bytes.");
+  }
+  return entries;
+}
+async function createCatalogOnlyCleanup(lock: string, journal: CatalogOnlyStorageJournal, rawJournal: Buffer): Promise<FinalizedCleanupManifest> {
+  const entries = await assertKnownCatalogOnlyLockEntries(lock);
+  const storedJournal = await checkedFile(path.join(lock, "journal.json"));
+  const journalDigest = await checkedFile(path.join(lock, "journal.digest"));
+  if (!storedJournal?.equals(rawJournal) || !journalDigest || journalDigest.toString("utf8") !== hash(rawJournal)) {
+    throw new Error("Catalog-only journal changed before cleanup custody was recorded.");
+  }
+  const nextPath = path.join(lock, "next-catalog");
+  const nextBytes = await checkedFile(nextPath);
+  const nextStat = await statMaybe(nextPath);
+  if (!nextBytes || hash(nextBytes) !== journal.newCatalog || !nextStat) throw new Error("Catalog-only next-catalog stage is missing or altered; preserve the journal and remaining artifacts for manual inspection with a newly verified recovery build.");
+  const oldPath = path.join(lock, "old-catalog");
+  const oldBytes = await checkedFile(oldPath);
+  const oldStat = await statMaybe(oldPath);
+  if (journal.oldCatalog === null ? entries.has("old-catalog") : !oldBytes || !oldStat || hash(oldBytes) !== journal.oldCatalog) {
+    throw new Error("Catalog-only old-catalog artifact is missing or unexpected.");
+  }
+  const heldPath = path.join(lock, "held-catalog");
+  const heldBytes = await checkedFile(heldPath);
+  const heldStat = await statMaybe(heldPath);
+  if (entries.has("held-catalog") && (journal.oldCatalog === null || !heldBytes || !heldStat || hash(heldBytes) !== journal.oldCatalog ||
+      !oldStat || !sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: heldStat.dev, ino: heldStat.ino }))) {
+    throw new Error("Catalog-only held-catalog artifact changed or lost its original inode.");
+  }
+  const rollback = await checkedFile(path.join(lock, "rollback.json"));
+  if (entries.has("rollback.json") && rollback?.toString("utf8") !== journal.token) throw new Error("Catalog-only rollback marker is invalid.");
+  const displacedPath = path.join(lock, "displaced-catalog");
+  const displacedBytes = await checkedFile(displacedPath);
+  const displacedStat = await statMaybe(displacedPath);
+  if (entries.has("displaced-catalog") && (!rollback || !displacedBytes || !displacedStat || hash(displacedBytes) !== journal.newCatalog ||
+      !sameDirectory({ dev: nextStat.dev, ino: nextStat.ino }, { dev: displacedStat.dev, ino: displacedStat.ino }))) {
+    throw new Error("Catalog-only displaced catalog is not bound to a checked rollback.");
+  }
+  const catalogPath = path.join(journal.root, "catalog.json");
+  const currentBytes = await checkedFile(catalogPath);
+  const currentStat = await statMaybe(catalogPath);
+  const currentIsNew = !!currentBytes && hash(currentBytes) === journal.newCatalog && !!currentStat &&
+    sameDirectory({ dev: nextStat.dev, ino: nextStat.ino }, { dev: currentStat.dev, ino: currentStat.ino });
+  const currentIsOld = journal.oldCatalog !== null && !!currentBytes && hash(currentBytes) === journal.oldCatalog && !!currentStat && !!oldStat &&
+    sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: currentStat.dev, ino: currentStat.ino });
+  if (!currentIsNew && !currentIsOld && !(journal.oldCatalog === null && !currentBytes)) {
+    throw new Error("Catalog-only final catalog is not a checked committed or rolled-back inode.");
+  }
+  if (currentIsNew && journal.oldCatalog !== null && !entries.has("held-catalog")) {
+    throw new Error("Committed catalog-only transaction lost its held old catalog inode.");
+  }
+  const artifacts: FinalizedCleanupArtifact[] = [];
+  for (const name of [...entries].sort()) {
+    if (name === "owner.json" || name === "journal.json" || name === "finalized.json" || name === "finalized.digest") continue;
+    const file = await checkedFile(path.join(lock, name));
+    if (!file) throw new Error(`Catalog-only cleanup artifact ${name} is missing.`);
+    const expected = name === "journal.digest" ? hash(journalDigest)
+      : name === "next-catalog" || name === "displaced-catalog" ? journal.newCatalog
+        : name === "old-catalog" || name === "held-catalog" ? journal.oldCatalog
+          : name === "rollback.json" ? journal.token : undefined;
+    if (!expected || (name === "rollback.json" ? file.toString("utf8") !== expected : hash(file) !== expected)) {
+      throw new Error(`Catalog-only cleanup artifact ${name} changed.`);
+    }
+    artifacts.push({ name, kind: "file", commitment: hash(file) });
+  }
+  if (!entries.has("next-catalog") || !entries.has("journal.digest") ||
+      (journal.oldCatalog === null ? entries.has("old-catalog") : !entries.has("old-catalog"))) {
+    throw new Error("Required catalog-only cleanup artifact is missing.");
+  }
+  return { version: 1, root: journal.root, token: journal.token, operationCount: 0, artifacts };
+}
 function parseFinalizedCleanup(value: unknown, expected: { root: string; token: string }): FinalizedCleanupManifest {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Finalized v2 cleanup manifest is malformed; refusing cleanup.");
   const record = value as Record<string, unknown>;
@@ -844,6 +976,86 @@ async function cleanupFinalizedSourcesLock(root: string, lock: string, token: st
   await rmdir(lock);
   await syncDirectory(root);
 }
+async function cleanupFinalizedCatalogOnlyLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
+  await assertLeaseOwner(lease);
+  const journalPath = path.join(lock, "journal.json");
+  const rawJournal = await checkedFile(journalPath);
+  if (!rawJournal) throw new Error("Catalog-only cleanup journal is missing; preserving the finalized lock.");
+  const journalDigest = await checkedFile(path.join(lock, "journal.digest"));
+  if (!journalDigest || journalDigest.toString("utf8") !== hash(rawJournal)) throw new Error("Catalog-only cleanup journal digest is missing or altered.");
+  const parsed = parseStorageJournal(JSON.parse(rawJournal.toString("utf8")) as unknown, { root, token });
+  if (parsed.version !== 3) throw new Error("Catalog-only cleanup was dispatched for a non-v3 journal.");
+  if (await catalogOnlySourcesTree(root) !== parsed.stableSourcesTree) throw new Error("Catalog-only cleanup found a changed or unsafe sources tree; preserving it.");
+  const revision = await captureStorageRevision(root);
+  if (revision.format !== "v2") throw new Error("Catalog-only cleanup found a legacy catalog; preserving its lock.");
+  const metadata = await readFinalizedMetadata(root, lock, token, revision);
+  const manifest = metadata?.cleanup;
+  if (!manifest) throw new Error("Catalog-only finalized cleanup custody is missing; preserving the journal and stages.");
+  const rebuilt = await createCatalogOnlyCleanup(lock, parsed, rawJournal);
+  if (JSON.stringify(rebuilt) !== JSON.stringify(manifest)) throw new Error("Catalog-only finalized cleanup custody changed; preserving the journal and stages.");
+  const expected = new Set(["owner.json", "journal.json", "finalized.json", "finalized.digest", ...manifest.artifacts.map((artifact) => artifact.name)]);
+  const entries = await readdir(lock);
+  if (entries.length !== expected.size || entries.some((entry) => !expected.has(entry))) {
+    throw new Error("Catalog-only cleanup found unknown or missing artifacts; preserving every remaining byte.");
+  }
+  const identities = new Map<string, DirectoryIdentity>();
+  for (const artifact of manifest.artifacts) {
+    if (artifact.kind !== "file") throw new Error("Catalog-only cleanup manifest contains a non-file artifact.");
+    const target = path.join(lock, artifact.name);
+    const bytes = await checkedFile(target);
+    const stat = await statMaybe(target);
+    if (!bytes || !stat || hash(bytes) !== artifact.commitment) throw new Error(`Catalog-only cleanup artifact ${artifact.name} is missing or altered; preserve the journal and remaining artifacts for manual inspection with a newly verified recovery build.`);
+    identities.set(artifact.name, { dev: stat.dev, ino: stat.ino });
+  }
+  await assertLeaseOwner(lease);
+  if (await catalogOnlySourcesTree(root) !== parsed.stableSourcesTree) {
+    throw new Error("Catalog-only sources tree changed during cleanup; preserve the journal and remaining artifacts.");
+  }
+  const finalizedDigestPath = path.join(lock, "finalized.digest");
+  const finalizedDigest = await checkedFile(finalizedDigestPath);
+  const finalizedDigestStat = await statMaybe(finalizedDigestPath);
+  if (!finalizedDigest || !finalizedDigestStat) throw new Error("Catalog-only finalized digest disappeared before cleanup.");
+  await unlink(finalizedDigestPath);
+  await unlink(path.join(lock, "finalized.json"));
+  await syncDirectory(lock);
+  const cleanupNames = manifest.artifacts.map((artifact) => artifact.name).filter((name) => name !== "journal.digest").sort();
+  for (const name of cleanupNames) {
+    await assertLeaseOwner(lease);
+    const target = path.join(lock, name);
+    const stat = await statMaybe(target);
+    const bytes = await checkedFile(target);
+    const identity = identities.get(name);
+    const artifact = manifest.artifacts.find((entry) => entry.name === name);
+    if (!stat || !bytes || !identity || !artifact || !sameDirectory({ dev: stat.dev, ino: stat.ino }, identity) || hash(bytes) !== artifact.commitment) {
+      throw new Error(`Catalog-only cleanup artifact ${name} changed before deletion; preserving all remaining artifacts.`);
+    }
+    await unlink(target);
+  }
+  await syncDirectory(lock);
+  if (await catalogOnlySourcesTree(root) !== parsed.stableSourcesTree) {
+    throw new Error("Catalog-only sources tree changed before journal cleanup; preserve the journal and remaining artifacts.");
+  }
+  const digestPath = path.join(lock, "journal.digest");
+  const digestStat = await statMaybe(digestPath);
+  const digestBytes = await checkedFile(digestPath);
+  const digestIdentity = identities.get("journal.digest");
+  const digestArtifact = manifest.artifacts.find((entry) => entry.name === "journal.digest");
+  if (!digestStat || !digestBytes || !digestIdentity || !digestArtifact ||
+      !sameDirectory({ dev: digestStat.dev, ino: digestStat.ino }, digestIdentity) || hash(digestBytes) !== digestArtifact.commitment) {
+    throw new Error("Catalog-only cleanup journal digest changed before deletion; preserving the journal.");
+  }
+  await unlink(digestPath);
+  await syncDirectory(lock);
+  const journalStat = await statMaybe(journalPath);
+  const journalBytesAtFinish = await checkedFile(journalPath);
+  if (!journalStat || !journalBytesAtFinish?.equals(rawJournal)) throw new Error("Catalog-only journal changed before final cleanup; preserving it.");
+  await unlink(journalPath);
+  await syncDirectory(lock);
+  await assertLeaseOwner(lease);
+  await unlink(path.join(lock, "owner.json"));
+  await rmdir(lock);
+  await syncDirectory(root);
+}
 async function cleanupUnjournaledLock(root: string, lock: string, lease: SessionLease): Promise<void> {
   const expected = new Set(["owner.json", ...lease.unjournaledArtifacts.keys()]);
   const entries = await readdir(lock);
@@ -867,8 +1079,14 @@ async function cleanupUnjournaledLock(root: string, lock: string, lease: Session
 }
 async function cleanupTransactionLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
   await assertLeaseOwner(lease);
+  const rawJournal = await checkedFile(path.join(lock, "journal.json"));
+  if (rawJournal) {
+    const journal = parseStorageJournal(JSON.parse(rawJournal.toString("utf8")) as unknown, { root, token });
+    if (journal.version !== 3) throw new Error("A non-catalog-only transaction journal remains after recovery; refusing cleanup.");
+    await cleanupFinalizedCatalogOnlyLock(root, lock, token, lease);
+    return;
+  }
   const entries = await readdir(lock);
-  if (entries.includes("journal.json")) throw new Error("A transaction journal remains after recovery; refusing cleanup.");
   const hasFinalizedRecord = entries.includes("finalized.json") || entries.includes("finalized.digest");
   if (!hasFinalizedRecord) {
     await cleanupUnjournaledLock(root, lock, lease);
@@ -1061,9 +1279,13 @@ export class StorageTransactions {
       try {
         await assertLeaseOwner(lease);
         if (await statMaybe(path.join(lock, "journal.json"))) {
-          // A failed recovery deliberately retains all evidence, and prevents readers seeing mixed state.
-          const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
-          try { await handle.writeFile(JSON.stringify({ ...owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
+          try { await cleanupTransactionLock(root, lock, owner.token, lease); }
+          catch (journalError) {
+            // Keep an unverified journal blocked; never delete incomplete cleanup artifacts.
+            const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
+            try { await handle.writeFile(JSON.stringify({ ...owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
+            throw journalError;
+          }
         } else { await cleanupTransactionLock(root, lock, owner.token, lease); }
       } catch (cleanupError) {
         if (!operationFailed) throw cleanupError;
@@ -1177,6 +1399,10 @@ export class StorageSession {
     if (expected.format !== "v2" || previousStored.version !== 2 || nextStored.version !== 2) throw new Error("Ordinary storage commits require catalog v2; explicitly migrate legacy v1 storage first.");
     assertModernCatalog(previousStored);
     assertModernCatalog(nextStored);
+    if (replacements.length === 0) {
+      await this.#commitCatalogOnly(expected, previousStored, nextStored, catalog);
+      return;
+    }
     const removedPaths = omittedSourcePaths(prepared, previousStored, nextStored);
     if (removedPaths.length > 0 && (!prepared.before || !authorization || authorization.approval.confirmed !== true)) {
       throw new Error("Ordinary source deletion requires a session-bound before review and confirmed approval.");
@@ -1188,6 +1414,162 @@ export class StorageSession {
     }
     await this.#commitSources(expected, previousStored, nextStored, catalog, replacements, prepared.before);
   }
+  async #commitCatalogOnly(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer): Promise<void> {
+    validateCatalogOnlyTransition(previous, next);
+    const stableSourcesTree = await catalogOnlySourcesTree(this.root);
+    if (stableSourcesTree !== expected.tree) throw new Error("Sources tree changed after capture; refusing catalog-only commit.");
+    await this.assertRevision(expected);
+
+    let journalInstalled = false;
+    let journalBytes: Buffer | undefined;
+    const catalogStage = path.join(this.lock, "next-catalog");
+    const oldCatalogStage = path.join(this.lock, "old-catalog");
+    const journalPath = path.join(this.lock, "journal.json");
+    try {
+      const catalogHandle = await open(catalogStage, "wx", 0o600);
+      try {
+        const stageStat = await catalogHandle.stat();
+        rememberUnjournaledArtifact(this, "next-catalog", { dev: stageStat.dev, ino: stageStat.ino }, "file", hash(catalog));
+        await catalogHandle.writeFile(catalog);
+        await this.checkpoint?.("stage-write", this.root);
+        await this.assertLease(false);
+        if (await catalogOnlySourcesTree(this.root) !== stableSourcesTree) throw new Error("Sources tree changed while staging catalog-only metadata.");
+        await this.checkpoint?.("stage-sync", this.root);
+        await this.assertLease(false);
+        await catalogHandle.sync();
+      } finally { await catalogHandle.close(); }
+      const stagedCatalog = await checkedFile(catalogStage);
+      if (!stagedCatalog?.equals(catalog)) throw new Error("Staged catalog changed from the fixed catalog-only bytes.");
+      await syncDirectory(this.lock);
+
+      const oldBytes = expected.catalog === null ? undefined : Buffer.from(expected.catalog, "base64");
+      if (oldBytes) {
+        const catalogPath = path.join(this.root, "catalog.json");
+        const current = await checkedFile(catalogPath);
+        const currentStat = await statMaybe(catalogPath);
+        if (!current?.equals(oldBytes) || !currentStat || expected.catalogIdentity !== `${currentStat.dev}:${currentStat.ino}`) {
+          throw new Error("Original catalog changed before catalog-only staging; preserving its inode.");
+        }
+        await link(catalogPath, oldCatalogStage);
+        await rememberUnjournaledFile(this, "old-catalog", oldCatalogStage, oldBytes);
+        const oldStageStat = await statMaybe(oldCatalogStage);
+        if (!oldStageStat || !sameDirectory({ dev: currentStat.dev, ino: currentStat.ino }, { dev: oldStageStat.dev, ino: oldStageStat.ino })) {
+          throw new Error("Catalog-only old-catalog stage did not retain the original inode.");
+        }
+      }
+      await this.assertRevision(expected);
+      if (await catalogOnlySourcesTree(this.root) !== stableSourcesTree) throw new Error("Sources tree changed before catalog-only journaling.");
+
+      const journal: CatalogOnlyStorageJournal = {
+        version: 3,
+        mode: "catalog-only",
+        root: this.root,
+        token: this.token,
+        oldCatalog: oldBytes ? hash(oldBytes) : null,
+        newCatalog: hash(catalog),
+        stableSourcesTree,
+        operations: [],
+      };
+      journalBytes = Buffer.from(JSON.stringify(journal));
+      const journalTemp = path.join(this.lock, "journal.tmp");
+      await writePrivate(journalTemp, journalBytes);
+      await rememberUnjournaledFile(this, "journal.tmp", journalTemp, journalBytes);
+      await link(journalTemp, journalPath);
+      journalInstalled = true;
+      await unlink(journalTemp);
+      forgetUnjournaledArtifact(this, "journal.tmp");
+      await writePrivate(path.join(this.lock, "journal.digest"), hash(journalBytes));
+      await syncDirectory(this.lock);
+
+      await this.checkpoint?.("journal", this.root);
+      await this.assertLease(false);
+      const entries = await assertKnownCatalogOnlyLockEntries(this.lock);
+      const expectedEntries = new Set(["owner.json", "next-catalog", "journal.json", "journal.digest", ...(oldBytes ? ["old-catalog"] : [])]);
+      if (entries.size !== expectedEntries.size || [...entries].some((entry) => !expectedEntries.has(entry))) {
+        throw new Error("Unexpected catalog-only lock stage before catalog installation; preserving it.");
+      }
+      const rawJournal = await checkedFile(journalPath);
+      const journalDigest = await checkedFile(path.join(this.lock, "journal.digest"));
+      if (!journalBytes || !rawJournal?.equals(journalBytes) || !journalDigest || journalDigest.toString("utf8") !== hash(rawJournal)) {
+        throw new Error("Catalog-only journal or digest changed before catalog installation.");
+      }
+      const parsed = parseStorageJournal(JSON.parse(rawJournal.toString("utf8")) as unknown, { root: this.root, token: this.token });
+      if (parsed.version !== 3 || parsed.mode !== "catalog-only" || JSON.stringify(parsed) !== JSON.stringify(journal)) {
+        throw new Error("Catalog-only journal changed its fixed v3 dispatch or commitments.");
+      }
+      const stagedAfterJournal = await checkedFile(catalogStage);
+      if (!stagedAfterJournal?.equals(catalog)) throw new Error("Catalog-only next-catalog stage changed after journaling.");
+      await this.assertRevision(expected);
+      if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) throw new Error("Sources tree changed after catalog-only journaling.");
+
+      const catalogPath = path.join(this.root, "catalog.json");
+      const heldPath = path.join(this.lock, "held-catalog");
+      const current = await checkedFile(catalogPath);
+      const currentStat = await statMaybe(catalogPath);
+      if ((current ? hash(current) : null) !== journal.oldCatalog ||
+          (currentStat ? `${currentStat.dev}:${currentStat.ino}` : null) !== expected.catalogIdentity) {
+        throw new Error("Catalog changed before catalog-only hold; refusing overwrite.");
+      }
+      if (await statMaybe(heldPath)) throw new Error("Unexpected held catalog in catalog-only transaction.");
+      if (current) await rename(catalogPath, heldPath);
+      await syncDirectory(this.root);
+      await this.checkpoint?.("catalog-held", this.root);
+      await this.assertLease(false);
+      if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) throw new Error("Sources tree changed while holding catalog-only metadata.");
+      const held = await checkedFile(heldPath);
+      const heldStat = await statMaybe(heldPath);
+      const oldStageStat = await statMaybe(oldCatalogStage);
+      if ((held ? hash(held) : null) !== journal.oldCatalog ||
+          (heldStat ? !oldStageStat || !sameDirectory({ dev: heldStat.dev, ino: heldStat.ino }, { dev: oldStageStat.dev, ino: oldStageStat.ino }) : journal.oldCatalog !== null)) {
+        throw new Error("Held catalog-only inode changed; preserving it.");
+      }
+      if (await statMaybe(catalogPath)) throw new Error("A catalog appeared during catalog-only hold; refusing replacement.");
+      if (!(await checkedFile(catalogStage))?.equals(catalog)) throw new Error("Catalog-only stage changed before exclusive installation.");
+      await link(catalogStage, catalogPath);
+      await syncDirectory(this.root);
+      await this.checkpoint?.("catalog-renamed", this.root);
+      await this.assertLease(false);
+      const installed = await checkedFile(catalogPath);
+      const installedStat = await statMaybe(catalogPath);
+      const stageStat = await statMaybe(catalogStage);
+      if (!installed?.equals(catalog) || !installedStat || !stageStat ||
+          !sameDirectory({ dev: installedStat.dev, ino: installedStat.ino }, { dev: stageStat.dev, ino: stageStat.ino }) ||
+          await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) {
+        throw new Error("Catalog-only installed inode or stable sources tree changed.");
+      }
+      await this.checkpoint?.("directory-sync", this.root);
+      await this.assertLease(false);
+      await syncDirectory(this.root);
+      await this.checkpoint?.("committed", this.root);
+      await this.assertLease(false);
+      if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree ||
+          hash((await checkedFile(catalogPath)) ?? Buffer.alloc(0)) !== journal.newCatalog) {
+        throw new Error("Catalog-only library changed during commit finalization.");
+      }
+      const heldAtFinish = await checkedFile(heldPath);
+      const heldAtFinishStat = await statMaybe(heldPath);
+      const oldStageAtFinish = await statMaybe(oldCatalogStage);
+      if ((heldAtFinish ? hash(heldAtFinish) : null) !== journal.oldCatalog ||
+          (heldAtFinishStat ? !oldStageAtFinish || !sameDirectory({ dev: heldAtFinishStat.dev, ino: heldAtFinishStat.ino }, { dev: oldStageAtFinish.dev, ino: oldStageAtFinish.ino }) : journal.oldCatalog !== null)) {
+        throw new Error("Held original catalog changed during catalog-only finalization.");
+      }
+      await this.markFinalized(await createCatalogOnlyCleanup(this.lock, journal, journalBytes));
+      await this.checkpoint?.("finalized", this.root);
+      await this.recover(false);
+    } catch (error) {
+      if (!journalInstalled) throw error;
+      const operation = sessionLeases.get(this)?.operation;
+      if (operation) operation.recovering = true;
+      try { await this.recover(true); }
+      catch (recoveryError) {
+        throw new Error("Copi catalog-only transaction could not safely recover; retained its journal and catalog artifacts.", {
+          cause: new AggregateError([error, recoveryError]),
+        });
+      }
+      throw error;
+    }
+  }
+
   async #commitNewItems(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer, replacements: readonly StorageReplacement[], operations: SourcesOperation[]): Promise<void> {
     if (operations.length === 0 || operations.some((operation) => operation.oldTree !== null) || next.items.length <= previous.items.length) {
       throw new Error("New-item storage requires a complete set of additions-only source operations.");
@@ -1837,6 +2219,123 @@ export class StorageSession {
     await rm(path.join(this.lock, "journal.json"));
     await this.checkpoint?.("rollback-finalized", this.root);
   }
+  private async recoverCatalogOnly(journal: CatalogOnlyStorageJournal, rollback: boolean, rawJournal: Buffer): Promise<void> {
+    const entries = await assertKnownCatalogOnlyLockEntries(this.lock);
+    if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) {
+      throw new Error("Catalog-only sources tree changed or became unsafe; preserving the journal and all sources.");
+    }
+    const rawNext = await checkedFile(path.join(this.lock, "next-catalog"));
+    const nextStat = await statMaybe(path.join(this.lock, "next-catalog"));
+    if (!rawNext || !nextStat || hash(rawNext) !== journal.newCatalog) throw new Error("Catalog-only next catalog is missing or altered; preserve the journal and remaining artifacts for manual inspection with a newly verified recovery build.");
+    const nextStored = parseStoredCatalog(JSON.parse(rawNext.toString("utf8")) as unknown);
+    if (nextStored.version !== 2) throw new Error("Catalog-only recovery requires a v2 catalog.");
+    assertModernCatalog(nextStored);
+    const oldPath = path.join(this.lock, "old-catalog");
+    const rawOld = journal.oldCatalog === null ? undefined : await checkedFile(oldPath);
+    const oldStat = journal.oldCatalog === null ? undefined : await statMaybe(oldPath);
+    if (journal.oldCatalog === null ? entries.has("old-catalog") : !rawOld || !oldStat || hash(rawOld) !== journal.oldCatalog) {
+      throw new Error("Catalog-only old catalog is missing or altered.");
+    }
+    const previousStored = rawOld ? parseStoredCatalog(JSON.parse(rawOld.toString("utf8")) as unknown) : null;
+    if (previousStored && previousStored.version !== 2) throw new Error("Catalog-only recovery cannot use a legacy v1 catalog.");
+    const previous = previousStored?.version === 2 ? previousStored : { version: 2 as const, items: [], groups: [] };
+    validateCatalogOnlyTransition(previous, nextStored);
+
+    const digest = await checkedFile(path.join(this.lock, "journal.digest"));
+    if (!digest || digest.toString("utf8") !== hash(rawJournal)) throw new Error("Catalog-only journal digest is missing or altered.");
+    const heldPath = path.join(this.lock, "held-catalog");
+    const heldBytes = await checkedFile(heldPath);
+    const heldStat = await statMaybe(heldPath);
+    if (entries.has("held-catalog") && (journal.oldCatalog === null || !heldBytes || !heldStat || hash(heldBytes) !== journal.oldCatalog ||
+        !oldStat || !sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: heldStat.dev, ino: heldStat.ino }))) {
+      throw new Error("Catalog-only held old inode is missing, altered, or foreign; preserving it.");
+    }
+    const rollbackBytes = await checkedFile(path.join(this.lock, "rollback.json"));
+    const rollbackMarker = !!rollbackBytes;
+    if (rollbackMarker && rollbackBytes.toString("utf8") !== journal.token) throw new Error("Catalog-only rollback marker has a foreign transaction nonce.");
+    const displacedPath = path.join(this.lock, "displaced-catalog");
+    const displacedBytes = await checkedFile(displacedPath);
+    const displacedStat = await statMaybe(displacedPath);
+    if (entries.has("displaced-catalog") && (!rollbackMarker || !displacedBytes || !displacedStat || hash(displacedBytes) !== journal.newCatalog ||
+        !sameDirectory({ dev: nextStat.dev, ino: nextStat.ino }, { dev: displacedStat.dev, ino: displacedStat.ino }))) {
+      throw new Error("Catalog-only displaced catalog is not an owned rollback inode.");
+    }
+
+    const catalogPath = path.join(this.root, "catalog.json");
+    const currentBytes = await checkedFile(catalogPath);
+    const currentStat = await statMaybe(catalogPath);
+    const currentHash = currentBytes ? hash(currentBytes) : null;
+    const currentIsNew = currentHash === journal.newCatalog && !!currentStat &&
+      sameDirectory({ dev: nextStat.dev, ino: nextStat.ino }, { dev: currentStat.dev, ino: currentStat.ino });
+    const currentIsOld = journal.oldCatalog !== null && currentHash === journal.oldCatalog && !!currentStat && !!oldStat &&
+      sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: currentStat.dev, ino: currentStat.ino });
+    const catalogInTransit = journal.oldCatalog !== null && currentHash === null && !!heldStat;
+    const initiallyAbsent = journal.oldCatalog === null && currentHash === null;
+    if (!currentIsNew && !currentIsOld && !catalogInTransit && !initiallyAbsent) {
+      throw new Error("Catalog-only current catalog is foreign, altered, or has lost its journal-bound inode.");
+    }
+    if ((currentIsNew || catalogInTransit) && journal.oldCatalog !== null && !heldStat) {
+      throw new Error("Catalog-only recovery lost the original held catalog inode; preserve the journal and remaining artifacts for manual inspection with a newly verified recovery build.");
+    }
+    if (await this.verifyFinalized()) {
+      if (rollback || rollbackMarker || !currentIsNew) throw new Error("Finalized catalog-only transaction cannot be rolled back or resumed from a partial state; preserving the journal.");
+      if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) throw new Error("Finalized catalog-only source tree changed; preserving it.");
+      await this.markFinalized(await createCatalogOnlyCleanup(this.lock, journal, rawJournal));
+      return;
+    }
+    if (currentIsNew && !rollback && !rollbackMarker) {
+      if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) throw new Error("Catalog-only source tree changed before commit recovery.");
+      await this.markFinalized(await createCatalogOnlyCleanup(this.lock, journal, rawJournal));
+      return;
+    }
+
+    if (!rollbackMarker) {
+      await writePrivate(path.join(this.lock, "rollback.json"), this.token);
+      await syncDirectory(this.lock);
+    }
+    if (currentIsNew) {
+      if (entries.has("displaced-catalog")) throw new Error("Unexpected displaced catalog before catalog-only rollback.");
+      await rename(catalogPath, displacedPath);
+      const displaced = await checkedFile(displacedPath);
+      const movedStat = await statMaybe(displacedPath);
+      if (!displaced || hash(displaced) !== journal.newCatalog || !movedStat ||
+          !sameDirectory({ dev: nextStat.dev, ino: nextStat.ino }, { dev: movedStat.dev, ino: movedStat.ino })) {
+        throw new Error("Catalog-only new catalog changed while being displaced; preserving it.");
+      }
+      await this.checkpoint?.("rollback-catalog-held", this.root);
+    }
+    const currentAfterDisplace = await checkedFile(catalogPath);
+    if (journal.oldCatalog === null) {
+      if (currentAfterDisplace) throw new Error("An external catalog appeared during absent-catalog rollback; preserving it.");
+    } else if (currentIsOld) {
+      const currentAfterStat = await statMaybe(catalogPath);
+      if (!currentAfterStat || !oldStat || !sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: currentAfterStat.dev, ino: currentAfterStat.ino })) {
+        throw new Error("Original catalog inode changed during catalog-only rollback.");
+      }
+    } else {
+      const heldNow = await checkedFile(heldPath);
+      const heldNowStat = await statMaybe(heldPath);
+      const oldNowStat = await statMaybe(oldPath);
+      if (currentAfterDisplace || !heldNow || hash(heldNow) !== journal.oldCatalog || !heldNowStat || !oldNowStat ||
+          !sameDirectory({ dev: oldNowStat.dev, ino: oldNowStat.ino }, { dev: heldNowStat.dev, ino: heldNowStat.ino })) {
+        throw new Error("Original held catalog inode changed before restoration; preserving it.");
+      }
+      await link(heldPath, catalogPath);
+    }
+    if (await catalogOnlySourcesTree(this.root) !== journal.stableSourcesTree) {
+      throw new Error("Catalog-only source tree changed during rollback; retaining journal and source bytes.");
+    }
+    const restored = await checkedFile(catalogPath);
+    const restoredStat = await statMaybe(catalogPath);
+    if (journal.oldCatalog === null ? !!restored || !!restoredStat : !restored || hash(restored) !== journal.oldCatalog || !restoredStat || !oldStat ||
+        !sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: restoredStat.dev, ino: restoredStat.ino })) {
+      throw new Error("Catalog-only rollback did not restore the exact original catalog presence and inode.");
+    }
+    await syncDirectory(this.root);
+    await this.markFinalized(await createCatalogOnlyCleanup(this.lock, journal, rawJournal));
+    await this.checkpoint?.("rollback-finalized", this.root);
+  }
+
   private async recoverSources(journal: SourcesStorageJournal, rollback: boolean, rawJournal: Buffer): Promise<void> {
     const allowedEntries = v2LockEntries(journal);
     const lockEntries = await readdir(this.lock);
@@ -1995,6 +2494,7 @@ export class StorageSession {
     const digest = await checkedFile(path.join(this.lock, "journal.digest"));
     if (!digest || digest.toString("utf8") !== hash(raw)) throw new Error("Transaction journal is missing integrity information or was altered; refusing recovery.");
     const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
+    if (parsed.version === 3) { await this.recoverCatalogOnly(parsed, rollback, raw); return; }
     if (parsed.version === 2) { await this.recoverSources(parsed, rollback, raw); return; }
     const journal = parsed;
     await this.assertLease(true);
