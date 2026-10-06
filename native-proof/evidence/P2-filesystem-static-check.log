@@ -1,0 +1,1 @@
+COMMAND=Node22 --check driver/test; git diff --cached --check; scan whitespace in staged native-proof sources/evidence; scan raw-secret tokens in P2 filesystem logs

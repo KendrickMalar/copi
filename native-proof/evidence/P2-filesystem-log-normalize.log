@@ -1,0 +1,3 @@
+COMMAND=strip trailing horizontal whitespace only from the two intermediate TAP logs; preserve all other output
+native-proof/evidence/P2-filesystem-green.log: removed trailing whitespace from 26 lines; content/counts otherwise preserved
+native-proof/evidence/P2-filesystem-green-2.log: removed trailing whitespace from 10 lines; content/counts otherwise preserved

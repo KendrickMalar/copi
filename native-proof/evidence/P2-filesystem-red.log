@@ -1,0 +1,31 @@
+COMMAND=HOME=<coder>/home PI_CODING_AGENT_DIR=<coder>/home/.pi/agent NPM_CONFIG_CACHE=<coder>/cache NPM_CONFIG_USERCONFIG=/dev/null TMPDIR=<coder>/tmp /opt/homebrew/opt/node@22/bin/node --test native-proof/recovery-filesystem.test.mjs
+TAP version 13
+# Subtest: P2 real-filesystem recovery driver exists
+not ok 1 - P2 real-filesystem recovery driver exists
+  ---
+  duration_ms: 0.66825
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/recovery-filesystem.test.mjs:15:3'
+  failureType: 'testCodeFailure'
+  error: 'recovery-filesystem-driver.mjs is not implemented'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: ~
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/recovery-filesystem.test.mjs:16:12)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.start (node:internal/test_runner/test:944:17)
+    startSubtestAfterBootstrap (node:internal/test_runner/harness:296:17)
+  ...
+1..1
+# tests 1
+# suites 0
+# pass 0
+# fail 1
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 80.788542

@@ -1,0 +1,136 @@
+COMMAND=HOME=<coder>/home PI_CODING_AGENT_DIR=<coder>/home/.pi/agent NPM_CONFIG_CACHE=<coder>/cache NPM_CONFIG_USERCONFIG=/dev/null TMPDIR=<coder>/tmp /opt/homebrew/opt/node@22/bin/node --test native-proof/placement.test.mjs native-proof/placement-boundary.test.mjs
+TAP version 13
+# {"case":"empty-dir","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-collision-empty-dir-SPuAxd","source":{"dev":"16777233","ino":"264303859","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303861","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1jb2xsaXNpb24tZW1wdHktZGlyCg=="}}},"external":{"dev":"16777233","ino":"264303867","mode":489,"type":"directory","children":{}},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303867","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty-dir destination at the syscall boundary
+ok 1 - RENAME_EXCL preserves a competing empty-dir destination at the syscall boundary
+  ---
+  duration_ms: 9.031333
+  type: 'test'
+  ...
+# {"case":"nonempty-dir","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-collision-nonempty-dir-YmGHAG","source":{"dev":"16777233","ino":"264303873","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303874","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1jb2xsaXNpb24tbm9uZW1wdHktZGlyCg=="}}},"external":{"dev":"16777233","ino":"264303882","mode":489,"type":"directory","children":{"sentinel.txt":{"dev":"16777233","ino":"264303883","mode":384,"type":"file","base64":"ZXh0ZXJuYWwgZGlyZWN0b3J5IHNlbnRpbmVsCg=="}}},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303882","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing nonempty-dir destination at the syscall boundary
+ok 2 - RENAME_EXCL preserves a competing nonempty-dir destination at the syscall boundary
+  ---
+  duration_ms: 11.401958
+  type: 'test'
+  ...
+# {"case":"file","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-collision-file-ifYq7E","source":{"dev":"16777233","ino":"264303889","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303890","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1jb2xsaXNpb24tZmlsZQo="}}},"external":{"dev":"16777233","ino":"264303892","mode":384,"type":"file","base64":"ZXh0ZXJuYWwgZmlsZSBzZW50aW5lbAo="},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303892","injected_external_mode":384,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing file destination at the syscall boundary
+ok 3 - RENAME_EXCL preserves a competing file destination at the syscall boundary
+  ---
+  duration_ms: 4.909625
+  type: 'test'
+  ...
+# {"case":"symlink","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-collision-symlink-DxzMBr","source":{"dev":"16777233","ino":"264303898","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303899","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1jb2xsaXNpb24tc3ltbGluawo="}}},"external":{"dev":"16777233","ino":"264303901","mode":493,"type":"symlink","target":"external-symlink-target"},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303901","injected_external_mode":493,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing symlink destination at the syscall boundary
+ok 4 - RENAME_EXCL preserves a competing symlink destination at the syscall boundary
+  ---
+  duration_ms: 5.305375
+  type: 'test'
+  ...
+# {"case":"samebytes-dir","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-collision-samebytes-dir-6SDSIU","source":{"dev":"16777233","ino":"264303903","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303904","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1jb2xsaXNpb24tc2FtZWJ5dGVzLWRpcgo="}}},"external":{"dev":"16777233","ino":"264303906","mode":489,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303907","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1jb2xsaXNpb24tc2FtZWJ5dGVzLWRpcgo="}}},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303906","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing samebytes-dir destination at the syscall boundary
+ok 5 - RENAME_EXCL preserves a competing samebytes-dir destination at the syscall boundary
+  ---
+  duration_ms: 4.787333
+  type: 'test'
+  ...
+# {"case":"symlink-ancestor","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-symlink-ancestor-x9wSGr","result":{"status":64,"stderr":"error=parent-openat errno=20"}}
+# Subtest: symlink in a destination ancestor is rejected without touching its referent
+ok 6 - symlink in a destination ancestor is rejected without touching its referent
+  ---
+  duration_ms: 3.73725
+  type: 'test'
+  ...
+# {"case":"parent-path-swap","classification":"LIMIT-not-safety-pass","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-parent-path-swap-nbboQe","heldParent":{"dev":"16777233","ino":"264303917","mode":448,"type":"directory","children":{"item":{"dev":"16777233","ino":"264303915","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303916","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1wYXJlbnQtcGF0aC1zd2FwCg=="}}}}},"replacementParent":{"dev":"16777233","ino":"264303918","mode":448,"type":"directory","children":{"item":{"dev":"16777233","ino":"264303919","mode":384,"type":"file","base64":"cmVwbGFjZW1lbnQgcGFyZW50IHNlbnRpbmVsCg=="}}},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"placed","errno":0,"source_dev":"16777233","source_ino":"264303915","destination_identity_preserved":true,"boundary":"LIMIT","test_interposition":"immediately-before-real-renameatx_np","parent_path_replaced":true}}
+# Subtest: LIMIT: replacing the parent path leaves the opened dirfd attached to the renamed parent
+ok 7 - LIMIT: replacing the parent path leaves the opened dirfd attached to the renamed parent
+  ---
+  duration_ms: 4.083125
+  type: 'test'
+  ...
+# {"case":"parent-namespace-move","classification":"LIMIT-not-safety-pass","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-parent-namespace-move-RPeI7i","externalParent":{"dev":"16777233","ino":"264303923","mode":448,"type":"directory","children":{"item":{"dev":"16777233","ino":"264303921","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303922","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1wYXJlbnQtbmFtZXNwYWNlLW1vdmUK"}}}}},"replacementParent":{"dev":"16777233","ino":"264303924","mode":448,"type":"directory","children":{"item":{"dev":"16777233","ino":"264303925","mode":384,"type":"file","base64":"cmVwbGFjZW1lbnQgcGFyZW50IHNlbnRpbmVsCg=="}}},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"placed","errno":0,"source_dev":"16777233","source_ino":"264303921","destination_identity_preserved":true,"boundary":"LIMIT","test_interposition":"immediately-before-real-renameatx_np","moved_parent_outside_root":true,"outside_parent_name":"p1b-parent-namespace-move-RPeI7i.p1b-outside-parent"}}
+# Subtest: LIMIT: moving the opened parent outside the synthetic root does not confine its dirfd
+ok 8 - LIMIT: moving the opened parent outside the synthetic root does not confine its dirfd
+  ---
+  duration_ms: 4.141334
+  type: 'test'
+  ...
+# {"case":"source-basename-swap","classification":"LIMIT-not-safety-pass","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-source-basename-swap-xSEyRx","original":{"dev":"16777233","ino":"264303927","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303928","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1zb3VyY2UtYmFzZW5hbWUtc3dhcAo="}}},"replacementDestination":{"dev":"16777233","ino":"264303930","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303931","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1zb3VyY2UtYmFzZW5hbWUtc3dhcAo="}}},"record":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"placed","errno":0,"source_dev":"16777233","source_ino":"264303927","destination_identity_preserved":false,"boundary":"LIMIT","test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: LIMIT: replacing the final source basename is not made conditional by RENAME_EXCL
+ok 9 - LIMIT: replacing the final source basename is not made conditional by RENAME_EXCL
+  ---
+  duration_ms: 4.534417
+  type: 'test'
+  ...
+# {"case":"unsupported-flag","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-unsupported-flag-qeqU32","result":{"operation":"renameatx_np","flag":"RENAME_EXCL|UNSUPPORTED_TEST_BIT","result":"refused","errno":22,"errno_name":"EINVAL","injected_external_dev":"0","injected_external_ino":"0","injected_external_mode":0}}
+# Subtest: unsupported flag failure does not fall back to an ordinary rename
+ok 10 - unsupported flag failure does not fall back to an ordinary rename
+  ---
+  duration_ms: 3.609792
+  type: 'test'
+  ...
+# {"case":"synthetic-unknown-errno-control-only","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-unknown-errno-T1ifCr","result":{"operation":"test-only-error-injection","result":"refused","errno":13,"errno_name":"OTHER","filesystem_result":false,"syscall_performed":false,"test_interposition":"before-renameatx_np-without-syscall"}}
+# Subtest: synthetic unknown-errno branch stops without treating injection as filesystem evidence
+ok 11 - synthetic unknown-errno branch stops without treating injection as filesystem evidence
+  ---
+  duration_ms: 2.915667
+  type: 'test'
+  ...
+# {"case":"helper-kill-before-syscall","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-helper-kill-before-QM3VXl","signal":"SIGKILL","source":{"dev":"16777233","ino":"264303941","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303942","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1oZWxwZXIta2lsbC1iZWZvcmUK"}}},"destination":"absent"}
+# Subtest: helper killed immediately before rename leaves the source and vacancy unchanged
+ok 12 - helper killed immediately before rename leaves the source and vacancy unchanged
+  ---
+  duration_ms: 2.529958
+  type: 'test'
+  ...
+# {"case":"helper-kill-after-syscall","classification":"receipt-unknown-preserve-and-stop","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/p1b-helper-kill-after-C2XdXX","signal":"SIGKILL","destination":{"dev":"16777233","ino":"264303945","mode":448,"type":"directory","children":{"payload.txt":{"dev":"16777233","ino":"264303946","mode":384,"type":"file","base64":"c3RhZ2VkIHBheWxvYWQgZm9yIHAxYi1oZWxwZXIta2lsbC1hZnRlcgo="}}}}
+# Subtest: helper killed after the real rename has an indeterminate receipt but placed bytes remain
+ok 13 - helper killed after the real rename has an indeterminate receipt but placed bytes remain
+  ---
+  duration_ms: 2.925292
+  type: 'test'
+  ...
+# {"kind":"file-parent","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/file-parent-0bilHF","source":{"dev":"16777233","ino":"264303860","mode":448,"isDirectory":true,"children":["payload.txt"]},"external":{"dev":"16777233","ino":"264303868","mode":489,"isDirectory":true,"children":[]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303868","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty destination (file-parent)
+ok 14 - RENAME_EXCL preserves a competing empty destination (file-parent)
+  ---
+  duration_ms: 7.825375
+  type: 'test'
+  ...
+# {"kind":"tree-target","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/tree-target-E1ODWD","source":{"dev":"16777233","ino":"264303870","mode":448,"isDirectory":true,"children":["payload.txt"]},"external":{"dev":"16777233","ino":"264303876","mode":489,"isDirectory":true,"children":[]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303876","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty destination (tree-target)
+ok 15 - RENAME_EXCL preserves a competing empty destination (tree-target)
+  ---
+  duration_ms: 6.250875
+  type: 'test'
+  ...
+# {"kind":"absent-sources-root","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/absent-sources-root-recXNx","source":{"dev":"16777233","ino":"264303878","mode":448,"isDirectory":true,"children":["payload.txt"]},"external":{"dev":"16777233","ino":"264303881","mode":489,"isDirectory":true,"children":[]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264303881","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty destination (absent-sources-root)
+ok 16 - RENAME_EXCL preserves a competing empty destination (absent-sources-root)
+  ---
+  duration_ms: 4.761417
+  type: 'test'
+  ...
+# {"kind":"normal-vacant","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/ignoredtmp/normal-vacant-arn6ZJ","source":{"dev":"16777233","ino":"264303885","mode":448,"isDirectory":true,"children":["payload.txt"]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"placed","errno":0,"source_dev":"16777233","source_ino":"264303885","destination_identity_preserved":true}}
+# Subtest: RENAME_EXCL moves a vacant staged tree without changing its inode or bytes
+ok 17 - RENAME_EXCL moves a vacant staged tree without changing its inode or bytes
+  ---
+  duration_ms: 4.497125
+  type: 'test'
+  ...
+# Subtest: malformed helper argv exits nonzero without changing staged source or vacant destination
+ok 18 - malformed helper argv exits nonzero without changing staged source or vacant destination
+  ---
+  duration_ms: 4.410625
+  type: 'test'
+  ...
+1..18
+# tests 18
+# suites 0
+# pass 18
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 134.66

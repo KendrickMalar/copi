@@ -1,6 +1,6 @@
 # P1a exclusive placement prototype
 
-This is an isolated proof under `native-proof/`; it is not product code and is not connected to the library, CLI, or package build. P1a covers the three empty-destination races and one vacant placement path; P1b adds selected collision, parent/source-name, flag, and helper-termination boundaries. P2 below is only an in-memory retain-and-stop model, not recovery or cleanup. This is not the full P1 matrix: real cross-volume `EXDEV`, unsupported writable filesystems, other OS/architecture combinations, and filesystem-backed P2 recovery/cleanup remain unverified.
+This is an isolated proof under `native-proof/`; it is not product code and is not connected to the library, CLI, or package build. P1a covers the three empty-destination races and one vacant placement path; P1b adds selected collision, parent/source-name, flag, and helper-termination boundaries. P2 includes the original in-memory retain-and-stop model plus a filesystem-backed crash/stop experiment; neither proves automatic recovery or cleanup. This is not the full P1 matrix: real cross-volume `EXDEV`, unsupported writable filesystems, other OS/architecture combinations, and power-loss durability remain unverified.
 
 ## Experiment
 
@@ -61,8 +61,21 @@ The helper was compiled on the current arm64 host with `/usr/bin/clang -std=c11 
 
 The P1 observed parent-path replacement, opened-parent movement outside root, and source-basename replacement remain **LIMITs, not passes**. P2 represents the resulting state and retains/stops; it does not move, repair, adopt, or clean up those objects.
 
-This model makes no claim of filesystem durability or actual recovery. Even a synthetic `catalog-after` success is not cleanup success: the journal, lock owner marker, held/current catalog, input, source, placed/staged object, and unknown bytes remain; subsequent retry/recovery use is blocked. Operators would need manual reconciliation and a separate approval before any cleanup/deletion. No cleanup method is supplied or proven here.
+This in-memory model makes no claim of filesystem durability or actual recovery. Even a synthetic `catalog-after` success is not cleanup success: the journal, lock owner marker, held/current catalog, input, source, placed/staged object, and unknown bytes remain; subsequent retry/recovery use is blocked. Operators would need manual reconciliation and a separate approval before any cleanup/deletion. No cleanup method is supplied or proven here.
 
-- `evidence/P2-recovery-red.log` / `.exit`: initial missing-module contract RED (1 assertion failure; expected; exit 1).
+## P2 real-filesystem retain-and-stop experiment
+
+`recovery-filesystem-driver.mjs` and `recovery-filesystem.test.mjs` add isolated fixtures below ignored `native-proof/ignoredtmp/`; neither changes product journal/schema or invokes the native placement helper. The driver creates and fsyncs actual input, journal, owner, stage, catalog, source, and unknown-byte files/directories. For each of the six stage/placement/catalog checkpoints and both receipt states, a separate Node child is killed with `SIGKILL`; a second fresh process snapshots the on-disk tree with `lstat`/reads, invokes the existing pure `decideRecovery()` stop API, and attempts every forbidden next operation. The durable receipt is a file whose contents and parent directory were fsynced before the child was killed.
+
+The filesystem cases perform same-inode writes, same-bytes/new-inode rename-and-hold swaps, unknown next/old/displaced/child additions, and parent/ancestor/source moves to held locations (including a parent outside the synthetic root). Before/after snapshots include dev/inode/mode, hashes, and sorted child names for both the synthetic root and held/outside tree. These pre-stop P1 LIMIT states are not repaired; evidence proves only that the P2 decision adds no further mutation. A matching stage mode/hash without a receipt still refuses adoption. A receipt and catalog-after state retain the lock, journal, owner marker, held/current catalogs, source, placed object, input, and unknown bytes; cleanup and later automatic operations remain refused pending manual reconciliation and separate approval.
+
+This is a same-host process-kill experiment, not a power-loss, storage-controller, cross-volume, or product recovery proof. `fsync` plus post-`SIGKILL` visibility does not establish physical-media durability across power failure. The result remains **safe-stop only**, not proof that recovery or cleanup succeeds. Raw fixture bytes are never included in the new P2 filesystem logs; only hashes and filesystem metadata are emitted.
+
+- `evidence/P2-recovery-red.log` / `.exit`: original in-memory model missing-module contract RED (1 assertion failure; expected; exit 1).
 - `evidence/P2-recovery-green.log` / `.exit`: Node 22.23.3 `node --test native-proof/recovery.test.mjs` (36 tests, 36 pass, 0 fail, 0 skipped; exit 0).
-- `evidence/P2-p1-regression.log` / `.exit`: Node 22.23.3 P1 placement and boundary regression (18 tests, 18 pass, 0 fail, 0 skipped; exit 0). This confirms P1 tests still run; its explicit namespace/source LIMIT cases remain unresolved.
+- `evidence/P2-filesystem-red.log` / `.exit`: new real-filesystem test RED before driver implementation (1 expected assertion failure; exit 1).
+- `evidence/P2-filesystem-verify.log` / `.exit`: final Node 22.23.3 `node --test native-proof/recovery-filesystem.test.mjs` (24 tests, 24 pass, 0 fail, 0 skipped; exit 0); full per-case hashed filesystem snapshots and decisions are retained in the log.
+- `evidence/P2-filesystem-inmemory-verify.log` / `.exit`: unchanged original in-memory suite rerun (36 tests, 36 pass, 0 fail, 0 skipped; exit 0).
+- `evidence/P2-filesystem-p1-verify.log` / `.exit`: P1 placement and boundary regression rerun (18 tests, 18 pass, 0 fail, 0 skipped; exit 0). Its explicit namespace/source LIMIT cases remain unresolved.
+- `evidence/P2-filesystem-green.log` (11 pass / 13 fail) and `P2-filesystem-green-2.log` (19 pass / 5 fail), with `.exit` files, preserve intermediate implementation/test defects; `green-3` and `final` preserve later runs. Trailing horizontal whitespace only was removed from the first two TAP logs; assertion details, test IDs, and counts are unchanged (`P2-filesystem-log-normalize.log` records the normalization). None were replaced by the latest passing evidence.
+- `evidence/P2-filesystem-static-check.log` / `.exit`: Node 22 syntax checks, tracked diff whitespace check, and whitespace scan of the new source files (exit 0).
