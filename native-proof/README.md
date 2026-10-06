@@ -1,6 +1,6 @@
 # P1a exclusive placement prototype
 
-This is a macOS-only, isolated proof under `native-proof/`; it is not product code and is not connected to the library, CLI, or package build. P1a covers the three empty-destination races and one vacant placement path; P1b adds selected collision, parent/source-name, flag, and helper-termination boundaries. This is not the full P1 matrix: real cross-volume `EXDEV`, unsupported writable filesystems, other OS/architecture combinations, and all P2 recovery/cleanup work remain out of scope.
+This is an isolated proof under `native-proof/`; it is not product code and is not connected to the library, CLI, or package build. P1a covers the three empty-destination races and one vacant placement path; P1b adds selected collision, parent/source-name, flag, and helper-termination boundaries. P2 below is only an in-memory retain-and-stop model, not recovery or cleanup. This is not the full P1 matrix: real cross-volume `EXDEV`, unsupported writable filesystems, other OS/architecture combinations, and filesystem-backed P2 recovery/cleanup remain unverified.
 
 ## Experiment
 
@@ -23,7 +23,7 @@ The vacant case verifies successful placement preserves staged-directory dev/ino
 - `evidence/placement-compile.log` / `.exit` and `placement-build-info.txt`: compiler invocation and target details.
 - `evidence/placement-green.log` / `.exit`: three deterministic `RENAME_EXCL` collision refusals, vacant placement, and malformed argv (5 tests, 5 pass, 0 fail, 0 skipped; exit 0), with per-case inode/mode evidence.
 
-The race is a deterministic synthetic interposition inside the helper, not a scheduler-stress test with a second process. The artifacts deliberately remain under `native-proof/tmp/` and are ignored by Git; the external competitor and staged source are not cleaned by the tests.
+The race is a deterministic synthetic interposition inside the helper, not a scheduler-stress test with a second process. Historical P1 artifacts remain under ignored `native-proof/tmp/`; later P1 regression roots use ignored `native-proof/ignoredtmp/`. The external competitor and staged source are not cleaned by the tests.
 
 ## Guarantee limits
 
@@ -52,3 +52,17 @@ The race is a deterministic synthetic interposition inside the helper, not a sch
 The current synthetic volume advertised a valid `VOL_CAP_INT_RENAME_EXCL` capability and the real collision calls returned `EEXIST`. This says nothing about another volume or filesystem. Ancestor-symlink rejection does not prove an opened directory cannot be moved concurrently. The two parent-movement tests are explicit counterexamples to treating dirfds as namespace confinement. Source-name replacement likewise remains outside the syscall's conditional guarantees. No automatic adopt, delete, or cleanup policy is proved here.
 
 The helper was compiled on the current arm64 host with `/usr/bin/clang -std=c11 -Wall -Wextra -Werror -O2 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -mmacosx-version-min=10.12`. The observed SDK is 26.2 and the host is Darwin 27.0 arm64. This records the compile target only: x64 was not built/tested, no older runtime was tested, and the minimum supported macOS version is **unconfirmed** despite the compile-time deployment-target flag. Other OS releases, volumes, and unsupported-capability behavior remain unverified.
+
+## P2 retain-and-stop model (synthetic only)
+
+`recovery-prototype.mjs` is deliberately a pure decision model. It creates in-memory fixtures and does not call filesystem operations. `recovery.test.mjs` models crashes before/after stage creation, immediately before/after exclusive placement, and before/after catalog switch. For each point it runs with receipt absent and present. Perturbations include same-inode byte edits, same-bytes/new-inode replacement, unknown `next`/`old`/`displaced` entries, unknown raw children, parent and ancestor identity replacement, an already-outside-root opened parent, and a replaced source basename.
+
+`decideRecovery()` always returns `status: "stopped"`, a receipt-specific reason, abstract `retainedPaths`, `manualReview`, and an empty `automaticActions` list. A missing receipt remains owner-unknown even when the synthetic observed mode/hash match the expected stage. A present receipt does not authorize cleanup: the P1 source-name syscall is not conditional on source inode, and opened dirfds do not confine concurrent namespace movement. `authorizeNextOperation()` refuses retry-placement, cleanup, rollback, adopt, move, delete, catalog-switch, and any other attempted operation. The decision and every refused next operation are checked against full synthetic snapshots containing bytes hashes, dev/inode, modes, and directory child lists; the logs emit hashes/metadata, never fixture raw bytes.
+
+The P1 observed parent-path replacement, opened-parent movement outside root, and source-basename replacement remain **LIMITs, not passes**. P2 represents the resulting state and retains/stops; it does not move, repair, adopt, or clean up those objects.
+
+This model makes no claim of filesystem durability or actual recovery. Even a synthetic `catalog-after` success is not cleanup success: the journal, lock owner marker, held/current catalog, input, source, placed/staged object, and unknown bytes remain; subsequent retry/recovery use is blocked. Operators would need manual reconciliation and a separate approval before any cleanup/deletion. No cleanup method is supplied or proven here.
+
+- `evidence/P2-recovery-red.log` / `.exit`: initial missing-module contract RED (1 assertion failure; expected; exit 1).
+- `evidence/P2-recovery-green.log` / `.exit`: Node 22.23.3 `node --test native-proof/recovery.test.mjs` (36 tests, 36 pass, 0 fail, 0 skipped; exit 0).
+- `evidence/P2-p1-regression.log` / `.exit`: Node 22.23.3 P1 placement and boundary regression (18 tests, 18 pass, 0 fail, 0 skipped; exit 0). This confirms P1 tests still run; its explicit namespace/source LIMIT cases remain unresolved.

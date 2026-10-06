@@ -1,4 +1,5 @@
 /placement-helper
 /tmp/
+/ignoredtmp/
 /coder/
 *.tmp.log

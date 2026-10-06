@@ -1,0 +1,30 @@
+TAP version 13
+# Subtest: P2 pure-stop recovery module contract exists
+not ok 1 - P2 pure-stop recovery module contract exists
+  ---
+  duration_ms: 0.68
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/recovery.test.mjs:12:3'
+  failureType: 'testCodeFailure'
+  error: 'recovery-prototype.mjs is not implemented'
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: ~
+  operator: '=='
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/recovery.test.mjs:13:12)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.start (node:internal/test_runner/test:944:17)
+    startSubtestAfterBootstrap (node:internal/test_runner/harness:296:17)
+  ...
+1..1
+# tests 1
+# suites 0
+# pass 0
+# fail 1
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 75.275875

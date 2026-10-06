@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const proofDir = dirname(fileURLToPath(import.meta.url));
-export const scratchDir = join(proofDir, "tmp");
+export const scratchDir = join(proofDir, "ignoredtmp");
 export const payloadName = "payload.txt";
 
 export async function makePlacementFixture(kind) {
