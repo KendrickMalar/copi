@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { lstatSync, mkdirSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createRequire, syncBuiltinESMExports } from "node:module";
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageFile } from "../src/storage-transaction.ts";
 import { readSourceContent } from "../src/source-content.ts";
 import type { Catalog, SavedItem } from "../src/types.ts";
+
+const childProcess = createRequire(import.meta.url)("node:child_process") as { spawn: typeof spawn };
+const testDirectory = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.basename(path.dirname(testDirectory)) === "dist" ? path.dirname(path.dirname(testDirectory)) : path.dirname(testDirectory);
+const nativeHelperPath = path.join(projectRoot, "dist", "native", "rename-exclusive-arm64");
 
 const digest = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
 
@@ -119,6 +127,13 @@ async function stopAt(child: ChildProcessWithoutNullStreams): Promise<void> {
 
 async function recover(libraryDir: string): Promise<void> {
   await new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {});
+}
+
+function errorContainsCode(error: unknown, code: string): boolean {
+  if (!(error instanceof Error)) return false;
+  if (Reflect.get(error, "code") === code) return true;
+  if (error instanceof AggregateError && [...error.errors].some((entry) => errorContainsCode(entry, code))) return true;
+  return error.cause !== undefined && errorContainsCode(error.cause, code);
 }
 
 test("first v2 file item stores only reviewed bytes under a private UUID parent and preserves descriptor mode", async (t) => {
@@ -259,6 +274,88 @@ test("a target added externally after review is preserved and prevents catalog c
   assert.deepEqual(await readFile(target), external);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), { version: 2, items: [], groups: [] });
   assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction")));
+});
+
+test("native exclusive placement preserves a competing empty destination for new sources root, file parent, and tree target", async (t) => {
+  const cases = ["new-sources-root", "file-parent", "tree-target"] as const;
+  for (const raceCase of cases) {
+    await t.test(raceCase, async (subtest) => {
+      const box = await fixture(subtest, { version: 2, items: [], groups: [] }, raceCase !== "new-sources-root");
+      const { item, files } = raceCase === "tree-target" ? newTree("NativeRace") : newFile("NativeRace");
+      const sourcesRoot = path.join(box.libraryDir, "sources");
+      const racedPath = raceCase === "new-sources-root" ? sourcesRoot : path.join(sourcesRoot, item.id);
+      const initialCatalog = await readFile(path.join(box.libraryDir, "catalog.json"));
+      const initialSources = raceCase === "new-sources-root" ? undefined : await lstat(sourcesRoot, { bigint: true });
+      let injectedIdentity: string | undefined;
+      let injected = false;
+      const originalSpawn = childProcess.spawn;
+      const interceptedSpawn = (...args: Parameters<typeof spawn>): ReturnType<typeof spawn> => {
+        const [command, helperArgs] = args;
+        if (!injected && path.resolve(command) === nativeHelperPath && helperArgs?.includes("--protocol-version")) {
+          mkdirSync(racedPath, { mode: 0o700 });
+          const external = lstatSync(racedPath, { bigint: true });
+          injectedIdentity = `${external.dev}:${external.ino}`;
+          injected = true;
+        }
+        return Reflect.apply(originalSpawn, childProcess, args) as ReturnType<typeof spawn>;
+      };
+      childProcess.spawn = interceptedSpawn as unknown as typeof spawn;
+      syncBuiltinESMExports();
+      let failure: unknown;
+      try {
+        await commitNewItem(box.libraryDir, item, files);
+      } catch (error) {
+        failure = error;
+      } finally {
+        childProcess.spawn = originalSpawn;
+        syncBuiltinESMExports();
+      }
+
+      assert.ok(failure instanceof Error, "exclusive native placement must reject the competing empty directory");
+      assert.ok(injected, "the external directory must be created immediately before the real packaged helper runs");
+      assert.ok(errorContainsCode(failure, "destination-exists"), "the real helper must report kernel EEXIST");
+      const externalAfter = await lstat(racedPath, { bigint: true });
+      assert.equal(`${externalAfter.dev}:${externalAfter.ino}`, injectedIdentity);
+      assert.deepEqual(await readdir(racedPath), []);
+      assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), initialCatalog);
+      assert.ok(await lstat(path.join(box.libraryDir, ".copi-transaction", "journal.json")));
+
+      if (initialSources) {
+        const afterSources = await lstat(sourcesRoot, { bigint: true });
+        assert.equal(`${afterSources.dev}:${afterSources.ino}`, `${initialSources.dev}:${initialSources.ino}`);
+      }
+      const stageRoot = path.join(box.libraryDir, ".copi-transaction", raceCase === "new-sources-root" ? "next-sources" : "next-0");
+      const stagedFile = path.join(stageRoot, raceCase === "new-sources-root" ? item.id : "", files[0]!.path);
+      assert.deepEqual(await readFile(stagedFile), files[0]!.bytes);
+      if (raceCase === "tree-target") assert.deepEqual(await readFile(path.join(stageRoot, "docs", "guide.md")), files[1]!.bytes);
+    });
+  }
+});
+
+test("new source writes reject unsupported architecture without changing catalog or live sources", async (t) => {
+  const box = await fixture(t, { version: 2, items: [], groups: [] }, true);
+  const { item, files } = newFile("UnsupportedArchitecture");
+  const catalog = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const sources = await lstat(path.join(box.libraryDir, "sources"), { bigint: true });
+  const originalArch = Object.getOwnPropertyDescriptor(process, "arch");
+  Object.defineProperty(process, "arch", { configurable: true, value: "x64" });
+  let failure: unknown;
+  try {
+    await commitNewItem(box.libraryDir, item, files);
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (originalArch === undefined) Reflect.deleteProperty(process, "arch");
+    else Object.defineProperty(process, "arch", originalArch);
+  }
+
+  assert.ok(failure instanceof Error);
+  assert.ok(errorContainsCode(failure, "unsupported-platform"));
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalog);
+  const sourcesAfter = await lstat(path.join(box.libraryDir, "sources"), { bigint: true });
+  assert.equal(`${sourcesAfter.dev}:${sourcesAfter.ino}`, `${sources.dev}:${sources.ino}`);
+  assert.deepEqual(await readdir(path.join(box.libraryDir, "sources")), []);
+  await assert.rejects(lstat(path.join(box.libraryDir, ...item.content.path.split("/"))), { code: "ENOENT" });
 });
 
 test("raw sensitive new content requires exact opaque individual approval", async (t) => {

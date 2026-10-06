@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
 import { readSourceContent } from "./source-content.ts";
 import { parseStorageJournal, validateSourcesJournalTargets, type SourcesStorageJournal } from "./storage-journal.ts";
+import { renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { Catalog, InspectionWarning, SavedItem } from "./types.ts";
@@ -190,6 +191,23 @@ async function checkedSourceTreeTarget(root: string, target: string, allowMissin
   if (!stat && allowMissing) return undefined;
   if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Registered sources content root must be a regular non-symlink directory.");
   return absolute;
+}
+
+async function renameNewSourcesStageExclusive(libraryDir: string, stagePath: string, targetPath: string): Promise<void> {
+  const [stage, parent] = await Promise.all([
+    lstat(stagePath, { bigint: true }),
+    lstat(path.dirname(targetPath), { bigint: true }),
+  ]);
+  if (!stage.isDirectory() || stage.isSymbolicLink() || !parent.isDirectory() || parent.isSymbolicLink()) {
+    throw new Error("New source placement requires a checked private stage and target parent directory.");
+  }
+  await renameExclusiveReviewedSource({
+    libraryDir,
+    stagePath,
+    targetPath,
+    expectedStage: { dev: stage.dev.toString(), ino: stage.ino.toString() },
+    expectedParent: { dev: parent.dev.toString(), ino: parent.ino.toString() },
+  });
 }
 
 async function assertNoExcludedTreeNodes(root: string): Promise<void> {
@@ -1160,7 +1178,7 @@ export class StorageSession {
           const stagedPath = directory.path === "sources" ? nextSourcesStage : path.join(nextSourcesStage, ...directory.path.slice("sources/".length).split("/"));
           await verifyOwnedDirectory(stagedPath, directory);
         }
-        await rename(nextSourcesStage, sourcesRoot);
+        await renameNewSourcesStageExclusive(this.root, nextSourcesStage, sourcesRoot);
         for (const directory of ownedDirectories) {
           const livePath = path.join(this.root, ...directory.path.split("/"));
           await verifyOwnedDirectory(livePath, directory);
@@ -1181,11 +1199,11 @@ export class StorageSession {
             if (!directory) throw new Error("New file target has no journaled private parent directory.");
             await verifyOwnedDirectory(stage, directory);
             if (await sourceArtifactTreeIfPresent(path.join(stage, path.posix.basename(operation.target)), "file") !== operation.newTree) throw new Error("Private new file stage changed before installation.");
-            await rename(stage, targetParent);
+            await renameNewSourcesStageExclusive(this.root, stage, targetParent);
             await verifyOwnedDirectory(targetParent, directory);
           } else {
             if (await sourceArtifactTreeIfPresent(stage, "tree") !== operation.newTree) throw new Error("Private new tree stage changed before installation.");
-            await rename(stage, target);
+            await renameNewSourcesStageExclusive(this.root, stage, target);
           }
           const installed = await checkedSourcesOperationTarget(this.root, operation);
           if (!installed || await sourceArtifactTreeIfPresent(installed, operation.kind) !== operation.newTree) throw new Error("New sources target changed during its installation.");
