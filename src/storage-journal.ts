@@ -23,7 +23,18 @@ export interface SourcesStorageJournal {
   operations: { itemId: string; target: string; kind: "file" | "tree"; oldTree: string | null; newTree: string }[];
 }
 
-export type StorageJournal = LegacyStorageJournal | SourcesStorageJournal;
+export interface CatalogOnlyStorageJournal {
+  version: 3;
+  mode: "catalog-only";
+  root: string;
+  token: string;
+  oldCatalog: string | null;
+  newCatalog: string;
+  stableSourcesTree: string;
+  operations: [];
+}
+
+export type StorageJournal = LegacyStorageJournal | SourcesStorageJournal | CatalogOnlyStorageJournal;
 
 const itemPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const sha256Pattern = /^[0-9a-f]{64}$/;
@@ -101,7 +112,32 @@ function assertNoTargetOverlap(targets: readonly string[]): void {
 }
 
 export function parseStorageJournal(value: unknown, expected: { root: string; token: string }): StorageJournal {
-  if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) throw new Error("Unsupported or invalid storage journal version.");
+  if (!isRecord(value) ||
+      (value.version !== 1 && value.version !== 2 && value.version !== 3)) {
+    throw new Error("Unsupported or invalid storage journal version.");
+  }
+  if (value.version === 3) {
+    const catalogOnlyKeys = [
+      "version", "mode", "root", "token", "oldCatalog", "newCatalog", "stableSourcesTree", "operations",
+    ];
+    if (!hasExactKeys(value, catalogOnlyKeys) || value.mode !== "catalog-only") {
+      throw new Error("Invalid catalog-only v3 storage journal object.");
+    }
+    assertCommonJournal(value, expected);
+    if (!isStableSourcesCommitment(value.stableSourcesTree) || value.operations.length !== 0) {
+      throw new Error("Invalid catalog-only v3 tree commitment or operations.");
+    }
+    return {
+      version: 3,
+      mode: "catalog-only",
+      root: value.root,
+      token: value.token,
+      oldCatalog: value.oldCatalog,
+      newCatalog: value.newCatalog,
+      stableSourcesTree: value.stableSourcesTree,
+      operations: [],
+    };
+  }
   const commonKeys = ["version", "root", "token", "oldCatalog", "newCatalog", "operations"];
   const hasAdditionMetadata = Object.hasOwn(value, "stableSourcesTreeNext") || Object.hasOwn(value, "nextSourcesTree") || Object.hasOwn(value, "ownedDirectories");
   const completeAdditionMetadata = ["stableSourcesTreeNext", "nextSourcesTree", "ownedDirectories"].every((key) => Object.hasOwn(value, key));
