@@ -17,6 +17,9 @@ export interface SourcesStorageJournal {
   oldCatalog: string | null;
   newCatalog: string;
   stableSourcesTree: string;
+  stableSourcesTreeNext?: string;
+  nextSourcesTree?: string;
+  ownedDirectories?: { path: string; stage: string; dev: number; ino: number }[];
   operations: { itemId: string; target: string; kind: "file" | "tree"; oldTree: string | null; newTree: string }[];
 }
 
@@ -44,6 +47,10 @@ function isSha256(value: unknown): value is string {
 
 function isOptionalSha256(value: unknown): value is string | null {
   return value === null || isSha256(value);
+}
+
+function isStableSourcesCommitment(value: unknown): value is string {
+  return value === "absent" || isSha256(value);
 }
 
 function isSafeSourcesTarget(value: string): boolean {
@@ -96,8 +103,10 @@ function assertNoTargetOverlap(targets: readonly string[]): void {
 export function parseStorageJournal(value: unknown, expected: { root: string; token: string }): StorageJournal {
   if (!isRecord(value) || (value.version !== 1 && value.version !== 2)) throw new Error("Unsupported or invalid storage journal version.");
   const commonKeys = ["version", "root", "token", "oldCatalog", "newCatalog", "operations"];
-  const expectedKeys = value.version === 1 ? commonKeys : [...commonKeys, "stableSourcesTree"];
-  if (!hasExactKeys(value, expectedKeys)) throw new Error("Invalid storage journal object.");
+  const hasAdditionMetadata = Object.hasOwn(value, "stableSourcesTreeNext") || Object.hasOwn(value, "nextSourcesTree") || Object.hasOwn(value, "ownedDirectories");
+  const completeAdditionMetadata = ["stableSourcesTreeNext", "nextSourcesTree", "ownedDirectories"].every((key) => Object.hasOwn(value, key));
+  const expectedKeys = value.version === 1 ? commonKeys : [...commonKeys, "stableSourcesTree", ...(hasAdditionMetadata ? ["stableSourcesTreeNext", "nextSourcesTree", "ownedDirectories"] : [])];
+  if (!hasExactKeys(value, expectedKeys) || (hasAdditionMetadata && !completeAdditionMetadata)) throw new Error("Invalid storage journal object.");
   assertCommonJournal(value, expected);
 
   if (value.version === 1) {
@@ -123,7 +132,7 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
     };
   }
 
-  if (!isSha256(value.stableSourcesTree)) throw new Error("Invalid stable sources tree commitment in v2 storage journal.");
+  if (!isStableSourcesCommitment(value.stableSourcesTree)) throw new Error("Invalid stable sources tree commitment in v2 storage journal.");
   const operations: SourcesStorageJournal["operations"] = [];
   for (const valueOperation of value.operations) {
     if (!isRecord(valueOperation) || !hasExactKeys(valueOperation, ["itemId", "target", "kind", "oldTree", "newTree"])) {
@@ -145,6 +154,59 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
   }
   assertUniqueItemIds(operations.map((operation) => operation.itemId));
   assertNoTargetOverlap(operations.map((operation) => operation.target));
+  const hasNewTargets = operations.some((operation) => operation.oldTree === null);
+  if (hasAdditionMetadata !== hasNewTargets || (hasNewTargets && operations.some((operation) => operation.oldTree !== null))) {
+    throw new Error("V2 new-target journal metadata does not match its operations.");
+  }
+  if (!hasAdditionMetadata) {
+    if (value.stableSourcesTree === "absent") throw new Error("Legacy v2 journal cannot start from an absent sources root.");
+    return {
+      version: 2,
+      root: value.root,
+      token: value.token,
+      oldCatalog: value.oldCatalog,
+      newCatalog: value.newCatalog,
+      stableSourcesTree: value.stableSourcesTree,
+      operations,
+    };
+  }
+  if (!isSha256(value.stableSourcesTreeNext) || !isSha256(value.nextSourcesTree) || !Array.isArray(value.ownedDirectories)) {
+    throw new Error("Invalid v2 new-target tree or directory ownership commitment.");
+  }
+  const ownedDirectories: SourcesStorageJournal["ownedDirectories"] = [];
+  const ownedPaths = new Set<string>();
+  for (const entry of value.ownedDirectories) {
+    if (!isRecord(entry) || !hasExactKeys(entry, ["path", "stage", "dev", "ino"]) ||
+        typeof entry.path !== "string" || (entry.path !== "sources" && !isSafeSourcesTarget(entry.path)) ||
+        typeof entry.stage !== "string" || !/^next-(?:sources|(?:0|[1-9][0-9]*))$/.test(entry.stage) ||
+        typeof entry.dev !== "number" || !Number.isSafeInteger(entry.dev) || entry.dev < 0 ||
+        typeof entry.ino !== "number" || !Number.isSafeInteger(entry.ino) || entry.ino < 0 || ownedPaths.has(entry.path)) {
+      throw new Error("Invalid or duplicate v2 owned source directory identity.");
+    }
+    const stageIndex = entry.stage === "next-sources" ? undefined : Number(entry.stage.slice("next-".length));
+    if (entry.path === "sources") {
+      if (entry.stage !== "next-sources" || value.stableSourcesTree !== "absent") throw new Error("New sources root ownership must come from its private stage when the root was absent.");
+    } else {
+      const match = /^sources\/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(entry.path);
+      const operationIndex = match ? operations.findIndex((operation) => operation.itemId === match[1]) : -1;
+      const operation = operations[operationIndex];
+      if (!match || !operation || operation.oldTree !== null || operation.kind !== "file" ||
+          (entry.stage !== "next-sources" && (stageIndex !== operationIndex || entry.stage !== `next-${operationIndex}`))) {
+        throw new Error("Owned source directory is not bound to a new file item operation.");
+      }
+    }
+    ownedPaths.add(entry.path);
+    ownedDirectories.push({ path: entry.path, stage: entry.stage, dev: entry.dev, ino: entry.ino });
+  }
+  if (value.stableSourcesTree === "absent" && !ownedPaths.has("sources")) {
+    throw new Error("Absent v2 sources root has no recorded private creation stage.");
+  }
+  for (const [index, operation] of operations.entries()) {
+    if (operation.kind !== "file") continue;
+    const parent = ownedDirectories.find((directory) => directory.path === `sources/${operation.itemId}`);
+    const expectedStage = value.stableSourcesTree === "absent" ? "next-sources" : `next-${index}`;
+    if (!parent || parent.stage !== expectedStage) throw new Error("New file operation is missing its exact private parent-directory custody record.");
+  }
   return {
     version: 2,
     root: value.root,
@@ -152,6 +214,9 @@ export function parseStorageJournal(value: unknown, expected: { root: string; to
     oldCatalog: value.oldCatalog,
     newCatalog: value.newCatalog,
     stableSourcesTree: value.stableSourcesTree,
+    stableSourcesTreeNext: value.stableSourcesTreeNext,
+    nextSourcesTree: value.nextSourcesTree,
+    ownedDirectories,
     operations,
   };
 }
