@@ -1,0 +1,8 @@
+command=/usr/bin/clang -std=c11 -Wall -Wextra -Werror -O2 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk -mmacosx-version-min=10.12 native-proof/rename-exclusive.c -o native-proof/placement-helper
+target=arm64-apple-darwin27.0.0
+minimum_macos=10.12
+clang=Apple clang version 17.0.0 (clang-1700.6.3.2)
+sdk_path=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+sdk_version=26.2
+arch=arm64
+os=27.0
