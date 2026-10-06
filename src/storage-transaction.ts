@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +22,10 @@ declare const storageReviewBrand: unique symbol;
 export interface StorageReview { readonly [storageReviewBrand]: true; readonly reviewId: string }
 export interface StorageReviewView { readonly sensitivePaths: readonly string[]; readonly warnings: readonly InspectionWarning[] }
 export interface StorageAuthorization { readonly review: StorageReview; readonly approval: { readonly reviewId: string; readonly confirmed: boolean; readonly approvedSensitivePaths: readonly string[] } }
-interface ReviewState { catalog: Buffer; replacements: StorageReplacement[]; sensitivePaths: string[]; warnings: InspectionWarning[] }
+interface BeforeReviewedFile { path: string; bytes: Buffer; mode: number; dev: string; ino: string }
+interface BeforeReviewedItem { itemId: string; files: BeforeReviewedFile[] }
+interface SourcesBeforeReview { root: string; expected: StorageRevision; items: BeforeReviewedItem[]; used: boolean }
+interface ReviewState { catalog: Buffer; replacements: StorageReplacement[]; sensitivePaths: string[]; warnings: InspectionWarning[]; before?: SourcesBeforeReview }
 const reviews = new WeakMap<StorageReview, ReviewState>();
 interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: string; mode: number; dev?: number; ino?: number }
 export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly catalogIdentity: string | null; readonly format: "v1" | "v2"; readonly tree: string }
@@ -80,6 +84,80 @@ export function readStorageReview(review: StorageReview): StorageReviewView {
   const state = reviews.get(review);
   if (!state) throw new Error("Invalid prepared storage review token.");
   return { sensitivePaths: [...state.sensitivePaths], warnings: structuredClone(state.warnings) };
+}
+function omittedSourcePaths(state: ReviewState, previous: Catalog, next: Catalog): string[] {
+  const replacementIds = new Set(state.replacements.map((replacement) => replacement.itemId));
+  const nextById = new Map(next.items.map((item) => [item.id, item]));
+  const omitted = new Set<string>();
+  for (const oldItem of previous.items) {
+    if (!replacementIds.has(oldItem.id)) continue;
+    const nextItem = nextById.get(oldItem.id);
+    const nextPaths = new Set(nextItem?.files.map((file) => file.path) ?? []);
+    for (const file of oldItem.files) if (!nextPaths.has(file.path)) omitted.add(`${oldItem.id}/${file.path}`);
+    for (const item of state.before?.items ?? []) {
+      if (item.itemId !== oldItem.id) continue;
+      for (const file of item.files) if (!nextPaths.has(file.path)) omitted.add(`${oldItem.id}/${file.path}`);
+    }
+  }
+  return [...omitted].sort();
+}
+function sameBeforeFiles(left: readonly BeforeReviewedFile[], right: readonly BeforeReviewedFile[]): boolean {
+  return left.length === right.length && left.every((file, index) => {
+    const other = right[index];
+    return other !== undefined && file.path === other.path && file.mode === other.mode && file.dev === other.dev &&
+      file.ino === other.ino && file.bytes.equals(other.bytes);
+  });
+}
+function withinPath(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+}
+async function captureSourcesBefore(root: string, item: SavedItem): Promise<BeforeReviewedItem> {
+  if (item.content.kind === "tree") {
+    const target = await checkedSourceTreeTarget(root, item.content.path);
+    if (!target) throw new Error("Registered sources tree disappeared before the before-review capture.");
+    await assertNoExcludedTreeNodes(target);
+    await assertNoEmptySourceDirectories(target);
+  }
+  const visible = await readSourceContent(root, item);
+  const canonicalRoot = await realpath(root);
+  const files: BeforeReviewedFile[] = [];
+  for (const entry of visible) {
+    const target = item.content.kind === "file"
+      ? path.join(root, ...item.content.path.split("/"))
+      : path.join(root, ...item.content.path.split("/"), ...entry.path.split("/"));
+    const canonical = await realpath(target);
+    if (!withinPath(canonicalRoot, canonical)) throw new Error("Before-review source resolves outside the library.");
+    const before = await lstat(target, { bigint: true });
+    if (!before.isFile() || before.isSymbolicLink()) throw new Error("Before-review source is not a regular file.");
+    const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const opened = await handle.stat({ bigint: true });
+      const sameOpenedFile = (left: typeof before, right: typeof before): boolean => left.dev === right.dev && left.ino === right.ino &&
+        left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs && left.mode === right.mode;
+      if (!opened.isFile() || !sameOpenedFile(before, opened)) throw new Error("Before-review source changed while being opened.");
+      const bytes = await handle.readFile();
+      const [afterHandle, after, canonicalAfter] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true }), realpath(target)]);
+      if (!after.isFile() || after.isSymbolicLink() || canonicalAfter !== canonical || !sameOpenedFile(opened, afterHandle) ||
+          !sameOpenedFile(opened, after) || hash(bytes) !== hash(entry.bytes)) {
+        throw new Error("Before-review source changed while being captured.");
+      }
+      files.push({ path: entry.path, bytes: Buffer.from(bytes), mode: Number(opened.mode & 0o777n), dev: opened.dev.toString(), ino: opened.ino.toString() });
+    } finally { await handle.close(); }
+  }
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  return { itemId: item.id, files };
+}
+async function assertBeforeReviewCurrent(root: string, expected: StorageRevision, before: SourcesBeforeReview): Promise<void> {
+  if (before.root !== root || JSON.stringify(before.expected) !== JSON.stringify(expected)) throw new Error("Before-review token belongs to another root or expected revision.");
+  const previous = expected.catalog === null ? { version: 2 as const, items: [], groups: [] } : parseStoredCatalog(JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown);
+  if (previous.version !== 2) throw new Error("Before-review requires a v2 sources catalog.");
+  for (const item of before.items) {
+    const oldItem = previous.items.find((entry) => entry.id === item.itemId);
+    if (!oldItem) throw new Error("Before-review token refers to a foreign source item.");
+    const current = await captureSourcesBefore(root, oldItem);
+    if (!sameBeforeFiles(item.files, current.files)) throw new Error("Before-reviewed source bytes, mode, identity or paths changed; refusing deletion.");
+  }
 }
 function approvedStorage(catalog: Buffer, replacements: readonly StorageReplacement[], authorization?: StorageAuthorization): ReviewState {
   const review = authorization?.review ?? prepareStorageReview(catalog, replacements);
@@ -226,6 +304,22 @@ async function assertNoExcludedTreeNodes(root: string): Promise<void> {
   }
   await visit(root, "");
 }
+async function assertNoEmptySourceDirectories(root: string): Promise<void> {
+  async function visit(directory: string): Promise<boolean> {
+    let containsFile = false;
+    for (const name of await readdir(directory)) {
+      const child = path.join(directory, name);
+      const stat = await lstat(child);
+      if (stat.isDirectory() && !stat.isSymbolicLink()) {
+        if (!await visit(child)) throw new Error("Empty sources directories are not represented in file review; refusing replacement.");
+        containsFile = true;
+      } else if (stat.isFile() && !stat.isSymbolicLink()) containsFile = true;
+      else throw new Error("Sources tree contains an unsupported node; refusing replacement.");
+    }
+    return containsFile;
+  }
+  await visit(root);
+}
 
 async function assertNewSourcesTargetVacant(root: string, item: SavedItem): Promise<void> {
   const sourcesRoot = path.join(root, "sources");
@@ -257,7 +351,7 @@ function validateNewItemDescriptors(item: SavedItem, replacement: StorageReplace
   }
 }
 
-async function validateSourcesTransition(root: string, previous: Catalog, next: Catalog, replacements: readonly StorageReplacement[]): Promise<SourcesOperation[]> {
+async function validateSourcesTransition(root: string, previous: Catalog, next: Catalog, replacements: readonly StorageReplacement[], before?: SourcesBeforeReview): Promise<SourcesOperation[]> {
   validateMutationNames(previous, next, replacements);
   if (next.items.length < previous.items.length || next.groups.length !== previous.groups.length) {
     throw new Error("A sources transaction cannot remove items or create groups.");
@@ -331,11 +425,13 @@ async function validateSourcesTransition(root: string, previous: Catalog, next: 
     const targetPath = await checkedSourceTreeTarget(root, target);
     if (!targetPath) throw new Error("Registered sources tree root disappeared before staging.");
     await assertNoExcludedTreeNodes(targetPath);
+    await assertNoEmptySourceDirectories(targetPath);
     const currentFiles = await readSourceContent(root, oldItem);
     if (!currentFiles.some((file) => file.path === "SKILL.md")) throw new Error("Registered skill tree is missing its required root SKILL.md.");
     const previouslyRegistered = new Set(oldItem.files.map((file) => file.path));
     const explicitlyReviewed = new Set(nextItem.files.map((file) => file.path));
-    if (currentFiles.some((file) => !previouslyRegistered.has(file.path) && !explicitlyReviewed.has(file.path))) {
+    const capturedBeforePaths = new Set(before?.items.find((entry) => entry.itemId === oldItem.id)?.files.map((file) => file.path) ?? []);
+    if (currentFiles.some((file) => !previouslyRegistered.has(file.path) && !explicitlyReviewed.has(file.path) && !capturedBeforePaths.has(file.path))) {
       throw new Error("Registered sources tree contains an unreviewed ordinary child; explicitly review it before replacement.");
     }
     operations.push({ itemId: oldItem.id, target, kind: "tree", oldTree: null, newTree: "0".repeat(64) });
@@ -999,6 +1095,28 @@ export class StorageSession {
   async assertRevision(expected: StorageRevision): Promise<void> {
     if (JSON.stringify(await this.capture()) !== JSON.stringify(expected)) throw new Error("Copi library changed after preparation (catalog or saved bytes); reload and review before retrying. A manual checksum mismatch must not be repaired automatically.");
   }
+  /** @internal Captures a private, lease-bound before state for an explicitly confirmed sources review. */
+  async prepareSourcesReview(expected: StorageRevision, catalog: Buffer, replacements: readonly StorageReplacement[]): Promise<StorageReview> {
+    await this.assertLease(false);
+    if (expected.root !== this.root || expected.format !== "v2") throw new Error("Sources before-review requires this issued session's v2 revision.");
+    await this.assertRevision(expected);
+    const review = prepareStorageReview(Buffer.from(catalog), replacements);
+    const state = reviews.get(review)!;
+    const previous = expected.catalog === null ? { version: 2 as const, items: [], groups: [] } : parseStoredCatalog(JSON.parse(Buffer.from(expected.catalog, "base64").toString("utf8")) as unknown);
+    const next = parseStoredCatalog(JSON.parse(state.catalog.toString("utf8")) as unknown);
+    if (previous.version !== 2 || next.version !== 2) throw new Error("Sources before-review requires v2 catalogs.");
+    assertModernCatalog(previous);
+    assertModernCatalog(next);
+    const beforeItems: BeforeReviewedItem[] = [];
+    for (const replacement of state.replacements) {
+      const oldItem = previous.items.find((item) => item.id === replacement.itemId);
+      if (oldItem) beforeItems.push(await captureSourcesBefore(this.root, oldItem));
+    }
+    await this.assertRevision(expected);
+    await this.assertLease(false);
+    state.before = { root: this.root, expected: structuredClone(expected), items: beforeItems, used: false };
+    return review;
+  }
   async commit(expected: StorageRevision, catalog: Buffer, replacements: readonly StorageReplacement[] = [], authorization?: StorageAuthorization): Promise<void> {
     const lease = sessionLeases.get(this);
     if (!lease || lease.stop.signal.aborted) throw new Error("Invalid or expired copi storage session; refusing a new commit.");
@@ -1024,7 +1142,16 @@ export class StorageSession {
     if (expected.format !== "v2" || previousStored.version !== 2 || nextStored.version !== 2) throw new Error("Ordinary storage commits require catalog v2; explicitly migrate legacy v1 storage first.");
     assertModernCatalog(previousStored);
     assertModernCatalog(nextStored);
-    await this.#commitSources(expected, previousStored, nextStored, catalog, replacements);
+    const removedPaths = omittedSourcePaths(prepared, previousStored, nextStored);
+    if (removedPaths.length > 0 && (!prepared.before || !authorization || authorization.approval.confirmed !== true)) {
+      throw new Error("Ordinary source deletion requires a session-bound before review and confirmed approval.");
+    }
+    if (prepared.before) {
+      if (prepared.before.used) throw new Error("Sources before-review token has already been used.");
+      prepared.before.used = true;
+      await assertBeforeReviewCurrent(this.root, expected, prepared.before);
+    }
+    await this.#commitSources(expected, previousStored, nextStored, catalog, replacements, prepared.before);
   }
   async #commitNewItems(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer, replacements: readonly StorageReplacement[], operations: SourcesOperation[]): Promise<void> {
     if (operations.length === 0 || operations.some((operation) => operation.oldTree !== null) || next.items.length <= previous.items.length) {
@@ -1278,8 +1405,8 @@ export class StorageSession {
       throw error;
     }
   }
-  async #commitSources(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer, replacements: readonly StorageReplacement[]): Promise<void> {
-    const operations = await validateSourcesTransition(this.root, previous, next, replacements);
+  async #commitSources(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer, replacements: readonly StorageReplacement[], before?: SourcesBeforeReview): Promise<void> {
+    const operations = await validateSourcesTransition(this.root, previous, next, replacements, before);
     if (next.items.length > previous.items.length) {
       await this.#commitNewItems(expected, previous, next, catalog, replacements, operations);
       return;
