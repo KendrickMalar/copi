@@ -1,0 +1,285 @@
+TAP version 13
+# Subtest: RENAME_EXCL preserves a competing empty-dir destination at the syscall boundary
+not ok 1 - RENAME_EXCL preserves a competing empty-dir destination at the syscall boundary
+  ---
+  duration_ms: 251.577959
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:89:3'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 1
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:93:12)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async startSubtestAfterBootstrap (node:internal/test_runner/harness:296:3)
+  ...
+# Subtest: RENAME_EXCL preserves a competing nonempty-dir destination at the syscall boundary
+not ok 2 - RENAME_EXCL preserves a competing nonempty-dir destination at the syscall boundary
+  ---
+  duration_ms: 6.256958
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:89:3'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 1
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:93:12)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: RENAME_EXCL preserves a competing file destination at the syscall boundary
+not ok 3 - RENAME_EXCL preserves a competing file destination at the syscall boundary
+  ---
+  duration_ms: 8.503333
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:89:3'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 1
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:93:12)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: RENAME_EXCL preserves a competing symlink destination at the syscall boundary
+not ok 4 - RENAME_EXCL preserves a competing symlink destination at the syscall boundary
+  ---
+  duration_ms: 4.080458
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:89:3'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 1
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:93:12)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: RENAME_EXCL preserves a competing samebytes-dir destination at the syscall boundary
+not ok 5 - RENAME_EXCL preserves a competing samebytes-dir destination at the syscall boundary
+  ---
+  duration_ms: 4.335584
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:89:3'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 1
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 1
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:93:12)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# {"case":"symlink-ancestor","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/tmp/p1b-symlink-ancestor-3r0zbR","result":{"status":64,"stderr":"error=parent-openat errno=20"}}
+# Subtest: symlink in a destination ancestor is rejected without touching its referent
+ok 6 - symlink in a destination ancestor is rejected without touching its referent
+  ---
+  duration_ms: 5.734625
+  type: 'test'
+  ...
+# Subtest: LIMIT: replacing the parent path leaves the opened dirfd attached to the renamed parent
+not ok 7 - LIMIT: replacing the parent path leaves the opened dirfd attached to the renamed parent
+  ---
+  duration_ms: 3.44575
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:150:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 0
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 0
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:156:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: LIMIT: moving the opened parent outside the synthetic root does not confine its dirfd
+not ok 8 - LIMIT: moving the opened parent outside the synthetic root does not confine its dirfd
+  ---
+  duration_ms: 2.739375
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:170:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    error=unknown-place-option errno=22
+
+
+    64 !== 0
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 0
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:175:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: LIMIT: replacing the final source basename is not made conditional by RENAME_EXCL
+not ok 9 - LIMIT: replacing the final source basename is not made conditional by RENAME_EXCL
+  ---
+  duration_ms: 3.367083
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:189:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    helper produced no JSON stdout: error=unknown-place-option errno=22
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: ''
+  operator: '=='
+  stack: |-
+    outputRecord (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:59:10)
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:195:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: unsupported flag failure does not fall back to an ordinary rename
+not ok 10 - unsupported flag failure does not fall back to an ordinary rename
+  ---
+  duration_ms: 2.559208
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:209:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    helper produced no JSON stdout: error=unknown-place-option errno=22
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: ''
+  operator: '=='
+  stack: |-
+    outputRecord (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:59:10)
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:215:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: synthetic unknown-errno branch stops without treating injection as filesystem evidence
+not ok 11 - synthetic unknown-errno branch stops without treating injection as filesystem evidence
+  ---
+  duration_ms: 3.322
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:225:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    helper produced no JSON stdout: error=unknown-place-option errno=22
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: true
+  actual: ''
+  operator: '=='
+  stack: |-
+    outputRecord (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:59:10)
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:231:18)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: helper killed immediately before rename leaves the source and vacancy unchanged
+not ok 12 - helper killed immediately before rename leaves the source and vacancy unchanged
+  ---
+  duration_ms: 2.451042
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:240:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+
+    64 !== null
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: ~
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:244:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+# Subtest: helper killed after the real rename has an indeterminate receipt but placed bytes remain
+not ok 13 - helper killed after the real rename has an indeterminate receipt but placed bytes remain
+  ---
+  duration_ms: 2.226167
+  type: 'test'
+  location: '/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:251:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+
+    64 !== null
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: ~
+  actual: 64
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/placement-boundary.test.mjs:255:10)
+    async Test.run (node:internal/test_runner/test:1054:7)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+1..13
+# tests 13
+# suites 0
+# pass 1
+# fail 12
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 378.144459

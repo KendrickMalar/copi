@@ -1,0 +1,46 @@
+ref=61e386bbcbb92201b575c231be2ad31f4d42f64a
+branch=feat/native-placement-proof
+harness_HOME=/Users/papillon
+
+$ git rev-parse HEAD
+61e386bbcbb92201b575c231be2ad31f4d42f64a
+exit=0
+
+$ git branch --show-current
+feat/native-placement-proof
+exit=0
+
+$ uname -a
+Darwin Soichiros-MacBook-Pro.local 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6041 arm64
+exit=0
+
+$ /usr/bin/clang --version
+Apple clang version 17.0.0 (clang-1700.6.3.2)
+Target: arm64-apple-darwin27.0.0
+Thread model: posix
+InstalledDir: /Library/Developer/CommandLineTools/usr/bin
+exit=0
+
+$ xcrun --sdk macosx --show-sdk-version
+26.2
+exit=0
+
+$ xcrun --sdk macosx --show-sdk-path
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+exit=0
+
+$ /opt/homebrew/opt/node@22/bin/node --version
+v22.23.3
+exit=0
+
+$ /opt/homebrew/opt/node@22/bin/node -p process.arch
+arm64
+exit=0
+
+$ git diff --check
+exit=0
+
+$ git diff --cached --name-only
+exit=0
+
+Scoped test environment: HOME=/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/coder/home PI_CODING_AGENT_DIR=/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/coder/home/.pi/agent NPM_CONFIG_CACHE=/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/coder/cache NPM_CONFIG_USERCONFIG=/dev/null TMPDIR=/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/coder/tmp

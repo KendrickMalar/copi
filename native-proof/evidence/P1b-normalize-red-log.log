@@ -1,0 +1,2 @@
+command=perl -pi -e s/[\t ]+\$// native-proof/evidence/P1b-red.log
+exit=0

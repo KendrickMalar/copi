@@ -1,0 +1,44 @@
+TAP version 13
+# {"kind":"file-parent","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/tmp/file-parent-VPDRa2","source":{"dev":"16777233","ino":"264277638","mode":448,"isDirectory":true,"children":["payload.txt"]},"external":{"dev":"16777233","ino":"264277644","mode":489,"isDirectory":true,"children":[]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264277644","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty destination (file-parent)
+ok 1 - RENAME_EXCL preserves a competing empty destination (file-parent)
+  ---
+  duration_ms: 382.618458
+  type: 'test'
+  ...
+# {"kind":"tree-target","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/tmp/tree-target-ZSkCmY","source":{"dev":"16777233","ino":"264277646","mode":448,"isDirectory":true,"children":["payload.txt"]},"external":{"dev":"16777233","ino":"264277653","mode":489,"isDirectory":true,"children":[]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264277653","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty destination (tree-target)
+ok 2 - RENAME_EXCL preserves a competing empty destination (tree-target)
+  ---
+  duration_ms: 11.603
+  type: 'test'
+  ...
+# {"kind":"absent-sources-root","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/tmp/absent-sources-root-mFYaIj","source":{"dev":"16777233","ino":"264277655","mode":448,"isDirectory":true,"children":["payload.txt"]},"external":{"dev":"16777233","ino":"264277659","mode":489,"isDirectory":true,"children":[]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"refused","errno":17,"errno_name":"EEXIST","injected_external_dev":"16777233","injected_external_ino":"264277659","injected_external_mode":489,"test_interposition":"immediately-before-real-renameatx_np"}}
+# Subtest: RENAME_EXCL preserves a competing empty destination (absent-sources-root)
+ok 3 - RENAME_EXCL preserves a competing empty destination (absent-sources-root)
+  ---
+  duration_ms: 7.854584
+  type: 'test'
+  ...
+# {"kind":"normal-vacant","fixtureRoot":"/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/tmp/normal-vacant-WfuubR","source":{"dev":"16777233","ino":"264277664","mode":448,"isDirectory":true,"children":["payload.txt"]},"result":{"operation":"renameatx_np","flag":"RENAME_EXCL","result":"placed","errno":0,"source_dev":"16777233","source_ino":"264277664","destination_identity_preserved":true}}
+# Subtest: RENAME_EXCL moves a vacant staged tree without changing its inode or bytes
+ok 4 - RENAME_EXCL moves a vacant staged tree without changing its inode or bytes
+  ---
+  duration_ms: 6.046167
+  type: 'test'
+  ...
+# Subtest: malformed helper argv exits nonzero without changing staged source or vacant destination
+ok 5 - malformed helper argv exits nonzero without changing staged source or vacant destination
+  ---
+  duration_ms: 5.026041
+  type: 'test'
+  ...
+1..5
+# tests 5
+# suites 0
+# pass 5
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 492.28225

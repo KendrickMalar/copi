@@ -1,0 +1,16 @@
+mount inventory (read-only; no mount or OS changes)
+Filesystem     512-blocks      Used Available Capacity  Mounted on
+/dev/disk3s5    965595304 699782000 170254104    81%    /System/Volumes/Data
+/dev/disk3s5    965595304 699782000 170254104    81%    /System/Volumes/Data
+/dev/disk3s1s1  965595304  27529720 170254104    14%    /
+/dev/disk3s2    965595304  42454048 170254104    20%    /System/Volumes/Preboot
+/dev/disk3s4    965595304   2422936 170254104     2%    /System/Volumes/Update
+/dev/disk3s6    965595304  16779416 170254104     9%    /System/Volumes/VM
+/dev/disk3s5    965595304 699782000 170254104    81%    /System/Volumes/Data
+path=/Users/papillon/Code/copi/.worktrees/native-placement-proof/native-proof/tmp readable=yes writable=yes fs=/ dev=16777233
+path=/System/Volumes/Data readable=yes writable=no fs=/ dev=16777233
+path=/System/Volumes/Recovery readable=yes writable=no fs=/ dev=16777233
+path=/System/Volumes/Preboot readable=yes writable=no fs=/ dev=16777231
+path=/System/Volumes/Update readable=yes writable=no fs=/ dev=16777230
+path=/System/Volumes/VM readable=yes writable=no fs=/ dev=16777234
+path=/Volumes readable=yes writable=no fs=/ dev=16777233
