@@ -3,13 +3,19 @@ import test from "node:test";
 import { lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { executeApply, planApply } from "../src/apply.ts";
-import { importPreparedResource, importResource, listSnapshots, loadCatalog, newCatalog, prepareResource, readSnapshotFiles, renameSavedItem, saveCatalog, saveNameChanges } from "../src/catalog.ts";
+import { assertModernCatalog, importPreparedResource, importResource, listSnapshots, loadCatalog as loadStoredCatalog, newCatalog, prepareResource, readSnapshotFiles, renameSavedItem, saveCatalog, saveNameChanges } from "../src/catalog.ts";
 import { createGroup, renameGroup, setGroupItems } from "../src/groups.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { findNameConflicts, nameKey } from "../src/names.ts";
 import { foldCaseUnicode17 } from "../src/unicode-case-folding.ts";
 import type { Catalog } from "../src/types.ts";
 import { acceptanceBox, add, assertOnlyNames, candidate, choose, cli, cliPipe, fixtureImportOptions, legacy, realPty, renameSteps, secret, treeBytes, wizardArgv, type AcceptanceBox, type Action } from "./helpers/issue2-acceptance.ts";
+
+async function loadCatalog(libraryDir: string): Promise<Catalog> {
+  const catalog = await loadStoredCatalog(libraryDir);
+  assertModernCatalog(catalog);
+  return catalog;
+}
 
 // Approved supplement, not expectations computed by the product implementation.
 const boundaries: readonly [string, string, boolean][] = [
@@ -63,7 +69,7 @@ test("N2 item/group same display name is persisted; comparison never replaces di
   setGroupItems(catalog, group.id, [item.id]);
   await saveCatalog(box.library, catalog);
   const sourceBefore = await treeBytes(box.source);
-  const filesBefore = await treeBytes(path.join(box.library, "items"));
+  const filesBefore = await treeBytes(path.join(box.library, "sources"));
   const renamed = await renameSavedItem(box.library, item.id, " Ａgent ﬃ ");
   assert.equal(renamed.name, "Ａgent ﬃ");
   const after = await loadCatalog(box.library);
@@ -71,7 +77,7 @@ test("N2 item/group same display name is persisted; comparison never replaces di
   await saveNameChanges(box.library, await loadCatalog(box.library), after);
   assert.equal((await loadCatalog(box.library)).groups[0]!.name, "Ａgent ﬃ");
   assert.deepEqual(await treeBytes(box.source), sourceBefore);
-  assert.deepEqual(await treeBytes(path.join(box.library, "items")), filesBefore);
+  assert.deepEqual(await treeBytes(path.join(box.library, "sources")), filesBefore);
   assert.match((await readSnapshotFiles(box.library, renamed)).find((file) => file.path === "SKILL.md")!.bytes.toString(), /Original Straße \/ ①/);
 });
 
@@ -188,7 +194,7 @@ test("N3 new occupied name rejected in actual text validation; corrected explici
   const before = await legacy(box);
   assert.equal((await listSnapshots(box.library)).length, 5);
   assert.equal(findNameConflicts(await loadCatalog(box.library)).length, 4);
-  const snapshotBefore = await treeBytes(path.join(box.library, "items"));
+  const snapshotBefore = await treeBytes(path.join(box.library, "sources"));
   const sourceBefore = await treeBytes(box.source);
   const result = await realPty(box, [process.execPath, cli, "groups"], [
     { waitFor: "Unresolved names", send: "\u001b[B\r" },
@@ -204,7 +210,7 @@ test("N3 new occupied name rejected in actual text validation; corrected explici
   assert.deepEqual(after.items.map((item) => item.name), ["Kit (chosen)", " 1 KIT ", "Greek (chosen)", "ος", "safe"]);
   assert.deepEqual(after.groups.map((group) => group.name), ["Daily (chosen)", "ＤＡＩＬＹ", "Café (chosen)", "Cafe\u0301", "safe-team"]);
   assert.equal(findNameConflicts(after).length, 0);
-  assert.deepEqual(await treeBytes(path.join(box.library, "items")), snapshotBefore);
+  assert.deepEqual(await treeBytes(path.join(box.library, "sources")), snapshotBefore);
   assert.deepEqual(await treeBytes(box.source), sourceBefore);
   for (const item of after.items) assert.equal((await readSnapshotFiles(box.library, item)).length, 3);
   for (const item of before.items) assert.ok(!result.output.includes(item.id));
@@ -315,7 +321,7 @@ test("N5 name-only APIs preserve identity, metadata, every group reference and a
   ];
   await saveCatalog(box.library, before);
   const source = await treeBytes(box.source);
-  const snapshots = await treeBytes(path.join(box.library, "items"));
+  const snapshots = await treeBytes(path.join(box.library, "sources"));
   await renameSavedItem(box.library, first.id, " explicit first ");
   const mid = await loadCatalog(box.library);
   const after = structuredClone(mid);
@@ -323,33 +329,32 @@ test("N5 name-only APIs preserve identity, metadata, every group reference and a
   await saveNameChanges(box.library, mid, after);
   assertOnlyNames(before, await loadCatalog(box.library));
   assert.deepEqual(await treeBytes(box.source), source);
-  assert.deepEqual(await treeBytes(path.join(box.library, "items")), snapshots);
+  assert.deepEqual(await treeBytes(path.join(box.library, "sources")), snapshots);
   await expectUnchanged(box, () => renameSavedItem(box.library, first.id, " SECOND "), /duplicate/i);
 });
 
-for (const corruption of ["none", "checksum", "file symlink", "directory symlink"] as const) {
-  test(`N5 ordinary CLI group rename ${corruption === "none" ? "preserves references and bytes" : `rejects ${corruption}`}`, async () => {
+for (const corruption of ["none", "checksum", "file symlink"] as const) {
+  test(`N5 ordinary CLI group rename ${corruption} ${corruption === "file symlink" ? "rejects the unsafe source" : "preserves current bytes and metadata"}`, async () => {
     const box = await acceptanceBox();
     const item = await add(box, "healthy-name");
     const catalog = await loadCatalog(box.library);
     catalog.groups = [{ id: "team", name: "Original team", itemIds: [item.id] }];
     await saveCatalog(box.library, catalog);
-    const fileRoot = path.join(box.library, "items", item.id, "files");
-    const target = path.join(fileRoot, "SKILL.md");
-    if (corruption === "checksum") await writeFile(target, "manual unexpected edit\n");
-    else if (corruption === "file symlink") {
-      const outside = path.join(box.root, "outside-copy.md");
-      await writeFile(outside, await readFile(target));
-      await rename(target, path.join(box.root, "original-copy.md"));
+    if (item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+    const contentRoot = path.join(box.library, ...item.content.path.split("/"));
+    const target = path.join(contentRoot, "SKILL.md");
+    if (corruption === "checksum") await writeFile(target, "manual current edit\n");
+    const outside = path.join(box.root, "original-copy.md");
+    if (corruption === "file symlink") {
+      await rename(target, outside);
       await symlink(outside, target);
-    } else if (corruption === "directory symlink") {
-      const outside = path.join(box.root, "outside-directory");
-      await rename(fileRoot, outside);
-      await symlink(outside, fileRoot);
     }
-    const before = await treeBytes(box.library);
-    const snapshotBefore = await treeBytes(path.join(box.library, "items"));
+    const libraryBefore = await treeBytes(box.library);
+    const sourcesBefore = await treeBytes(path.join(box.library, "sources"));
     const sourceBefore = await treeBytes(box.source);
+    const currentBytes = corruption === "file symlink" ? undefined : await readFile(target);
+    const outsideBytesBefore = corruption === "file symlink" ? await readFile(outside) : undefined;
+    const targetBefore = await lstat(corruption === "file symlink" ? outside : target);
     const result = await realPty(box, [process.execPath, cli, "groups"], [
       { waitFor: "Manage saved groups", send: "\u001b[B\r" },
       { waitFor: "Select group", send: "\r" },
@@ -357,21 +362,29 @@ for (const corruption of ["none", "checksum", "file symlink", "directory symlink
       { waitFor: "Manage saved groups", send: "\u001b[B\u001b[B\u001b[B\r" },
       { waitFor: "Save these group changes", send: "y" },
     ]);
-    const actualLibrary = await treeBytes(box.library);
-    const actualSnapshots = await treeBytes(path.join(box.library, "items"));
-    console.log(JSON.stringify({ corruption, actualExit: result.code, expectedExit: corruption === "none" ? 0 : 1,
-      beforeGroupName: catalog.groups[0]!.name, afterGroupName: (await loadCatalog(box.library)).groups[0]!.name,
-      catalogBytesUnchanged: actualLibrary["catalog.json"] === before["catalog.json"],
-      snapshotBytesUnchanged: JSON.stringify(actualSnapshots) === JSON.stringify(snapshotBefore), log: result.log }));
-    assert.equal(result.code, corruption === "none" ? 0 : 1, result.output);
-    if (corruption === "none") {
+    if (corruption !== "file symlink") {
+      assert.equal(result.code, 0, result.output);
       const after = await loadCatalog(box.library);
       assertOnlyNames(catalog, after);
       assert.equal(after.groups[0]!.name, "Explicit new team");
-      assert.deepEqual(await treeBytes(path.join(box.library, "items")), snapshotBefore);
+      assert.equal(after.items[0]!.name, "healthy-name");
+      assert.deepEqual(after.items[0]!.files, catalog.items[0]!.files, "metadata rename must not rewrite the old descriptor SHA");
+      assert.ok(currentBytes);
+      assert.deepEqual(await readFile(target), currentBytes);
+      assert.deepEqual((await readSnapshotFiles(box.library, after.items[0]!)).find((file) => file.path === "SKILL.md")!.bytes, currentBytes);
+      const targetAfter = await lstat(target);
+      assert.equal(targetAfter.dev, targetBefore.dev);
+      assert.equal(targetAfter.ino, targetBefore.ino);
+      assert.deepEqual(await treeBytes(path.join(box.library, "sources")), sourcesBefore);
     } else {
-      assert.match(result.output, /checksum|symbolic.link/i);
-      assert.deepEqual(await treeBytes(box.library), before);
+      assert.equal(result.code, 1, result.output);
+      assert.match(result.output, /unsafe symbolic link/i);
+      assert.deepEqual(await treeBytes(box.library), libraryBefore);
+      assert.ok(outsideBytesBefore);
+      assert.deepEqual(await readFile(outside), outsideBytesBefore);
+      const outsideAfter = await lstat(outside);
+      assert.equal(outsideAfter.dev, targetBefore.dev);
+      assert.equal(outsideAfter.ino, targetBefore.ino);
     }
     assert.deepEqual(await treeBytes(box.source), sourceBefore);
   });
@@ -406,28 +419,108 @@ test("N5 resolution API rejects metadata/membership/file forgery and nonconflict
   await expectUnchanged(box, () => saveNameChanges(box.library, before, unrelated), /only conflicting/i);
 });
 
-for (const corruption of ["checksum", "file symlink", "directory symlink"] as const) {
-  test(`N5 ${corruption} is not silently accepted by item rename or group resolution`, async () => {
+test("N5 item rename reads directly edited sources and preserves descriptor metadata and inode", async () => {
+  const box = await acceptanceBox();
+  const item = await add(box, "original item name");
+  const initial = await loadCatalog(box.library);
+  const group = createGroup(initial, "original group name");
+  setGroupItems(initial, group.id, [item.id]);
+  await saveCatalog(box.library, initial);
+  const before = await loadCatalog(box.library);
+  if (item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+  const target = path.join(box.library, ...item.content.path.split("/"), "SKILL.md");
+  await writeFile(target, "manual current source edit\n");
+  const currentBytes = await readFile(target);
+  const targetBefore = await lstat(target);
+  const descriptorBefore = structuredClone(before.items[0]!.files);
+
+  await renameSavedItem(box.library, item.id, "renamed item");
+
+  const after = await loadCatalog(box.library);
+  assertOnlyNames(before, after);
+  assert.equal(after.items[0]!.name, "renamed item");
+  assert.equal(after.groups[0]!.name, "original group name");
+  assert.deepEqual(after.items[0]!.files, descriptorBefore, "direct edits must not silently update the historical descriptor SHA");
+  assert.deepEqual(await readFile(target), currentBytes);
+  assert.deepEqual((await readSnapshotFiles(box.library, after.items[0]!)).find((file) => file.path === "SKILL.md")!.bytes, currentBytes);
+  const targetAfter = await lstat(target);
+  assert.equal(targetAfter.dev, targetBefore.dev);
+  assert.equal(targetAfter.ino, targetBefore.ino);
+});
+
+for (const corruption of ["file symlink", "directory symlink"] as const) {
+  test(`N5 item/group metadata operations reject ${corruption} before mutation`, async () => {
     const box = await acceptanceBox();
-    const before = await legacy(box);
-    const fileRoot = path.join(box.library, "items", before.items[4]!.id, "files");
-    const target = path.join(fileRoot, "SKILL.md");
-    if (corruption === "checksum") await writeFile(target, "manual tamper\n");
-    else if (corruption === "file symlink") {
-      const outside = path.join(box.root, "outside-copy.md");
-      await writeFile(outside, await readFile(target));
-      await rename(target, path.join(box.root, "original-copy.md"));
+    const item = await add(box, "unique item");
+    const initial = await loadCatalog(box.library);
+    const group = createGroup(initial, "unique group");
+    setGroupItems(initial, group.id, [item.id]);
+    await saveCatalog(box.library, initial);
+    const before = await loadCatalog(box.library);
+    if (item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+    const contentRoot = path.join(box.library, ...item.content.path.split("/"));
+    const target = path.join(contentRoot, "SKILL.md");
+    let linkPath: string;
+    let outside: string;
+    if (corruption === "file symlink") {
+      linkPath = target;
+      outside = path.join(box.root, "original-copy.md");
+      await rename(target, outside);
       await symlink(outside, target);
     } else {
-      const outside = path.join(box.root, "outside-directory");
-      await rename(fileRoot, outside);
-      await symlink(outside, fileRoot);
+      linkPath = contentRoot;
+      outside = path.join(box.root, "outside-directory");
+      await rename(contentRoot, outside);
+      await symlink(outside, contentRoot);
     }
-    const pattern = /checksum|symbolic.link/i;
-    await expectUnchanged(box, () => renameSavedItem(box.library, before.items[0]!.id, "Kit distinct"), pattern);
-    const after = structuredClone(before);
-    renameGroup(after, "day-a", "Daily distinct");
-    await expectUnchanged(box, () => saveNameChanges(box.library, before, after), pattern);
-    await assert.rejects(readSnapshotFiles(box.library, before.items[4]!), pattern);
+    const outsideFile = corruption === "file symlink" ? outside : path.join(outside, "SKILL.md");
+    const outsideBytes = await readFile(outsideFile);
+    const outsideBefore = await lstat(outsideFile);
+    const libraryBefore = await treeBytes(box.library);
+    const groupRename = structuredClone(before);
+    renameGroup(groupRename, group.id, "renamed group");
+
+    await expectUnchanged(box, () => renameSavedItem(box.library, item.id, "renamed item"), /unsafe symbolic link/i);
+    await expectUnchanged(box, () => saveNameChanges(box.library, before, groupRename), /unsafe symbolic link/i);
+    await assert.rejects(readSnapshotFiles(box.library, item), /unsafe symbolic link/i);
+
+    assert.deepEqual(await treeBytes(box.library), libraryBefore);
+    assert.ok((await lstat(linkPath)).isSymbolicLink());
+    assert.deepEqual(await readFile(outsideFile), outsideBytes);
+    const outsideAfter = await lstat(outsideFile);
+    assert.equal(outsideAfter.dev, outsideBefore.dev);
+    assert.equal(outsideAfter.ino, outsideBefore.ino);
   });
 }
+
+test("N5 name-only preview rejects later direct source edits without rewriting catalog or source", async () => {
+  const box = await acceptanceBox();
+  const item = await add(box, "stable item");
+  const initial = await loadCatalog(box.library);
+  const group = createGroup(initial, "stable group");
+  setGroupItems(initial, group.id, [item.id]);
+  await saveCatalog(box.library, initial);
+  if (item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+  const target = path.join(box.library, ...item.content.path.split("/"), "SKILL.md");
+  await writeFile(target, "direct edit before preview\n");
+  const before = await loadCatalog(box.library);
+  const after = structuredClone(before);
+  renameGroup(after, group.id, "previewed group name");
+  const catalogPath = path.join(box.library, "catalog.json");
+  const catalogBefore = await readFile(catalogPath);
+
+  await writeFile(target, "later external edit after preview\n");
+  const currentBytes = await readFile(target);
+  const currentStat = await lstat(target);
+  const libraryBeforeCommit = await treeBytes(box.library);
+  await assert.rejects(saveNameChanges(box.library, before, after), /Copi library changed after preparation/);
+  assert.deepEqual(await treeBytes(box.library), libraryBeforeCommit);
+  assert.deepEqual(await readFile(catalogPath), catalogBefore);
+  assert.deepEqual(await readFile(target), currentBytes);
+  const targetAfter = await lstat(target);
+  assert.equal(targetAfter.dev, currentStat.dev);
+  assert.equal(targetAfter.ino, currentStat.ino);
+  const current = await loadCatalog(box.library);
+  assert.equal(current.groups[0]!.name, "stable group");
+  assert.deepEqual(current.items[0]!.files, before.items[0]!.files);
+});
