@@ -12,7 +12,9 @@ import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigra
 import { renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
-import type { Catalog, InspectionWarning, SavedItem } from "./types.ts";
+import type { Catalog, InspectionWarning, LegacyCatalog, SavedItem } from "./types.ts";
+import { assertPreparedMigrationRequest } from "./migration.ts";
+import type { PreparedMigration } from "./migration.ts";
 
 const lockName = ".copi-transaction";
 const privateNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions", "auth.json", "mcp-auth.json", "oauth.json"]);
@@ -61,7 +63,7 @@ function snapshotDenseOwnDataArray(value: unknown): unknown[] | undefined {
 export interface StorageFile { readonly path: string; readonly bytes: Buffer; readonly mode: number }
 export interface StorageReplacement { readonly itemId: string; readonly files: readonly StorageFile[] }
 export interface LegacyMigrationInput extends StorageFile { readonly sha256: string; readonly dev: string; readonly ino: string }
-export interface LegacyAdoptOnlyMigrationRequest {
+interface LegacyAdoptOnlyMigrationRequest {
   readonly root: string;
   readonly oldCatalogBytes: Buffer;
   readonly oldCatalogIdentity: string;
@@ -80,6 +82,7 @@ export interface LegacyMigrationReview { readonly [legacyMigrationReviewBrand]: 
 export interface LegacyMigrationApproval { readonly reviewId: string; readonly confirmed: boolean; readonly approvedSensitivePaths: readonly string[] }
 interface LegacyMigrationReviewState { readonly request: LegacyAdoptOnlyMigrationRequest; used: boolean }
 const legacyMigrationReviews = new WeakMap<LegacyMigrationReview, LegacyMigrationReviewState>();
+const legacyMigrationPlanReviews = new WeakSet<PreparedMigration>();
 declare const storageReviewBrand: unique symbol;
 export interface StorageReview { readonly [storageReviewBrand]: true; readonly reviewId: string }
 export interface StorageReviewView { readonly sensitivePaths: readonly string[]; readonly warnings: readonly InspectionWarning[] }
@@ -565,7 +568,7 @@ function sameJsonShape(value: unknown, canonical: unknown): boolean {
   return Object.is(value, canonical);
 }
 
-function assertCanonicalStoredCatalog(raw: unknown, canonical: Catalog): void {
+function assertCanonicalStoredCatalog(raw: unknown, canonical: LegacyCatalog | Catalog): void {
   if (!sameJsonShape(raw, canonical)) {
     throw new Error("Catalog contains unknown or non-canonical stored fields; preserving its original bytes.");
   }
@@ -1400,7 +1403,9 @@ async function assertLegacyMigrationBackup(root: string, request: LegacyAdoptOnl
     entries,
   });
 }
-export function prepareLegacyMigrationReview(value: unknown): LegacyMigrationReview {
+/** @internal Plan-bound bridge; the request is checked against the opaque public preview before issuance. */
+export async function prepareLegacyMigrationReview(plan: PreparedMigration, value: unknown): Promise<LegacyMigrationReview> {
+  if (legacyMigrationPlanReviews.has(plan)) throw new Error("Prepared migration already issued a storage review; prepare and review again.");
   const fields = snapshotOwnDataRecord(value, ["root", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries", "inputs", "backupDir", "backupManifestBytes", "reviewId", "sensitivePaths"]);
   if (!fields || typeof fields.root !== "string" || !path.isAbsolute(fields.root) || path.resolve(fields.root) !== fields.root ||
       typeof fields.oldCatalogIdentity !== "string" || typeof fields.itemsTree !== "string" || typeof fields.sourcesTree !== "string" ||
@@ -1441,8 +1446,12 @@ export function prepareLegacyMigrationReview(value: unknown): LegacyMigrationRev
     reviewId: fields.reviewId,
     sensitivePaths: (sensitivePaths as string[]).slice().sort(),
   };
-  const oldValue = parseStoredCatalog(JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown);
-  const nextValue = parseStoredCatalog(JSON.parse(request.catalogBytes.toString("utf8")) as unknown);
+  const oldRaw = JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown;
+  const nextRaw = JSON.parse(request.catalogBytes.toString("utf8")) as unknown;
+  const oldValue = parseStoredCatalog(oldRaw);
+  const nextValue = parseStoredCatalog(nextRaw);
+  assertCanonicalStoredCatalog(oldRaw, oldValue);
+  assertCanonicalStoredCatalog(nextRaw, nextValue);
   if (oldValue.version !== 1 || nextValue.version !== 2 || !request.backupDir.startsWith(".migration-backups/") ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.backupDir.slice(".migration-backups/".length))) {
     throw new Error("Legacy migration review is not a v1-to-v2 adopt-only transition.");
@@ -1470,8 +1479,10 @@ export function prepareLegacyMigrationReview(value: unknown): LegacyMigrationRev
   if (JSON.stringify(exactSensitivePaths) !== JSON.stringify(request.sensitivePaths)) {
     throw new Error("Legacy migration review sensitive paths differ from the fixed selected source bytes.");
   }
+  await assertPreparedMigrationRequest(plan, request);
   const review = Object.freeze({ reviewId: request.reviewId }) as LegacyMigrationReview;
   legacyMigrationReviews.set(review, { request, used: false });
+  legacyMigrationPlanReviews.add(plan);
   return review;
 }
 
@@ -1521,7 +1532,9 @@ async function inspectLegacyMigrationJournal(root: string, lock: string, token: 
     manifestSha256: journal.backupManifest,
     entries: manifestEntries,
   });
-  const parsedOld = parseStoredCatalog(JSON.parse(backupCatalog.toString("utf8")) as unknown);
+  const parsedOldRaw = JSON.parse(backupCatalog.toString("utf8")) as unknown;
+  const parsedOld = parseStoredCatalog(parsedOldRaw);
+  assertCanonicalStoredCatalog(parsedOldRaw, parsedOld);
   if (parsedOld.version !== 1) throw new Error("V4 backup does not contain its committed original v1 catalog.");
   const oldStage = path.join(lock, "old-catalog");
   const oldBytes = await checkedFile(oldStage);
@@ -1554,7 +1567,9 @@ async function inspectLegacyMigrationJournal(root: string, lock: string, token: 
     throw new Error("V4 current original catalog lost its reviewed inode; preserving it.");
   }
   if (nextStage) {
-    const parsedNext = parseStoredCatalog(JSON.parse(nextStage.toString("utf8")) as unknown);
+    const parsedNextRaw = JSON.parse(nextStage.toString("utf8")) as unknown;
+    const parsedNext = parseStoredCatalog(parsedNextRaw);
+    assertCanonicalStoredCatalog(parsedNextRaw, parsedNext);
     if (!nextStageStat || hash(nextStage) !== journal.newCatalog || parsedNext.version !== 2) throw new Error("V4 next catalog stage is missing or altered.");
     if (currentHash === journal.newCatalog && (!currentStat || !sameDirectory({ dev: currentStat.dev, ino: currentStat.ino }, { dev: nextStageStat.dev, ino: nextStageStat.ino }))) {
       throw new Error("V4 installed catalog is not the reviewed staged inode.");
@@ -1869,8 +1884,12 @@ export class StorageSession {
   async #commitLegacyMigrationInFlight(request: LegacyAdoptOnlyMigrationRequest): Promise<void> {
     const lease = sessionLeases.get(this);
     if (!lease || request.root !== this.root) throw new Error("Invalid or expired copi storage session; refusing legacy migration.");
-    const oldValue = parseStoredCatalog(JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown);
-    const nextValue = parseStoredCatalog(JSON.parse(request.catalogBytes.toString("utf8")) as unknown);
+    const oldRaw = JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown;
+    const nextRaw = JSON.parse(request.catalogBytes.toString("utf8")) as unknown;
+    const oldValue = parseStoredCatalog(oldRaw);
+    const nextValue = parseStoredCatalog(nextRaw);
+    assertCanonicalStoredCatalog(oldRaw, oldValue);
+    assertCanonicalStoredCatalog(nextRaw, nextValue);
     if (oldValue.version !== 1 || nextValue.version !== 2 || !request.reviewId ||
         !request.backupDir.startsWith(".migration-backups/") ||
         !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.backupDir.slice(".migration-backups/".length))) {

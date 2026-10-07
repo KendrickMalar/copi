@@ -6,7 +6,7 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { buildMigrationBackupManifest, type MigrationBackupInputEntry } from "./migration-backup.ts";
-import { prepareLegacyMigrationReview, storageTransactions, type LegacyAdoptOnlyMigrationRequest } from "./storage-transaction.ts";
+import { prepareLegacyMigrationReview, storageTransactions } from "./storage-transaction.ts";
 import { parseStoredCatalog } from "./catalog.ts";
 import type { ChangeApproval } from "./resource-mutations.ts";
 import type { Catalog, LegacyCatalog, LegacySavedItem, SavedItem } from "./types.ts";
@@ -108,6 +108,21 @@ interface PlannedAddition {
   readonly target: string;
   readonly kind: "file" | "tree";
   readonly files: readonly PlannedPayloadFile[];
+}
+
+interface LegacyAdoptOnlyMigrationRequest {
+  readonly root: string;
+  readonly oldCatalogBytes: Buffer;
+  readonly oldCatalogIdentity: string;
+  readonly catalogBytes: Buffer;
+  readonly itemsTree: string;
+  readonly sourcesTree: string;
+  readonly rootEntries: readonly string[];
+  readonly inputs: readonly FileState[];
+  readonly backupDir: string;
+  readonly backupManifestBytes: Buffer;
+  readonly reviewId: string;
+  readonly sensitivePaths: readonly string[];
 }
 
 interface PreparedMigrationState {
@@ -947,6 +962,64 @@ async function recheckPreparedMigration(state: PreparedMigrationState): Promise<
   }
 }
 
+/** @internal Validates the storage adapter's request without exposing fixed migration buffers. */
+export async function assertPreparedMigrationRequest(plan: PreparedMigration, value: unknown): Promise<void> {
+  const state = typeof plan === "object" && plan !== null ? preparedStates.get(plan) : undefined;
+  if (!state || state.used || state.view.status !== "ready" || plan.reviewId !== state.view.reviewId ||
+      state.additions.length !== 0 || state.selections.length !== state.view.items.length ||
+      state.selections.some((selection) => selection.selection !== "sources")) {
+    throw new Error("Legacy migration storage reviews require an unused opaque ready plan selecting existing sources.");
+  }
+  const fields = snapshotOwnDataRecord(value, [
+    "root", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries",
+    "inputs", "backupDir", "backupManifestBytes", "reviewId", "sensitivePaths",
+  ]);
+  if (!fields || typeof fields.root !== "string" || typeof fields.oldCatalogIdentity !== "string" ||
+      typeof fields.itemsTree !== "string" || typeof fields.sourcesTree !== "string" || typeof fields.backupDir !== "string" ||
+      typeof fields.reviewId !== "string" || fields.reviewId !== state.view.reviewId ||
+      !Buffer.isBuffer(fields.oldCatalogBytes) || !Buffer.isBuffer(fields.catalogBytes) || !Buffer.isBuffer(fields.backupManifestBytes)) {
+    throw new Error("Legacy migration review request does not match the fixed prepared plan.");
+  }
+  const rootEntries = snapshotDenseOwnDataArray(fields.rootEntries);
+  const rawInputs = snapshotDenseOwnDataArray(fields.inputs);
+  const sensitivePaths = snapshotDenseOwnDataArray(fields.sensitivePaths);
+  const backupDirPattern = /^\.migration-backups\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (!rootEntries || rootEntries.some((entry) => typeof entry !== "string") || !rawInputs || !sensitivePaths ||
+      sensitivePaths.some((entry) => typeof entry !== "string") || !backupDirPattern.test(fields.backupDir) ||
+      fields.root !== state.root || !state.oldCatalogBytes || !state.nextCatalog || !state.backupManifestBytes ||
+      !state.itemsTree || !state.sourcesTree || !state.rootEntries ||
+      !state.oldCatalogBytes.equals(fields.oldCatalogBytes) ||
+      !Buffer.from(`${JSON.stringify(state.nextCatalog, null, 2)}\n`, "utf8").equals(fields.catalogBytes) ||
+      !state.backupManifestBytes.equals(fields.backupManifestBytes) ||
+      fields.itemsTree !== scannedTreeCommitment("items", state.itemsTree) ||
+      fields.sourcesTree !== scannedTreeCommitment("sources", state.sourcesTree) ||
+      JSON.stringify(rootEntries) !== JSON.stringify(state.rootEntries) ||
+      JSON.stringify(sensitivePaths) !== JSON.stringify(state.view.sensitivePaths) || rawInputs.length !== state.inputs.length) {
+    throw new Error("Legacy migration raw request differs from the fixed root, before snapshot, catalog, or selected sources plan.");
+  }
+  const catalogInput = state.inputs.find((input) => input.path === "catalog.json");
+  if (!catalogInput || fields.oldCatalogIdentity !== `${catalogInput.dev}:${catalogInput.ino}`) {
+    throw new Error("Legacy migration original catalog identity differs from the prepared plan.");
+  }
+  for (const [index, rawInput] of rawInputs.entries()) {
+    const input = snapshotOwnDataRecord(rawInput, ["path", "bytes", "mode", "sha256", "dev", "ino"]);
+    const expected = state.inputs[index];
+    if (!input || !expected || input.path !== expected.path || !Buffer.isBuffer(input.bytes) ||
+        !expected.bytes.equals(input.bytes) || input.mode !== expected.mode || input.sha256 !== expected.sha256 ||
+        input.dev !== expected.dev || input.ino !== expected.ino) {
+      throw new Error("Legacy migration request inputs differ from the opaque prepared before-data snapshot.");
+    }
+  }
+  const nextItems = state.nextCatalog.items;
+  if (nextItems.length !== state.view.items.length || nextItems.some((item, index) => {
+    const selected = state.view.items[index];
+    return !selected || selected.id !== item.id || selected.target !== item.content.path || selected.selection !== "sources";
+  })) {
+    throw new Error("Legacy migration next catalog does not preserve the opaque plan's selected source targets.");
+  }
+  await recheckPreparedMigration(state);
+}
+
 export async function commitMigration(plan: PreparedMigration, approval: ChangeApproval): Promise<MigrationResult> {
   if (typeof plan !== "object" || plan === null || !preparedStates.has(plan)) {
     throw new Error("Invalid prepared migration token.");
@@ -1003,7 +1076,7 @@ export async function commitMigration(plan: PreparedMigration, approval: ChangeA
     reviewId: state.view.reviewId,
     sensitivePaths: [...state.view.sensitivePaths],
   };
-  const storageReview = prepareLegacyMigrationReview(request);
+  const storageReview = await prepareLegacyMigrationReview(plan, request);
   state.used = true;
   await storageTransactions.run(state.root, false, async (session) => {
     if (!session || session.root !== state.root) throw new Error("Issued storage lease does not match the reviewed canonical migration root.");

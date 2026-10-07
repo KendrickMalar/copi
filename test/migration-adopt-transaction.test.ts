@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { lstat, readFile, readdir } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { commitMigration, prepareMigration, readMigration, type PreparedMigration } from "../src/migration.ts";
 import type { ChangeApproval } from "../src/resource-mutations.ts";
-import { parseMigrationBackupManifest, verifyMigrationBackup } from "../src/migration-backup.ts";
-import { storageTransactions, StorageTransactions } from "../src/storage-transaction.ts";
+import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup } from "../src/migration-backup.ts";
+import { prepareLegacyMigrationReview, storageTransactions, StorageTransactions, type LegacyMigrationReview, type StorageSession } from "../src/storage-transaction.ts";
 import {
   createLegacyLibrary,
   legacyFileBytes,
@@ -17,8 +17,96 @@ import {
   writeLegacyCatalog,
   writeLegacySnapshot,
 } from "./helpers/legacy-library.ts";
+import type { LegacyCatalog } from "../src/types.ts";
 
 const digest = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
+const issueMigrationReview = prepareLegacyMigrationReview as unknown as (...args: unknown[]) => Promise<LegacyMigrationReview>;
+
+async function migrationTreeCommitment(root: string, relativeRoot: "items" | "sources"): Promise<string> {
+  const target = path.join(root, relativeRoot);
+  const entries: Array<{ path: string; kind: "directory" | "file"; value: string; mode: number; dev: number; ino: number }> = [];
+  const visit = async (absolute: string, relative: string): Promise<void> => {
+    const stat = await lstat(absolute, { bigint: true });
+    const identity = { dev: Number(stat.dev), ino: Number(stat.ino) };
+    if (stat.isDirectory()) {
+      entries.push({ path: relative, kind: "directory", value: "", mode: Number(stat.mode & 0o777n), ...identity });
+      const prefix = relative === "." ? "" : `${relative}/`;
+      for (const name of (await readdir(absolute)).sort()) await visit(path.join(absolute, name), `${prefix}${name}`);
+    } else if (stat.isFile()) {
+      entries.push({ path: relative, kind: "file", value: digest(await readFile(absolute)), mode: Number(stat.mode & 0o777n), ...identity });
+    } else {
+      throw new Error(`Unexpected migration fixture node: ${absolute}`);
+    }
+  };
+  await visit(target, ".");
+  return digest(Buffer.from(JSON.stringify(entries)));
+}
+
+async function migrationInputFiles(root: string, relativeRoot: "items" | "sources"): Promise<string[]> {
+  const result: string[] = [];
+  const visit = async (absolute: string, relative: string): Promise<void> => {
+    for (const name of (await readdir(absolute)).sort()) {
+      const childRelative = `${relative}/${name}`;
+      const child = path.join(absolute, name);
+      const stat = await lstat(child, { bigint: true });
+      if (stat.isDirectory()) await visit(child, childRelative);
+      else if (stat.isFile()) result.push(childRelative);
+      else throw new Error(`Unexpected migration fixture node: ${child}`);
+    }
+  };
+  const target = path.join(root, relativeRoot);
+  await visit(target, relativeRoot);
+  return result;
+}
+
+function catalogWithUnknownField(value: unknown, area: "top" | "item" | "file" | "group"): Record<string, unknown> {
+  const catalog = structuredClone(value) as Record<string, unknown>;
+  if (area === "top") {
+    catalog.unrecognizedTopField = "synthetic-extra";
+  } else if (area === "item") {
+    const items = catalog.items as Array<Record<string, unknown>>;
+    items[0]!.unrecognizedItemField = "synthetic-extra";
+  } else if (area === "file") {
+    const items = catalog.items as Array<Record<string, unknown>>;
+    const files = items[0]!.files as Array<Record<string, unknown>>;
+    files[0]!.unrecognizedFileField = "synthetic-extra";
+  } else {
+    const groups = catalog.groups as Array<Record<string, unknown>>;
+    if (groups.length === 0) groups.push({ id: "223e4567-e89b-42d3-a456-426614174001", name: "Synthetic group", itemIds: ["123e4567-e89b-42d3-a456-426614174000"] });
+    groups[0]!.unrecognizedGroupField = "synthetic-extra";
+  }
+  return catalog;
+}
+
+async function legacyReviewRequest(
+  root: string,
+  plan: PreparedMigration,
+  oldCatalogBytes: Buffer,
+  nextCatalog: { version: 2; items: Array<LegacyCatalog["items"][number] & { content: { kind: "file" | "tree"; path: string } }>; groups: LegacyCatalog["groups"] },
+): Promise<Record<string, unknown>> {
+  const paths = ["catalog.json", ...await migrationInputFiles(root, "items"), ...await migrationInputFiles(root, "sources")].sort();
+  const inputs = await Promise.all(paths.map(async (inputPath) => {
+    const target = path.join(root, ...inputPath.split("/"));
+    const stat = await lstat(target, { bigint: true });
+    const bytes = await readFile(target);
+    return { path: inputPath, bytes, mode: Number(stat.mode & 0o777n), sha256: digest(bytes), dev: stat.dev.toString(), ino: stat.ino.toString() };
+  }));
+  const catalogStat = await lstat(path.join(root, "catalog.json"), { bigint: true });
+  return {
+    root,
+    oldCatalogBytes: Buffer.from(oldCatalogBytes),
+    oldCatalogIdentity: `${catalogStat.dev}:${catalogStat.ino}`,
+    catalogBytes: Buffer.from(`${JSON.stringify(nextCatalog, null, 2)}\n`),
+    itemsTree: await migrationTreeCommitment(root, "items"),
+    sourcesTree: await migrationTreeCommitment(root, "sources"),
+    rootEntries: (await readdir(root)).sort(),
+    inputs,
+    backupDir: `.migration-backups/${randomUUID()}`,
+    backupManifestBytes: buildMigrationBackupManifest(inputs.map(({ path: originalPath, sha256, mode }) => ({ originalPath, sha256, mode }))),
+    reviewId: plan.reviewId,
+    sensitivePaths: [...readMigration(plan).sensitivePaths],
+  };
+}
 
 function approvalFor(plan: PreparedMigration): ChangeApproval {
   const view = readMigration(plan);
@@ -96,6 +184,134 @@ test("adopts only existing sources, preserves source custody, and keeps a verifi
       preservedPaths: [],
     });
     assert.equal(await treeSnapshot(fixture.root), committedTree);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("does not authorize a raw review that redirects an items-only plan to unrelated sources", async () => {
+  const fixture = await createLegacyLibrary();
+  try {
+    await writeLegacyCatalog(fixture.root);
+    await writeLegacySnapshot(fixture.root);
+    const unrelatedBytes = Buffer.from("unreviewed unrelated source bytes\n");
+    await writeBytes(fixture.root, "sources/unrelated/AGENTS.md", unrelatedBytes, 0o755);
+    const oldCatalog = await readFile(path.join(fixture.root, "catalog.json"));
+    const plan = await prepareMigration(fixture.root);
+    assert.equal(readMigration(plan).items[0]?.selection, "items");
+    const legacy = JSON.parse(oldCatalog.toString("utf8")) as LegacyCatalog;
+    const forgedNext = {
+      version: 2 as const,
+      items: legacy.items.map((item) => ({ ...item, content: { kind: "file" as const, path: "sources/unrelated/AGENTS.md" } })),
+      groups: legacy.groups,
+    };
+    const rawRequest = await legacyReviewRequest(fixture.root, plan, oldCatalog, forgedNext);
+
+    await assert.rejects(issueMigrationReview(rawRequest), /opaque|prepared|plan|review/i);
+    await assert.rejects(issueMigrationReview(plan, rawRequest), /fixed prepared plan|selected sources plan|selecting existing sources/i);
+    const copiedReview = Object.freeze({ reviewId: plan.reviewId }) as LegacyMigrationReview;
+    await assert.rejects(storageTransactions.run(fixture.root, false, async (session) => {
+      assert.ok(session);
+      await session.commitLegacyMigration(copiedReview, {
+        reviewId: plan.reviewId,
+        confirmed: true,
+        approvedSensitivePaths: [],
+      });
+    }), /issued|invalid|review/i);
+    let expiredSession: StorageSession | undefined;
+    await storageTransactions.run(fixture.root, false, async (session) => { expiredSession = session; });
+    assert.ok(expiredSession);
+    await assert.rejects(expiredSession.commitLegacyMigration(copiedReview, {
+      reviewId: plan.reviewId,
+      confirmed: true,
+      approvedSensitivePaths: [],
+    }), /expired|invalid|lease/i);
+
+    assert.deepEqual(await readFile(path.join(fixture.root, "catalog.json")), oldCatalog);
+    assert.deepEqual(await readFile(path.join(fixture.root, "sources/unrelated/AGENTS.md")), unrelatedBytes);
+    assert.equal((await readdir(fixture.root)).includes(".copi-transaction"), false);
+    assert.equal((await readdir(fixture.root)).includes(".migration-backups"), false);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("binds a source-adopted target to the exact opaque preview selection", async () => {
+  const fixture = await createLegacyLibrary();
+  try {
+    const selectedBytes = Buffer.from("preview-selected source bytes\n");
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", selectedBytes, 0o640);
+    const unrelatedBytes = Buffer.from("unreviewed unrelated source bytes\n");
+    await writeBytes(fixture.root, "sources/unrelated/AGENTS.md", unrelatedBytes, 0o755);
+    const oldCatalog = await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    const plan = await prepareMigration(fixture.root);
+    const view = readMigration(plan);
+    assert.equal(view.status, "ready");
+    assert.equal(view.items[0]?.selection, "sources");
+    assert.equal(view.items[0]?.target, "sources/current/AGENTS.md");
+    const legacy = JSON.parse(oldCatalog.toString("utf8")) as LegacyCatalog;
+    const forgedNext = {
+      version: 2 as const,
+      items: legacy.items.map((item) => ({ ...item, content: { kind: "file" as const, path: "sources/unrelated/AGENTS.md" } })),
+      groups: legacy.groups,
+    };
+    const rawRequest = await legacyReviewRequest(fixture.root, plan, oldCatalog, forgedNext);
+    const before = await treeSnapshot(fixture.root);
+
+    await assert.rejects(issueMigrationReview(plan, rawRequest), /fixed prepared plan|selected sources plan/i);
+    assert.equal(await treeSnapshot(fixture.root), before);
+    assert.deepEqual(await readFile(sourcePath), selectedBytes);
+    assert.deepEqual(await readFile(path.join(fixture.root, "sources/unrelated/AGENTS.md")), unrelatedBytes);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("rejects unknown fields in raw legacy and next catalogs before issuing a migration review", async () => {
+  const fixture = await createLegacyLibrary();
+  try {
+    const sourceBytes = Buffer.from("selected existing source\n");
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", sourceBytes, 0o640);
+    const oldCatalog = await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    const plan = await prepareMigration(fixture.root);
+    assert.equal(readMigration(plan).items[0]?.selection, "sources");
+    const baseLegacy = JSON.parse(oldCatalog.toString("utf8")) as LegacyCatalog;
+    const target = readMigration(plan).items[0]!.target;
+
+    for (const area of ["top", "item", "file", "group"] as const) {
+      const rawNext = {
+        version: 2 as const,
+        items: baseLegacy.items.map((item) => ({ ...item, content: { kind: "file" as const, path: target } })),
+        groups: area === "group"
+          ? [{ id: "223e4567-e89b-42d3-a456-426614174001", name: "Synthetic group", itemIds: [baseLegacy.items[0]!.id] }]
+          : baseLegacy.groups,
+      };
+      const request = await legacyReviewRequest(fixture.root, plan, oldCatalog, rawNext);
+      const rawCatalog = catalogWithUnknownField(rawNext, area);
+      request.catalogBytes = Buffer.from(`${JSON.stringify(rawCatalog, null, 2)}\n`);
+      await assert.rejects(issueMigrationReview(plan, request), /unknown|unsupported|canonical|stored fields/i, `next ${area} field must be rejected`);
+    }
+
+    for (const area of ["top", "item", "file", "group"] as const) {
+      const rawCatalog = catalogWithUnknownField(baseLegacy, area);
+      const oldBytes = Buffer.from(`${JSON.stringify(rawCatalog, null, 2)}\n`);
+      await writeFile(path.join(fixture.root, "catalog.json"), oldBytes);
+      const cleanLegacy = structuredClone(baseLegacy);
+      if (area === "group") cleanLegacy.groups.push({
+        id: "223e4567-e89b-42d3-a456-426614174001",
+        name: "Synthetic group",
+        itemIds: [baseLegacy.items[0]!.id],
+      });
+      const rawNext = {
+        version: 2 as const,
+        items: cleanLegacy.items.map((item) => ({ ...item, content: { kind: "file" as const, path: target } })),
+        groups: cleanLegacy.groups,
+      };
+      const request = await legacyReviewRequest(fixture.root, plan, oldBytes, rawNext);
+      await assert.rejects(issueMigrationReview(plan, request), /unknown|unsupported|canonical|stored fields/i, `old ${area} field must be rejected`);
+    }
   } finally {
     await fixture.dispose();
   }
@@ -200,14 +416,29 @@ test("recovers an adopt-only catalog hold after SIGKILL and keeps the permanent 
     assert.equal(killed.signal, "SIGKILL", killed.stderr);
     assert.equal(await lstat(path.join(fixture.root, "catalog.json")).catch((error: NodeJS.ErrnoException) => error.code), "ENOENT");
 
-    await new StorageTransactions({ waitMilliseconds: 100 }).run(fixture.root, false, async () => undefined);
+    const stagePath = path.join(fixture.root, ".copi-transaction", "next-catalog");
+    const alteredNext = JSON.parse(await readFile(stagePath, "utf8")) as Record<string, unknown>;
+    alteredNext.unrecognizedTopField = "synthetic-rehashed-stage-field";
+    const alteredNextBytes = Buffer.from(`${JSON.stringify(alteredNext, null, 2)}\n`);
+    await writeFile(stagePath, alteredNextBytes);
+    const journalPath = path.join(fixture.root, ".copi-transaction", "journal.json");
+    const journal = JSON.parse(await readFile(journalPath, "utf8")) as Record<string, unknown>;
+    journal.newCatalog = digest(alteredNextBytes);
+    const journalBytes = Buffer.from(JSON.stringify(journal));
+    await writeFile(journalPath, journalBytes);
+    await writeFile(path.join(fixture.root, ".copi-transaction", "journal.digest"), Buffer.from(digest(journalBytes)));
 
-    assert.deepEqual(await readFile(path.join(fixture.root, "catalog.json")), oldCatalog);
+    await assert.rejects(new StorageTransactions({ waitMilliseconds: 100 }).run(fixture.root, false, async () => undefined), /unknown|canonical|stored fields/i);
+    assert.equal(await lstat(path.join(fixture.root, "catalog.json")).catch((error: NodeJS.ErrnoException) => error.code), "ENOENT");
+    assert.deepEqual(await readFile(stagePath), alteredNextBytes);
+    assert.ok((await readdir(path.join(fixture.root, ".copi-transaction"))).includes("journal.json"));
+    assert.ok((await readdir(fixture.root)).includes(".migration-backups"));
+
     const sourceAfter = await lstat(sourcePath, { bigint: true });
     assert.equal(sourceAfter.dev, sourceBefore.dev);
     assert.equal(sourceAfter.ino, sourceBefore.ino);
     assert.deepEqual(await readFile(sourcePath), sourceBytes);
-    assert.equal((await readdir(fixture.root)).includes(".copi-transaction"), false);
+    assert.equal((await readdir(fixture.root)).includes(".copi-transaction"), true);
     assert.ok((await readdir(fixture.root)).includes(".migration-backups"));
   } finally {
     await fixture.dispose();
