@@ -600,8 +600,24 @@ test("S4 sources-root symlink swap stops before live outside mutation", async ()
     errorChainContains(error, (nested) => nested.message === "Registered sources tree changed during commit; refusing overwrite.") &&
     errorChainContains(error, (nested) => nested.message === "Registered sources tree has a missing, unsafe, or symbolic-link parent directory."));
   assert.equal(crossed, false);
-  const sourceLink = await lstat(sourcesRoot);
-  assert.ok(sourceLink.isSymbolicLink());
+  const sourceLinkBeforeReader = await lstat(sourcesRoot);
+  assert.ok(sourceLinkBeforeReader.isSymbolicLink());
+  assert.equal(await readlink(sourcesRoot), outside);
+  const lock = path.join(b.library, ".copi-transaction");
+  const journalPath = path.join(lock, "journal.json");
+  const retainedLock = await rawTree(lock);
+  const journalBefore = await readFile(journalPath);
+  const journalStatBefore = await lstat(journalPath);
+  await assert.rejects(loadStoredCatalog(b.library), (error: unknown) => error instanceof Error && error.message === "Copi transaction recovery stopped after an external change; inspect its owner-only journal. No external bytes were overwritten.");
+  assert.deepEqual(await rawTree(lock), retainedLock);
+  assert.deepEqual(await readFile(journalPath), journalBefore);
+  const journalStatAfter = await lstat(journalPath);
+  assert.equal(journalStatAfter.dev, journalStatBefore.dev);
+  assert.equal(journalStatAfter.ino, journalStatBefore.ino);
+  const sourceLinkAfterReader = await lstat(sourcesRoot);
+  assert.ok(sourceLinkAfterReader.isSymbolicLink());
+  assert.equal(sourceLinkAfterReader.dev, sourceLinkBeforeReader.dev);
+  assert.equal(sourceLinkAfterReader.ino, sourceLinkBeforeReader.ino);
   assert.equal(await readlink(sourcesRoot), outside);
   assert.deepEqual(await rawTree(outside), outsideBefore);
   assert.deepEqual(await rawTree(originalSources), originalBefore);
@@ -611,17 +627,7 @@ test("S4 sources-root symlink swap stops before live outside mutation", async ()
   const originalRootAfter = await lstat(originalSources);
   assert.equal(originalRootAfter.dev, originalRootBefore.dev);
   assert.equal(originalRootAfter.ino, originalRootBefore.ino);
-  const lock = path.join(b.library, ".copi-transaction");
-  const journalPath = path.join(lock, "journal.json");
-  const retainedLock = await rawTree(lock);
-  const journalBefore = await readFile(journalPath);
-  const journalStatBefore = await lstat(journalPath);
-  assert.deepEqual(await rawTree(lock), retainedLock);
-  assert.deepEqual(await readFile(journalPath), journalBefore);
-  const journalStatAfter = await lstat(journalPath);
-  assert.equal(journalStatAfter.dev, journalStatBefore.dev);
-  assert.equal(journalStatAfter.ino, journalStatBefore.ino);
-  await evidence(b, "sources-root-ancestor-swap", { outside, originalSources, journalPath, outsideFile: { dev: outsideFileAfter.dev, ino: outsideFileAfter.ino }, sourceLink: { dev: sourceLink.dev, ino: sourceLink.ino } });
+  await evidence(b, "sources-root-ancestor-swap", { outside, originalSources, journalPath, outsideFile: { dev: outsideFileAfter.dev, ino: outsideFileAfter.ino }, sourceLink: { dev: sourceLinkAfterReader.dev, ino: sourceLinkAfterReader.ino } });
 });
 
 test("S4 v1 reader preserves legacy metadata and bytes; ordinary apply requires explicit migration", async () => {
