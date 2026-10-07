@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, lstat, mkdir, readFile, readlink, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { loadCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { commitRefresh, discoverRefreshOrigin, prepareRefresh, readRefresh, resolveRefreshPath, type PreparedRefresh } from "../src/refresh.ts";
 import { StorageTransactions, storageTransactions, type StorageCheckpoint } from "../src/storage-transaction.ts";
 import type { ResourceCandidate } from "../src/types.ts";
-import { approval, at, contract, down, enter, evidence, finish, fixture, hash, manage, packageFixture, plain, tree } from "./helpers/issue4-acceptance.ts";
+import { approval, at, contract, down, enter, evidence, finish, fixture, hash, loadCatalog, manage, packageFixture, plain, savedPath, storedContentPath, tree } from "./helpers/issue4-acceptance.ts";
 
 // Independent acceptance oracles fixed BEFORE execution: full snapshot replacement,
 // exact prepared bytes/modes, identity+all memberships preserved, fail closed on
@@ -74,8 +75,8 @@ for(const kind of ["false","string","number","missing","wrong-review","missing-s
  test(`R5 rejection ${kind} retains exact FS`,async()=>{
   const b=await fixture(), source=await b.replacement({"SKILL.md":"token: sk_live_Independent111111111\n","b.md":"password: Independent222222222\n"}), p=await prepareRefresh(b.library,b.item.id,source);
   assert.deepEqual([...readRefresh(p).sensitivePaths].sort(),["SKILL.md","b.md"]);
-  const a:any=approval(p); if(kind==="false")a.confirmed=false;if(kind==="string")a.confirmed="true";if(kind==="number")a.confirmed=1;if(kind==="missing")delete a.confirmed;
-  if(kind==="wrong-review")a.reviewId="fake";if(kind==="missing-secret")delete a.approvedSensitivePaths;if(kind==="one-secret")a.approvedSensitivePaths=["SKILL.md"];if(kind==="duplicate")a.approvedSensitivePaths=["SKILL.md","SKILL.md"];if(kind==="extra")a.approvedSensitivePaths.push("other.md");
+  const a=approval(p); if(kind==="false")Object.assign(a,{confirmed:false});if(kind==="string")Object.assign(a,{confirmed:"true"});if(kind==="number")Object.assign(a,{confirmed:1});if(kind==="missing")assert.equal(Reflect.deleteProperty(a,"confirmed"),true);
+  if(kind==="wrong-review")a.reviewId="fake";if(kind==="missing-secret")assert.equal(Reflect.deleteProperty(a,"approvedSensitivePaths"),true);if(kind==="one-secret")Object.assign(a,{approvedSensitivePaths:["SKILL.md"]});if(kind==="duplicate")Object.assign(a,{approvedSensitivePaths:["SKILL.md","SKILL.md"]});if(kind==="extra")a.approvedSensitivePaths.push("other.md");
   const before=await tree(b.library), originals=await tree(b.source);await assert.rejects(commitRefresh(p,a));assert.deepEqual(await tree(b.library),before);assert.deepEqual(await tree(b.source),originals);
  });
 
@@ -141,12 +142,109 @@ for(const attack of ["clone","mutation","proxy","prototype-toJSON","accessor-swi
 
 for(const conflict of ["group","name","source-metadata","destination","catalog-bytes","body","unregistered"] as const) test(`R3/R6 ${conflict} conflict preserves external state`,async()=>{
  const b=await fixture(),p=await prepareRefresh(b.library,b.item.id,await b.replacement({"SKILL.md":"new\n"}));
- if(conflict==="body")await writeFile(b.saved("SKILL.md"),"external body\n");else if(conflict==="unregistered")await writeFile(b.saved("unknown.md"),"user unknown\n");else if(conflict==="catalog-bytes")await writeFile(path.join(b.library,"catalog.json"),(await readFile(path.join(b.library,"catalog.json"))).toString()+" ");else {const c=await loadCatalog(b.library);if(conflict==="group")c.groups[0]!.itemIds=[];if(conflict==="name")c.items[0]!.name="external name";if(conflict==="source-metadata")c.items[0]!.source="external source";if(conflict==="destination")c.items[0]!.destination={kind:"project",path:"OTHER.md"};await saveCatalog(b.library,c);}
+ if(conflict==="body")await writeFile(b.saved("SKILL.md"),"external body\n");else if(conflict==="unregistered")await writeFile(b.saved("unknown.md"),"user unknown\n");else if(conflict==="catalog-bytes")await writeFile(path.join(b.library,"catalog.json"),(await readFile(path.join(b.library,"catalog.json"))).toString()+" ");else {const c=await loadCatalog(b.library);if(conflict==="group")c.groups[0]!.itemIds=[];if(conflict==="name")c.items[0]!.name="external name";if(conflict==="source-metadata")c.items[0]!.source="external source";if(conflict==="destination")c.items[0]!.destination={kind:"project",path:"OTHER.md"};if(conflict==="source-metadata")await writeFile(path.join(b.library,"catalog.json"),`${JSON.stringify(c,null,2)}\n`);else await saveCatalog(b.library,c);}
  const external=await tree(b.library),originals=await tree(b.source);await assert.rejects(commitRefresh(p,approval(p)),/changed|checksum|registered/);assert.deepEqual(await tree(b.library),external);assert.deepEqual(await tree(b.source),originals);await evidence(b,`conflict-${conflict}`);
 });
 
-test("R6 checksum and unknown physical elements reject during prepare without repairing/deleting",async()=>{
- for(const unknown of [false,true]) {const b=await fixture();await writeFile(b.saved(unknown?"unknown.md":"SKILL.md"),"external changes\n");const before=await tree(b.library);await assert.rejects(prepareRefresh(b.library,b.item.id,await b.replacement({"SKILL.md":"new\n"})),/checksum|registered/);assert.deepEqual(await tree(b.library),before);}
+test("S2 current saved bytes, not the stale descriptor SHA, are the refresh diff baseline",async()=>{
+ const b=await fixture({"SKILL.md":"original saved bytes\n"}),source=await b.replacement({"SKILL.md":"approved replacement bytes\n"});
+ const original=await loadCatalog(b.library),descriptorBefore=structuredClone(original.items[0]!.files),file=b.saved("SKILL.md");
+ const edited=Buffer.from("manual current saved bytes\n");await writeFile(file,edited);const editedStat=await lstat(file),sourceBefore=await tree(b.source);
+ const current=await loadCatalog(b.library),currentFiles=await readSnapshotFiles(b.library,current.items[0]!);
+ assert.deepEqual(currentFiles[0]!.bytes,edited);assert.equal(currentFiles[0]!.sha256,hash(edited));assert.deepEqual(current.items[0]!.files,descriptorBefore);
+ const prepared=await prepareRefresh(b.library,b.item.id,source),review=readRefresh(prepared);
+ assert.match(review.diffs[0]!.diff,/manual current saved bytes/);assert.doesNotMatch(review.diffs[0]!.diff,/original saved bytes/);
+ assert.deepEqual(review.originalCatalog.items[0]!.files,descriptorBefore);assert.deepEqual((await loadCatalog(b.library)).items[0]!.files,descriptorBefore);
+ assert.deepEqual(await readFile(file),edited);const afterStat=await lstat(file);assert.equal(afterStat.dev,editedStat.dev);assert.equal(afterStat.ino,editedStat.ino);
+ assert.deepEqual(await tree(b.source),sourceBefore);await evidence(b,"current-saved-bytes-refresh-baseline",{descriptorSha:descriptorBefore[0]!.sha256,currentSha:hash(edited),bytes:edited.toString()});
+});
+
+test("S2 a saved-byte edit after refresh preview is rejected without repairing descriptor or replacing the edited inode",async()=>{
+ const b=await fixture(),source=await b.replacement({"SKILL.md":"approved replacement bytes\n"}),prepared=await prepareRefresh(b.library,b.item.id,source);
+ const file=b.saved("SKILL.md"),descriptorBefore=structuredClone((await loadCatalog(b.library)).items[0]!.files);
+ const external=Buffer.from("external saved bytes after preview\n");await writeFile(file,external);const externalStat=await lstat(file),libraryBefore=await tree(b.library),sourceBefore=await tree(b.source);
+ await assert.rejects(commitRefresh(prepared,approval(prepared)),/changed|checksum|registered/);
+ assert.deepEqual(await tree(b.library),libraryBefore);assert.deepEqual(await readFile(file),external);
+ const afterStat=await lstat(file);assert.equal(afterStat.dev,externalStat.dev);assert.equal(afterStat.ino,externalStat.ino);
+ assert.deepEqual((await loadCatalog(b.library)).items[0]!.files,descriptorBefore);assert.deepEqual(await tree(b.source),sourceBefore);
+ await evidence(b,"post-preview-saved-byte-change-retained",{descriptorSha:descriptorBefore[0]!.sha256,externalSha:hash(external),inode:{dev:externalStat.dev,ino:externalStat.ino}});
+});
+
+test("R6 ordinary unknown children are shown as masked deletions and deleted only after exact review approval",async()=>{
+ const b=await fixture({"SKILL.md":"old saved bytes\n"}),textPath=b.saved("unknown.md"),binaryPath=b.saved("asset.bin");
+ const secret=Buffer.from("apiKey: sk_live_unknownBeforeReview123456789\n"),binary=Buffer.from([0,1,2,255]);
+ await writeFile(textPath,secret);await chmod(textPath,0o600);await writeFile(binaryPath,binary);await chmod(binaryPath,0o600);
+ const source=await b.replacement({"SKILL.md":"approved source bytes\n"}),catalogBefore=await loadCatalog(b.library),descriptorBefore=structuredClone(catalogBefore.items[0]!.files);
+ const libraryBefore=await tree(b.library),libraryInodesBefore=await inodeTree(b.library),sourceBefore=await tree(b.source),sourceInodesBefore=await inodeTree(b.source);
+ const prepared=await prepareRefresh(b.library,b.item.id,source),review=readRefresh(prepared);
+ assert.deepEqual(await tree(b.library),libraryBefore);assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);
+ assert.deepEqual(await tree(b.source),sourceBefore);assert.deepEqual(await inodeTree(b.source),sourceInodesBefore);
+ assert.deepEqual(review.originalCatalog.items[0]!.files,descriptorBefore);assert.equal(review.bytesChanged,true);assert.deepEqual(review.sensitivePaths,[]);
+ const textRemoval=review.diffs.find(diff=>diff.path==="unknown.md"),binaryRemoval=review.diffs.find(diff=>diff.path==="asset.bin");assert.ok(textRemoval);assert.ok(binaryRemoval);
+ assert.equal(textRemoval.bytesChanged,true);assert.equal(textRemoval.summary,`Bytes changed; ${secret.length} → 0 bytes; mode 600 → absent.`);
+ assert.ok(textRemoval.diff.includes("unknown.md"));assert.match(textRemoval.diff,/REDACTED/);assert.ok(!JSON.stringify(review.diffs).includes(secret.toString()));
+ assert.equal(binaryRemoval.bytesChanged,true);assert.equal(binaryRemoval.diff,"");assert.equal(binaryRemoval.summary,"Bytes changed; 4 → 0 bytes; mode 600 → absent.");
+ const approved=approval(prepared);
+ await assert.rejects(commitRefresh(prepared,{...approved,confirmed:false}),/Saved change was not confirmed; no bytes were written\./);
+ assert.deepEqual(await tree(b.library),libraryBefore);assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);assert.deepEqual(await tree(b.source),sourceBefore);
+ await assert.rejects(commitRefresh(prepared,{...approved,reviewId:"forged-review"}),/Approval reviewId does not match this prepared change\./);
+ assert.deepEqual(await tree(b.library),libraryBefore);assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);assert.deepEqual(await tree(b.source),sourceBefore);
+ const committed=await commitRefresh(prepared,approved);assert.equal(committed.id,b.item.id);assert.deepEqual(committed.files.map(file=>file.path),["SKILL.md"]);
+ assert.equal(await lstat(textPath).then(()=>true,()=>false),false);assert.equal(await lstat(binaryPath).then(()=>true,()=>false),false);
+ assert.deepEqual(await readFile(b.saved("SKILL.md")),Buffer.from("approved source bytes\n"));assert.deepEqual(await tree(b.source),sourceBefore);assert.deepEqual(await inodeTree(b.source),sourceInodesBefore);
+});
+
+for(const mutation of ["post-preview-child","same-inode-edit"] as const)test(`R6 ${mutation} after review retains external bytes/inode and rejects the prepared deletion`,async()=>{
+ const b=await fixture({"SKILL.md":"old saved bytes\n"}),unknown=b.saved("unknown.md");await writeFile(unknown,"ordinary bytes before review\n");await chmod(unknown,0o600);
+ const prepared=await prepareRefresh(b.library,b.item.id,await b.replacement({"SKILL.md":"approved source bytes\n"}));
+ let externalPath:string,externalBytes:Buffer;
+ if(mutation==="post-preview-child"){
+  externalPath=b.saved("late-child.md");externalBytes=Buffer.from("user file added after preview\n");await writeFile(externalPath,externalBytes);await chmod(externalPath,0o600);
+ }else{
+  externalPath=unknown;const beforeStat=await lstat(externalPath);externalBytes=Buffer.from("same inode edited after preview\n");await writeFile(externalPath,externalBytes);
+  const afterStat=await lstat(externalPath);assert.equal(afterStat.dev,beforeStat.dev);assert.equal(afterStat.ino,beforeStat.ino);
+ }
+ const externalStat=await lstat(externalPath),libraryAfterExternal=await tree(b.library),libraryInodesAfterExternal=await inodeTree(b.library),sourceAfterExternal=await tree(b.source);
+ await assert.rejects(commitRefresh(prepared,approval(prepared)),/Copi library changed after preparation \(catalog or saved bytes\)/);
+ assert.deepEqual(await tree(b.library),libraryAfterExternal);assert.deepEqual(await inodeTree(b.library),libraryInodesAfterExternal);assert.deepEqual(await readFile(externalPath),externalBytes);
+ const afterStat=await lstat(externalPath);assert.equal(afterStat.dev,externalStat.dev);assert.equal(afterStat.ino,externalStat.ino);
+ assert.deepEqual(await tree(b.source),sourceAfterExternal);assert.deepEqual((await loadCatalog(b.library)).items[0]!.files,b.item.files);
+});
+
+test("R6 excluded physical children are not silently hidden or converted into ordinary deletions",async()=>{
+ const b=await fixture(),content=storedContentPath(b.library,b.item),privateDir=path.join(content,"auth"),privateFile=path.join(privateDir,"token.txt");
+ await mkdir(privateDir);const privateBytes=Buffer.from("private excluded fixture bytes\n");await writeFile(privateFile,privateBytes);const source=await b.replacement({"SKILL.md":"new\n"});
+ const catalogBefore=await readFile(path.join(b.library,"catalog.json")),savedBefore=await readFile(b.saved("SKILL.md")),libraryInodesBefore=await inodeTree(b.library),sourceBefore=await tree(b.source);
+ await assert.rejects(prepareRefresh(b.library,b.item.id,source),/Excluded\/private files in a registered sources tree require preservation/);
+ assert.deepEqual(await readFile(path.join(b.library,"catalog.json")),catalogBefore);assert.deepEqual(await readFile(b.saved("SKILL.md")),savedBefore);
+ assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);assert.deepEqual(await readFile(privateFile),privateBytes);assert.deepEqual(await tree(b.source),sourceBefore);
+});
+
+test("R6 symlink nodes in the saved tree remain unshown and fail closed",async()=>{
+ const b=await fixture(),content=storedContentPath(b.library,b.item),link=path.join(content,"external-link.md");await symlink(path.join(b.sourcePath,"SKILL.md"),link);const source=await b.replacement({"SKILL.md":"new\n"});
+ const catalogBefore=await readFile(path.join(b.library,"catalog.json")),savedBefore=await readFile(b.saved("SKILL.md")),libraryInodesBefore=await inodeTree(b.library),linkTarget=await readlink(link),sourceBefore=await tree(b.source);
+ await assert.rejects(prepareRefresh(b.library,b.item.id,source),/unsafe symbolic link/);
+ assert.deepEqual(await readFile(path.join(b.library,"catalog.json")),catalogBefore);assert.deepEqual(await readFile(b.saved("SKILL.md")),savedBefore);
+ assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);assert.equal(await readlink(link),linkTarget);assert.deepEqual(await tree(b.source),sourceBefore);
+});
+
+test("R6 empty directories are not silently omitted from the saved-tree review",async()=>{
+ const b=await fixture(),content=storedContentPath(b.library,b.item),empty=path.join(content,"empty");await mkdir(empty);const source=await b.replacement({"SKILL.md":"new\n"});
+ const catalogBefore=await readFile(path.join(b.library,"catalog.json")),savedBefore=await readFile(b.saved("SKILL.md")),libraryInodesBefore=await inodeTree(b.library),sourceBefore=await tree(b.source);
+ await assert.rejects(prepareRefresh(b.library,b.item.id,source),/Empty sources directories are not represented in file review/);
+ assert.deepEqual(await readFile(path.join(b.library,"catalog.json")),catalogBefore);assert.deepEqual(await readFile(b.saved("SKILL.md")),savedBefore);
+ assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);assert.deepEqual(await tree(b.source),sourceBefore);
+});
+
+test("R6 special nodes are rejected without mutation or loss of identity",async()=>{
+ const b=await fixture(),content=storedContentPath(b.library,b.item),fifo=path.join(content,"ordinary-pipe");
+ const created=spawnSync("mkfifo",[fifo],{encoding:"utf8"});assert.equal(created.status,0,created.stderr);assert.ifError(created.error);const source=await b.replacement({"SKILL.md":"new\n"});
+ const beforeStat=await lstat(fifo),catalogBefore=await readFile(path.join(b.library,"catalog.json")),savedBefore=await readFile(b.saved("SKILL.md")),libraryInodesBefore=await inodeTree(b.library),sourceBefore=await tree(b.source);
+ assert.ok(beforeStat.isFIFO());
+ await assert.rejects(prepareRefresh(b.library,b.item.id,source),/Unsupported special file in copi storage\./);
+ const afterStat=await lstat(fifo);assert.ok(afterStat.isFIFO());assert.equal(afterStat.dev,beforeStat.dev);assert.equal(afterStat.ino,beforeStat.ino);
+ assert.deepEqual(await readFile(path.join(b.library,"catalog.json")),catalogBefore);assert.deepEqual(await readFile(b.saved("SKILL.md")),savedBefore);
+ assert.deepEqual(await inodeTree(b.library),libraryInodesBefore);assert.deepEqual(await tree(b.source),sourceBefore);
 });
 
 for(const boundary of ["stage-write","stage-sync","journal","old-renamed","new-renamed","before-catalog","catalog-held","catalog-renamed","directory-sync","committed"] as StorageCheckpoint[]) test(`R6 actual commitRefresh failure ${boundary} rolls back exact snapshot+catalog`,async()=>{
@@ -182,10 +280,10 @@ for(const interrupt of ["ctrl-c","escape","eof","SIGINT","SIGTERM","SIGHUP"] as 
 });
 
 test("R2/R3 real CLI missing file reselects regular same-kind source; no wide search, no body rewrite",async()=>{
- const b=await fixture({"original.md":"old body\n"},"subagent");await rm(b.sourcePath);const s=await b.replacement({"new.md":"# Keep embedded body name\nnew original body\n"});const originals=await tree(b.source);
+ const b=await fixture({"original.md":"old body\n"},"subagent");await rm(b.sourcePath);const s=await b.replacement({"original.md":"# Keep embedded body name\nnew original body\n"});const originals=await tree(b.source);
  const r=await manage(b,[...enter,at("New source path",`${s.sourcePath}\r`),at("Source scope","\r"),at(contract.permission),at(contract.diff),at(contract.final),finish]);assert.equal(r.code,0,r.output);
  assert.ok(r.output.includes("sourceRoot was not stored"));assert.ok(r.output.includes("No HOME or parent tree will be searched implicitly"));assert.ok(r.output.includes(path.dirname(s.sourcePath)));assert.ok(r.output.indexOf("Source read permission")<r.output.indexOf(contract.permission));
- const item=(await loadCatalog(b.library)).items[0]!;for(const k of contract.preserve)assert.deepEqual(item[k as keyof typeof item],b.item[k as keyof typeof b.item]);assert.equal(item.sourcePath,s.sourcePath);assert.equal(await readFile(b.saved("new.md"),"utf8"),"# Keep embedded body name\nnew original body\n");assert.deepEqual(await tree(b.source),originals);await evidence(b,"cli-reselection",{pty:r.log});
+ const item=(await loadCatalog(b.library)).items[0]!;for(const k of contract.preserve)assert.deepEqual(item[k as keyof typeof item],b.item[k as keyof typeof b.item]);assert.equal(item.sourcePath,s.sourcePath);assert.equal(await readFile(b.saved("original.md"),"utf8"),"# Keep embedded body name\nnew original body\n");assert.deepEqual(await tree(b.source),originals);await evidence(b,"cli-reselection",{pty:r.log});
 });
 
 for(const stage of ["source-path","source-scope"] as const)test(`R2/R6 real CLI missing directory cancellation ${stage}`,async()=>{
@@ -325,6 +423,15 @@ import { importPreparedResource, prepareResource } from "../src/catalog.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange } from "../src/resource-mutations.ts";
 
+async function inodeTree(root: string): Promise<Record<string, { dev: number; ino: number }>> {
+ const entries: Record<string, { dev: number; ino: number }> = {};
+ async function visit(target: string, relative: string): Promise<void> {
+  const stat = await lstat(target); entries[relative || "."] = { dev: stat.dev, ino: stat.ino };
+  if (!stat.isDirectory()) return;
+  for (const name of await readdir(target)) await visit(path.join(target, name), relative ? `${relative}/${name}` : name);
+ }
+ await visit(root, ""); return entries;
+}
 async function modeLayers(b:Awaited<ReturnType<typeof fixture>>,expected:Record<string,{bytes:Buffer;mode:number}>,review?:ReturnType<typeof readRefresh>,returned?:typeof b.item) {
  const item=(await loadCatalog(b.library)).items.find(i=>i.id===b.item.id)!;const files=await readSnapshotFiles(b.library,item);
  assert.deepEqual(files.map(f=>f.path).sort(),Object.keys(expected).sort());
@@ -335,7 +442,8 @@ async function modeLayers(b:Awaited<ReturnType<typeof fixture>>,expected:Record<
   if(review)assert.equal(review.item.files.find(f=>f.path===p)!.mode,want.mode);
   if(returned)assert.equal(returned.files.find(f=>f.path===p)!.mode,want.mode);
  }
- for(const dir of [b.library,path.join(b.library,"items"),path.join(b.library,"items",item.id),path.dirname(b.saved("SKILL.md"))])assert.equal((await lstat(dir)).mode&0o777,0o700);
+ const contentPath=storedContentPath(b.library,item);
+ for(const dir of [b.library,path.join(b.library,"sources"),contentPath])assert.equal((await lstat(dir)).mode&0o777,0o700);
  assert.equal((await lstat(path.join(b.library,"catalog.json"))).mode&0o777,0o600);
  assert.ok(!Object.keys(await tree(b.library)).some(p=>p.includes(".copi-transaction")));
  return files.map(f=>({path:f.path,descriptor:f.mode,privateMode:0o600,hash:f.sha256}));
@@ -381,17 +489,46 @@ test("origincheck full bundle five source modes, two individual secrets, binary/
 
 test("origincheck same bytes with different source descriptor modes must be apply collision despite both private inodes 0600",async()=>{
  const b=await fixture({"SKILL.md":"identical shared bytes\n"}),s=await b.replacement({"SKILL.md":"identical shared bytes\n"});await chmod(path.join(s.sourcePath,"SKILL.md"),0o755);const preparedSource=await prepareResource({...s,name:"second unique resource",destination:{...b.item.destination}}),inspection=await inspectPreparedResource(preparedSource),second=await importPreparedResource(b.library,preparedSource,{confirmed:true,groupIds:[],inspection,approvedSensitivePaths:inspection.sensitivePaths});assert.ok(second);
- const c=await loadCatalog(b.library);c.groups[0]!.itemIds.push(second.id);await saveCatalog(b.library,c);const secondFile=path.join(b.library,"items",second.id,"files","SKILL.md");assert.equal((await lstat(b.saved("SKILL.md"))).mode&0o777,0o600);assert.equal((await lstat(secondFile)).mode&0o777,0o600);assert.equal(second.files[0]!.mode,0o755);assert.equal((await readSnapshotFiles(b.library,second))[0]!.mode,0o755);
+ const c=await loadCatalog(b.library);c.groups[0]!.itemIds.push(second.id);await saveCatalog(b.library,c);const secondFile=savedPath(b.library,second,"SKILL.md");assert.equal((await lstat(b.saved("SKILL.md"))).mode&0o777,0o600);assert.equal((await lstat(secondFile)).mode&0o777,0o600);assert.equal(second.files[0]!.mode,0o755);assert.equal((await readSnapshotFiles(b.library,second))[0]!.mode,0o755);
  const originals=await tree(b.source),before=await tree(b.cwd),plan=await planApply(b.library,"alpha",b.cwd);assert.equal(plan.files[0]!.status,"collision");assert.deepEqual(plan.collisions[0]!.itemIds.slice().sort(),[b.item.id,second.id].sort());await assert.rejects(executeApply(b.library,plan,{}),/collision selection/);assert.deepEqual(await tree(b.cwd),before);
  await executeApply(b.library,plan,{collisions:{".pi/skills/retained/SKILL.md":second.id}});assert.equal((await lstat(path.join(b.cwd,".pi/skills/retained/SKILL.md"))).mode&0o777,0o755);assert.equal(await readFile(path.join(b.cwd,".pi/skills/retained/SKILL.md"),"utf8"),"identical shared bytes\n");assert.deepEqual(await tree(b.source),originals);await evidence(b,"origincheck-descriptor-collision",{firstDescriptor:b.item.files[0]!.mode,secondDescriptor:second.files[0]!.mode,bothPrivate:0o600,applyMode:0o755});
 });
 
-for(const conflict of ["private-mode-race","apply-mode-race","checksum"] as const)test(`origincheck three-layer ${conflict} stops without clobbering external bytes/mode`,async()=>{
+for(const conflict of ["private-mode-race","apply-mode-race"] as const)test(`origincheck three-layer ${conflict} stops without clobbering external bytes/mode`,async()=>{
  const b=await fixture(),s=await b.replacement({"SKILL.md":"new fixed source\n"});await chmod(path.join(s.sourcePath,"SKILL.md"),0o755);const p=await prepareRefresh(b.library,b.item.id,s);
  if(conflict==="private-mode-race"){await chmod(b.saved("SKILL.md"),0o700);const before=await tree(b.library),orig=await tree(b.source);await assert.rejects(commitRefresh(p,approval(p)),/changed/);assert.deepEqual(await tree(b.library),before);assert.deepEqual(await tree(b.source),orig);}
- else if(conflict==="checksum"){await writeFile(b.saved("SKILL.md"),"external corrupt bytes\n");const before=await tree(b.library),orig=await tree(b.source);await assert.rejects(commitRefresh(p,approval(p)),/checksum/);await assert.rejects(planApply(b.library,"alpha",b.cwd),/checksum/);assert.deepEqual(await tree(b.library),before);assert.deepEqual(await tree(b.source),orig);}
  else{await commitRefresh(p,approval(p));const plan=await planApply(b.library,"alpha",b.cwd);await executeApply(b.library,plan,{});const next=await b.replacement({"SKILL.md":"other fixed bytes\n"});await chmod(path.join(next.sourcePath,"SKILL.md"),0o751);const q=await prepareRefresh(b.library,b.item.id,next);await commitRefresh(q,approval(q));const apply=await planApply(b.library,"alpha",b.cwd);await chmod(path.join(b.cwd,".pi/skills/retained/SKILL.md"),0o700);const before=await tree(b.cwd),priv=await tree(b.library),orig=await tree(b.source);await assert.rejects(executeApply(b.library,apply,{existing:{".pi/skills/retained/SKILL.md":"replace"}}),/changed after planning/);assert.deepEqual(await tree(b.cwd),before);assert.deepEqual(await tree(b.library),priv);assert.deepEqual(await tree(b.source),orig);}
  await evidence(b,`origincheck-${conflict}`);
+});
+
+test("S2 apply preview uses current saved bytes and requires individual approval without repairing the old descriptor SHA",async()=>{
+ const b=await fixture({"SKILL.md":"original catalog bytes\n"}),file=b.saved("SKILL.md"),target=".pi/skills/retained/SKILL.md";
+ const descriptorBefore=structuredClone((await loadCatalog(b.library)).items[0]!.files),oldStat=await lstat(file),current=Buffer.from("manual current saved bytes\napiKey: sk_live_currentApplyReview987654321\n");
+ await writeFile(file,current);const currentStat=await lstat(file);assert.equal(currentStat.dev,oldStat.dev);assert.equal(currentStat.ino,oldStat.ino);
+ const currentHash=hash(current),libraryBeforePlan=await tree(b.library),projectBeforePlan=await tree(b.cwd),snapshot=await readSnapshotFiles(b.library,b.item);
+ assert.deepEqual(snapshot[0]!.bytes,current);assert.equal(snapshot[0]!.sha256,currentHash);assert.deepEqual((await loadCatalog(b.library)).items[0]!.files,descriptorBefore);
+ const plan=await planApply(b.library,"alpha",b.cwd);assert.equal(plan.files.length,1);const filePlan=plan.files[0]!;
+ assert.equal(filePlan.path,target);assert.equal(filePlan.status,"new");assert.equal(filePlan.sensitive,true);assert.equal(filePlan.preview.kind,"text");
+ if(filePlan.preview.kind!=="text")throw new Error("Text fixture must produce a masked text preview.");
+ assert.ok(filePlan.preview.diff.includes("manual current saved bytes"));assert.ok(!filePlan.preview.diff.includes("original catalog bytes"));assert.ok(!filePlan.preview.diff.includes("sk_live_currentApplyReview987654321"));
+ assert.deepEqual(await tree(b.library),libraryBeforePlan);assert.deepEqual(await tree(b.cwd),projectBeforePlan);
+ await assert.rejects(executeApply(b.library,plan,{}),/Explicit secret approval is required for \.pi\/skills\/retained\/SKILL\.md\./);
+ assert.deepEqual(await tree(b.library),libraryBeforePlan);assert.deepEqual(await tree(b.cwd),projectBeforePlan);
+ const applied=await executeApply(b.library,plan,{secretApprovals:[target]});assert.deepEqual(applied.written,[target]);assert.equal(applied.cancelled,false);
+ assert.deepEqual(await readFile(path.join(b.cwd,...target.split("/"))),current);assert.deepEqual(await tree(b.library),libraryBeforePlan);
+ assert.deepEqual((await loadCatalog(b.library)).items[0]!.files,descriptorBefore);const after=await readSnapshotFiles(b.library,b.item);assert.deepEqual(after[0]!.bytes,current);assert.equal(after[0]!.sha256,currentHash);
+ assert.deepEqual(Object.keys(await tree(b.cwd)).sort(),[".pi",".pi/skills",".pi/skills/retained",target].sort());
+});
+
+test("S2 apply plan rejects a same-inode saved-byte edit after preview without clobbering it",async()=>{
+ const b=await fixture({"SKILL.md":"catalog preview baseline\n"}),file=b.saved("SKILL.md"),descriptorBefore=structuredClone((await loadCatalog(b.library)).items[0]!.files);
+ const plan=await planApply(b.library,"alpha",b.cwd),beforeEdit=await lstat(file),external=Buffer.from("manual same-inode edit after plan\n");
+ await writeFile(file,external);const externalStat=await lstat(file);assert.equal(externalStat.dev,beforeEdit.dev);assert.equal(externalStat.ino,beforeEdit.ino);
+ const libraryAfterEdit=await tree(b.library),libraryInodesAfterEdit=await inodeTree(b.library),projectBeforeExecute=await tree(b.cwd);
+ await assert.rejects(executeApply(b.library,plan,{}),/Copi library changed after preparation \(catalog or saved bytes\)/);
+ assert.deepEqual(await tree(b.library),libraryAfterEdit);assert.deepEqual(await inodeTree(b.library),libraryInodesAfterEdit);assert.deepEqual(await readFile(file),external);
+ const afterStat=await lstat(file);assert.equal(afterStat.dev,externalStat.dev);assert.equal(afterStat.ino,externalStat.ino);
+ assert.deepEqual((await loadCatalog(b.library)).items[0]!.files,descriptorBefore);assert.deepEqual(await tree(b.cwd),projectBeforeExecute);
 });
 
 for(const attack of ["prototype-toJSON","nonenumerable-toJSON","clone","manual","mutation","proxy","prototype-derived","accessor","symbol","extra-field","nested-mutation","nested-accessor","nested-proxy","nested-prototype","nested-toJSON"] as const)test(`origincheck authority ${attack} rejects at actual prepare/commit; zero hooks and complete custody`,async()=>{
