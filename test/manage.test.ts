@@ -3,13 +3,38 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { importPreparedResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { duplicateFixture, sandbox, type Sandbox } from "./helpers/sandbox.ts";
 import { runTerminalPty, type TerminalAction } from "./helpers/terminal-editor.ts";
-import { packageRefreshFixture, refreshFixture, refreshCustody } from "./helpers/refresh.ts";
+import { packageRefreshFixture as makePackageRefreshFixture, refreshFixture as makeRefreshFixture, refreshCustody } from "./helpers/refresh.ts";
 
-const cli = new URL("../src/cli.js", import.meta.url).pathname;
+const sourceTypeScript = import.meta.url.endsWith(".ts");
+const sourceNodeFlags = sourceTypeScript ? ["--experimental-transform-types"] : [];
+const cli = new URL(sourceTypeScript ? "../src/cli.ts" : "../src/cli.js", import.meta.url).pathname;
+type RefreshFixture = Awaited<ReturnType<typeof makeRefreshFixture>>;
+
+async function currentSavedFile(libraryDir: string, itemId: string): Promise<string> {
+  const catalog = await loadCatalog(libraryDir);
+  assertModernCatalog(catalog);
+  const item = catalog.items.find((entry) => entry.id === itemId);
+  if (!item) throw new Error(`Saved item ${itemId} is missing from the modern catalog.`);
+  const contentPath = path.join(libraryDir, ...item.content.path.split("/"));
+  if (item.content.kind === "file") return contentPath;
+  const firstFile = item.files[0];
+  if (!firstFile) throw new Error(`Saved item ${itemId} has no current file descriptors.`);
+  return path.join(contentPath, ...firstFile.path.split("/"));
+}
+
+async function refreshFixture(t: test.TestContext, kind: "instruction" | "skill" = "skill", contents = "source original\r\n日本語\n"): Promise<RefreshFixture> {
+  const box = await makeRefreshFixture(t, kind, contents);
+  return { ...box, file: await currentSavedFile(box.libraryDir, box.item.id) };
+}
+
+async function packageRefreshFixture(t: test.TestContext) {
+  const box = await makePackageRefreshFixture(t);
+  return { ...box, file: await currentSavedFile(box.libraryDir, box.item.id) };
+}
 const down = "\u001b[B";
 async function fixture(t: test.TestContext, bytes: string | Buffer = "\ufeffold\r\ne\u0301 日本語\r\n", name = "Friendly resource") {
   const box = await sandbox(t);
@@ -21,15 +46,18 @@ async function fixture(t: test.TestContext, bytes: string | Buffer = "\ufeffold\
   const item = await importPreparedResource(box.libraryDir, prepared, {confirmed:true,groupIds:[],inspection,approvedSensitivePaths:inspection.sensitivePaths});
   assert.ok(item);
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.groups.push({id:"a124842e-1872-4cc0-a267-935c6b8a19f1",name:"Friendly group",itemIds:[item.id]});
   await saveCatalog(box.libraryDir, catalog);
-  return {...box,item,file:path.join(box.libraryDir,"items",item.id,"files","SKILL.md"),sourceFile:path.join(sourcePath,"SKILL.md")};
+  const contentPath = path.join(box.libraryDir, ...item.content.path.split("/"));
+  const file = item.content.kind === "file" ? contentPath : path.join(contentPath, "SKILL.md");
+  return {...box,item,file,sourceFile:path.join(sourcePath,"SKILL.md")};
 }
 async function custody(box: Awaited<ReturnType<typeof fixture>>) {
   return {catalog:await readFile(path.join(box.libraryDir,"catalog.json")),file:await readFile(box.file),source:await readFile(box.sourceFile)};
 }
 async function manage(box: Sandbox, actions: TerminalAction[]) {
-  return runTerminalPty(box, [process.execPath,cli,"manage"], actions);
+  return runTerminalPty(box, [process.execPath,...sourceNodeFlags,cli,"manage"], actions);
 }
 function editActions(): TerminalAction[] {
   return [
@@ -155,10 +183,11 @@ for(const mutation of ["name","groups","destination","source metadata"] as const
   });
 }
 
-test("R6 real CLI prepare failure retains unknown physical files rather than replacing them",async t=>{
+test("R6 refresh previews a new saved-tree child and keeps it when replacement is denied",async t=>{
   const box=await refreshFixture(t);await writeFile(box.sourceFile,"new source\n");const unknown=path.join(path.dirname(box.file),"unregistered.md");await writeFile(unknown,"retain this physical file\n");const before=await refreshCustody(box);
-  const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",send:"y\r"}]);
-  assert.equal(run.code,1,run.output);assert.match(run.output,/unregistered|unexpected|layout/i);assert.deepEqual(await refreshCustody(box),before);assert.equal(await readFile(unknown,"utf8"),"retain this physical file\n");
+  const run=await manage(box,[...refreshActions(),{waitFor:"Authorize reading only",send:"y\r"},{waitFor:"Approve this refresh diff",send:"n\r"},finish]);
+  assert.equal(run.code,0,run.output);assert.match(run.output,/unregistered\.md/);assert.match(run.output,/All copi-only edits will be lost/);assert.match(run.output,/PTY_TERMIOS_RESTORED=True/);
+  assert.ok(run.output.indexOf("Full masked refresh diff")<run.output.indexOf("Approve this refresh diff"));assert.deepEqual(await refreshCustody(box),before);assert.equal(await readFile(unknown,"utf8"),"retain this physical file\n");
 });
 
 test("R1 real CLI mode-only refresh still reviews and commits, without a byte-only no-op shortcut",async t=>{
@@ -371,7 +400,7 @@ test("U5 labels/paths/body mask secrets and escape OSC/control sequences without
 for (const mode of ["stdin-pipe", "stdout-pipe"] as const) {
   test(`U7 ${mode} manage refuses before reading/creating/searching the library`,async(t)=>{
     const box=await sandbox(t);
-    const run=await runTerminalPty(box,[process.execPath,cli,"manage"],[],[12,60],mode);
+    const run=await runTerminalPty(box,[process.execPath,...sourceNodeFlags,cli,"manage"],[],[12,60],mode);
     assert.equal(run.code,1,run.output); assert.match(run.output,/TTY/);
     await assert.rejects(readFile(path.join(box.libraryDir,"catalog.json")),{code:"ENOENT"});
     assert.ok(!run.output.includes("Manage saved resources"));
@@ -471,7 +500,7 @@ test("F5 real TTY CLI malformed catalog before any input exits naturally with re
   const catalogPath=path.join(box.libraryDir,"catalog.json"),bytes=Buffer.from("independent malformed early-error sentinel");
   await writeFile(catalogPath,bytes);
   const run=await manage(box,[]);
-  assert.equal(run.code,1,run.output); assert.match(run.output,/Invalid copi catalog JSON/);
+  assert.equal(run.code,1,run.output); assert.match(run.output,/Invalid copi catalog/);
   assert.ok(!run.output.includes("Manage saved resources")); assert.ok(!run.output.includes("\u001b[?1049h"));
   assert.match(run.output,/PTY_TERMIOS_EXACT=True/); assert.ok(run.output.includes("\u001b[?25h"));
   assert.deepEqual(await readFile(catalogPath),bytes);
@@ -483,14 +512,14 @@ for(const initiallyPaused of [false,true]) {
     const catalogPath=path.join(box.libraryDir,"catalog.json"),bytes=Buffer.from("F5 malformed observed sentinel");
     await writeFile(catalogPath,bytes);
     const observedPath=path.join(box.root,"reader-state.json");
-    const moduleUrl=new URL("../src/cli.js",import.meta.url).href;
+    const moduleUrl=new URL(sourceTypeScript?"../src/cli.ts":"../src/cli.js",import.meta.url).href;
     const code=`import {writeFile} from 'node:fs/promises';import {main} from ${JSON.stringify(moduleUrl)};
 const input=process.stdin;if(${initiallyPaused})input.pause();
 const counts=()=>['data','end','close','error'].map(e=>input.listenerCount(e)).concat(['SIGINT','SIGTERM','SIGHUP'].map(e=>process.listenerCount(e)),['resize','error'].map(e=>process.stdout.listenerCount(e)));
 const before={flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()};
 try{process.exitCode=await main(['manage']);}catch(error){console.error('copi: '+error.message);process.exitCode=1;}
 await writeFile(${JSON.stringify(observedPath)},JSON.stringify({before,after:{flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()}}));`;
-    const run=await runTerminalPty(box,[process.execPath,"--input-type=module","-e",code],[]);
+    const run=await runTerminalPty(box,[process.execPath,...sourceNodeFlags,"--input-type=module","-e",code],[]);
     const observed=JSON.parse(await readFile(observedPath,"utf8")) as {before:{flow:boolean|null;raw:boolean;listeners:number[]};after:{flow:boolean|null;raw:boolean;listeners:number[]}};
     console.log(`F5 readerState=${JSON.stringify(observed)} naturalExit=${run.code} evidence=${run.logPath}`);
     assert.equal(run.code,1,run.output); assert.equal(observed.before.flow,initiallyPaused?false:null);
@@ -502,7 +531,7 @@ await writeFile(${JSON.stringify(observedPath)},JSON.stringify({before,after:{fl
 
 test("F5 lifecycle restores an already-flowing caller reader after its operation pauses input",async(t)=>{
   const box=await sandbox(t),observedPath=path.join(box.root,"caller-reader-state.json");
-  const moduleUrl=new URL("../src/wizard.js",import.meta.url).href;
+  const moduleUrl=new URL(sourceTypeScript?"../src/wizard.ts":"../src/wizard.js",import.meta.url).href;
   const code=`import {writeFile} from 'node:fs/promises';import {withWizardLifecycle} from ${JSON.stringify(moduleUrl)};
 const input=process.stdin;const counts=()=>['data','end','close','error'].map(e=>input.listenerCount(e));
 // This caller owns canonical input and ends its own stream only after receiving its line.
@@ -512,7 +541,7 @@ await withWizardLifecycle(async()=>{input.pause();});
 const after={flow:input.readableFlowing,raw:!!input.isRaw,listeners:counts()};
 process.stdout.write('CALLER_READER_READY '+JSON.stringify({before,after}));const line=await received;
 await writeFile(${JSON.stringify(observedPath)},JSON.stringify({before,after,line}));`;
-  const run=await runTerminalPty(box,[process.execPath,"--input-type=module","-e",code],[{waitFor:"CALLER_READER_READY",send:"caller canonical line\r"}]);
+  const run=await runTerminalPty(box,[process.execPath,...sourceNodeFlags,"--input-type=module","-e",code],[{waitFor:"CALLER_READER_READY",send:"caller canonical line\r"}]);
   assert.equal(run.code,0,run.output);
   const observed=JSON.parse(await readFile(observedPath,"utf8")) as {before:{flow:boolean;raw:boolean;listeners:number[]};after:{flow:boolean;raw:boolean;listeners:number[]};line:string};
   console.log(`F5 callerReaderState=${JSON.stringify(observed)} evidence=${run.logPath}`);
