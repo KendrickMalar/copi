@@ -2535,6 +2535,7 @@ export class StorageSession {
     const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
     if (parsed.version === 3) { await this.recoverCatalogOnly(parsed, rollback, raw); return; }
     if (parsed.version === 2) { await this.recoverSources(parsed, rollback, raw); return; }
+    if (parsed.version === 4) throw new Error("Legacy migration v4 recovery is not implemented in this build; preserving the journal and all bytes.");
     const journal = parsed;
     await this.assertLease(true);
     if (await this.verifyFinalized()) { await rm(path.join(this.lock, "journal.json")); return; }

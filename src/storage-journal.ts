@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { Catalog, SavedItem } from "./types.ts";
+import type { Catalog, LegacyCatalog, SavedItem } from "./types.ts";
 
 export interface LegacyStorageJournal {
   version: 1;
@@ -34,7 +34,24 @@ export interface CatalogOnlyStorageJournal {
   operations: [];
 }
 
-export type StorageJournal = LegacyStorageJournal | SourcesStorageJournal | CatalogOnlyStorageJournal;
+export interface LegacyMigrationStorageJournal {
+  version: 4;
+  mode: "legacy-migration";
+  root: string;
+  token: string;
+  oldCatalog: string;
+  newCatalog: string;
+  stableItemsTree: string;
+  stableSourcesTree: string;
+  stableSourcesTreeNext: string;
+  backupDir: string;
+  backupManifest: string;
+  operations: { itemId: string; target: string; kind: "file" | "tree"; oldTree: null; newTree: string }[];
+  ownedDirectories: { path: string; stage: string; dev: string; ino: string }[];
+  nextSourcesTree?: string;
+}
+
+export type StorageJournal = LegacyStorageJournal | SourcesStorageJournal | CatalogOnlyStorageJournal | LegacyMigrationStorageJournal;
 
 const itemPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const sha256Pattern = /^[0-9a-f]{64}$/;
@@ -62,6 +79,22 @@ function isOptionalSha256(value: unknown): value is string | null {
 
 function isStableSourcesCommitment(value: unknown): value is string {
   return value === "absent" || isSha256(value);
+}
+
+function isStableItemsCommitment(value: unknown): value is string {
+  return value === "absent" || isSha256(value);
+}
+
+function isMigrationBackupDir(value: unknown): value is string {
+  if (typeof value !== "string" || path.posix.normalize(value) !== value) return false;
+  const parts = value.split("/");
+  return parts.length === 2 && parts[0] === ".migration-backups" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(parts[1]!);
+}
+
+function isUint64Decimal(value: unknown): value is string {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*)$/.test(value)) return false;
+  try { return BigInt(value) <= 18_446_744_073_709_551_615n; } catch { return false; }
 }
 
 function isSafeSourcesTarget(value: string): boolean {
@@ -111,11 +144,110 @@ function assertNoTargetOverlap(targets: readonly string[]): void {
   }
 }
 
+function parseLegacyMigrationJournal(value: Record<string, unknown>, expected: { root: string; token: string }): LegacyMigrationStorageJournal {
+  const hasNextSourcesTree = Object.hasOwn(value, "nextSourcesTree");
+  const requiredKeys = [
+    "version", "mode", "root", "token", "oldCatalog", "newCatalog", "stableItemsTree", "stableSourcesTree",
+    "stableSourcesTreeNext", "backupDir", "backupManifest", "operations", "ownedDirectories",
+  ];
+  if (!hasExactKeys(value, hasNextSourcesTree ? [...requiredKeys, "nextSourcesTree"] : requiredKeys) ||
+      value.mode !== "legacy-migration" || !Array.isArray(value.ownedDirectories)) {
+    throw new Error("Invalid legacy-migration v4 storage journal object.");
+  }
+  assertCommonJournal(value, expected);
+  if (value.oldCatalog === null || !isStableItemsCommitment(value.stableItemsTree) ||
+      !isStableSourcesCommitment(value.stableSourcesTree) || !isStableSourcesCommitment(value.stableSourcesTreeNext) ||
+      !isMigrationBackupDir(value.backupDir) || !isSha256(value.backupManifest)) {
+    throw new Error("Invalid v4 catalog, tree, backup directory, or manifest commitment.");
+  }
+  if (!path.isAbsolute(expected.root) || path.resolve(expected.root) !== expected.root ||
+      !path.isAbsolute(value.root) || path.resolve(value.root) !== value.root) {
+    throw new Error("V4 storage journal root must be canonical and absolute.");
+  }
+
+  const operations: LegacyMigrationStorageJournal["operations"] = [];
+  for (const operation of value.operations) {
+    if (!isRecord(operation) || !hasExactKeys(operation, ["itemId", "target", "kind", "oldTree", "newTree"])) {
+      throw new Error("Invalid legacy-migration v4 operation.");
+    }
+    assertItemId(operation.itemId);
+    if (typeof operation.target !== "string" || !isSafeSourcesTarget(operation.target) ||
+        (operation.kind !== "file" && operation.kind !== "tree") || operation.oldTree !== null || !isSha256(operation.newTree)) {
+      throw new Error("V4 migration operations must add only safe sources targets with null old-tree commitments.");
+    }
+    operations.push({ itemId: operation.itemId, target: operation.target, kind: operation.kind, oldTree: null, newTree: operation.newTree });
+  }
+  assertUniqueItemIds(operations.map((operation) => operation.itemId));
+  assertNoTargetOverlap(operations.map((operation) => operation.target));
+  if (operations.length > 0 && value.stableItemsTree === "absent") {
+    throw new Error("V4 source additions require the fixed legacy items tree commitment.");
+  }
+
+  const ownedDirectories: LegacyMigrationStorageJournal["ownedDirectories"] = [];
+  const ownedPaths = new Set<string>();
+  const ownedIdentities = new Set<string>();
+  for (const entry of value.ownedDirectories) {
+    if (!isRecord(entry) || !hasExactKeys(entry, ["path", "stage", "dev", "ino"]) ||
+        typeof entry.path !== "string" || (entry.path !== "sources" && !/^sources\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry.path)) ||
+        typeof entry.stage !== "string" || !/^next-(?:sources|(?:0|[1-9][0-9]*))$/.test(entry.stage) ||
+        !isUint64Decimal(entry.dev) || !isUint64Decimal(entry.ino) || ownedPaths.has(entry.path)) {
+      throw new Error("Invalid or duplicate v4 owned source directory identity.");
+    }
+    const identity = `${entry.dev}:${entry.ino}`;
+    if (ownedIdentities.has(identity)) throw new Error("V4 owned source directories must have distinct recorded identities.");
+    ownedPaths.add(entry.path);
+    ownedIdentities.add(identity);
+    ownedDirectories.push({ path: entry.path, stage: entry.stage, dev: entry.dev, ino: entry.ino });
+  }
+
+  const beforeSources = value.stableSourcesTree;
+  const afterSources = value.stableSourcesTreeNext;
+  const hasNextSourcesTreeValue = isSha256(value.nextSourcesTree);
+  if (operations.length === 0) {
+    if (afterSources !== beforeSources || ownedDirectories.length !== 0 || hasNextSourcesTree) {
+      throw new Error("An adopt-only v4 journal must preserve the sources tree and contain no staged ownership.");
+    }
+  } else {
+    if (afterSources === "absent" || afterSources === beforeSources ||
+        (beforeSources === "absent" ? !hasNextSourcesTree || !hasNextSourcesTreeValue : hasNextSourcesTree)) {
+      throw new Error("V4 new-source operations require changed after-state and exact absent-root stage metadata.");
+    }
+    const expectedOwned = new Map<string, string>();
+    if (beforeSources === "absent") expectedOwned.set("sources", "next-sources");
+    for (const [index, operation] of operations.entries()) {
+      if (operation.kind !== "file") continue;
+      expectedOwned.set(`sources/${operation.itemId}`, beforeSources === "absent" ? "next-sources" : `next-${index}`);
+    }
+    if (ownedDirectories.length !== expectedOwned.size ||
+        ownedDirectories.some((directory) => expectedOwned.get(directory.path) !== directory.stage)) {
+      throw new Error("V4 new-source operations are missing exact root or new-file-parent stage custody.");
+    }
+  }
+
+  return {
+    version: 4,
+    mode: "legacy-migration",
+    root: value.root,
+    token: value.token,
+    oldCatalog: value.oldCatalog,
+    newCatalog: value.newCatalog,
+    stableItemsTree: value.stableItemsTree,
+    stableSourcesTree: value.stableSourcesTree,
+    stableSourcesTreeNext: value.stableSourcesTreeNext,
+    backupDir: value.backupDir,
+    backupManifest: value.backupManifest,
+    operations,
+    ownedDirectories,
+    ...(hasNextSourcesTree ? { nextSourcesTree: value.nextSourcesTree as string } : {}),
+  };
+}
+
 export function parseStorageJournal(value: unknown, expected: { root: string; token: string }): StorageJournal {
   if (!isRecord(value) ||
-      (value.version !== 1 && value.version !== 2 && value.version !== 3)) {
+      (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4)) {
     throw new Error("Unsupported or invalid storage journal version.");
   }
+  if (value.version === 4) return parseLegacyMigrationJournal(value, expected);
   if (value.version === 3) {
     const catalogOnlyKeys = [
       "version", "mode", "root", "token", "oldCatalog", "newCatalog", "stableSourcesTree", "operations",
@@ -275,6 +407,59 @@ function assertCatalogItems(catalog: Catalog, label: string): Map<string, SavedI
   }
   assertNoTargetOverlap(targets);
   return items;
+}
+
+export function validateLegacyMigrationJournalTargets(journal: LegacyMigrationStorageJournal, previous: LegacyCatalog, next: Catalog): void {
+  if (!journal || journal.version !== 4 || journal.mode !== "legacy-migration" || journal.oldCatalog === null ||
+      !Array.isArray(journal.operations) || !previous || previous.version !== 1 || !Array.isArray(previous.items) ||
+      !Array.isArray(previous.groups) || !next || next.version !== 2 || !Array.isArray(next.groups)) {
+    throw new Error("Legacy migration target validation requires its fixed v4 journal, v1 catalog, and v2 catalog.");
+  }
+  const nextItems = assertCatalogItems(next, "legacy migration next");
+  for (const id of nextItems.keys()) assertItemId(id);
+  const previousItems = new Map<string, LegacyCatalog["items"][number]>();
+  for (const item of previous.items) {
+    if (!item || typeof item.id !== "string" || previousItems.has(item.id)) throw new Error("Invalid or duplicate item in the legacy migration source catalog.");
+    assertItemId(item.id);
+    previousItems.set(item.id, item);
+  }
+  if (previous.items.length !== next.items.length || JSON.stringify(previous.groups) !== JSON.stringify(next.groups)) {
+    throw new Error("Legacy migration must preserve v1 item membership and group relationships exactly.");
+  }
+  for (const [index, oldItem] of previous.items.entries()) {
+    const migrated = next.items[index];
+    if (!migrated || migrated.id !== oldItem.id) throw new Error("Legacy migration must preserve catalog item order and identity.");
+    const { content: _content, ...migratedLegacy } = migrated;
+    if (JSON.stringify(migratedLegacy) !== JSON.stringify(oldItem)) {
+      throw new Error("Legacy migration may add source content locations but must preserve all v1 item metadata and descriptors.");
+    }
+  }
+
+  const operationIds: string[] = [];
+  const operationTargets: string[] = [];
+  if (journal.operations.length > 0 && journal.stableItemsTree === "absent") {
+    throw new Error("Legacy migration cannot stage source additions without the fixed v1 items tree.");
+  }
+  for (const operation of journal.operations) {
+    assertItemId(operation.itemId);
+    const oldItem = previousItems.get(operation.itemId);
+    const nextItem = nextItems.get(operation.itemId);
+    if (!oldItem || !nextItem || operation.oldTree !== null || !isSha256(operation.newTree) ||
+        operation.target !== nextItem.content.path || operation.kind !== nextItem.content.kind) {
+      throw new Error("Legacy migration operation target or kind is not bound to the corresponding v1 and v2 catalog item.");
+    }
+    const targetParts = operation.target.split("/");
+    if ((operation.kind === "tree" && (operation.target !== `sources/${operation.itemId}` || nextItem.kind !== "skill" ||
+          !nextItem.files.some((file) => file.path === "SKILL.md"))) ||
+        (operation.kind === "file" && (targetParts.length !== 3 || targetParts[0] !== "sources" ||
+          targetParts[1] !== operation.itemId || nextItem.files.length !== 1 || nextItem.files[0]?.path !== targetParts[2]))) {
+      throw new Error("Legacy migration new target does not match the v2 item root and R2 placement contract.");
+    }
+    operationIds.push(operation.itemId);
+    operationTargets.push(operation.target);
+  }
+  assertUniqueItemIds(operationIds);
+  assertNoTargetOverlap(operationTargets);
 }
 
 export function validateSourcesJournalTargets(journal: SourcesStorageJournal, previous: Catalog | null, next: Catalog): void {
