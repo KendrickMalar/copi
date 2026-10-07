@@ -1,15 +1,38 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, cp, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readlink, rename, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { catalogBytes, importPreparedResource, importResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges } from "../src/catalog.ts";
+import { assertModernCatalog, catalogBytes, importPreparedResource, importResource, loadCatalog as loadStoredCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges } from "../src/catalog.ts";
 import { executeApply, planApply } from "../src/apply.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { changeSavedDestination, commitSavedChange, prepareSavedChange, prepareSavedEdit, prepareSavedReplacement, readSavedChange, readSavedEdit } from "../src/resource-mutations.ts";
 import { prepareStorageReview, readStorageReview, StorageSession, StorageTransactions, type StorageCheckpoint, type StorageRevision } from "../src/storage-transaction.ts";
-import { approval, box, child, digest, evidence, interrupted, kernel, modules, proposal, rawTree, wait } from "./helpers/issue5-acceptance.ts";
+import { approval, box, child, digest, errorChainContains, evidence, interrupted, kernel, modules, proposal, rawTree, wait } from "./helpers/issue5-acceptance.ts";
+import type { Catalog, LegacyCatalog } from "../src/types.ts";
+
+async function loadCatalog(library: string): Promise<Catalog> {
+  const catalog = await loadStoredCatalog(library);
+  assertModernCatalog(catalog);
+  return catalog;
+}
+
+test("Issue5 error matching follows bounded Error causes and AggregateError errors", () => {
+  const specific = new Error("specific recovery cause");
+  const wrapper = new Error("outer", { cause: new AggregateError([new Error("unrelated"), specific], "aggregate") });
+  assert.equal(errorChainContains(wrapper, (error) => error.message === "specific recovery cause"), true);
+  assert.equal(errorChainContains({ message: "specific recovery cause" }, () => true), false);
+
+  const cycle = new AggregateError([], "cycle");
+  const cycleErrors: unknown[] = cycle.errors;
+  cycleErrors.push(cycle);
+  assert.equal(errorChainContains(cycle, () => false), false);
+
+  let beyondDepth = new Error("beyond depth");
+  for (let index = 0; index < 9; index += 1) beyondDepth = new Error(`wrapper ${index}`, { cause: beyondDepth });
+  assert.equal(errorChainContains(beyondDepth, (error) => error.message === "beyond depth"), false);
+});
 
 // Expected values originate in the approved Issue #5 contract, not observed implementation behaviour.
 test("S1 fixed bytes/metadata/private view/no-op/source loss", async () => {
@@ -144,7 +167,7 @@ for (const entry of ["legacy", "prepared"] as const) {
   });
 }
 
-test("S5 direct kernel secret approval and catalog-only descriptor registration cannot bypass inspection", async () => {
+test("S5 direct kernel secret replacement requires exact review approval", async () => {
   const b = await box(); const before = await rawTree(b.library);
   const p = await proposal(b, { "SKILL.md": "apiKey=sk_live_acceptanceKERNEL123456\n" });
   await assert.rejects(kernel(b, p), /approval|inspection/i);
@@ -154,15 +177,35 @@ test("S5 direct kernel secret approval and catalog-only descriptor registration 
     await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), p.bytes, p.replacements, { review, approval: bad })), /approval|review/i);
   }
   assert.deepEqual(await rawTree(b.library), before);
+  await evidence(b, "kernel-secret-rejections");
+});
+
+test("S5 catalog save requires inspection; metadata-only descriptor registration is forbidden", async () => {
+  const b = await box();
   const newPath = path.join(path.dirname(b.file), "manually-added.md");
   const secret = "apiKey=sk_live_acceptanceDESCRIPTOR123456\n";
   await writeFile(newPath, secret);
+  const before = await rawTree(b.library);
   const catalog = await loadCatalog(b.library);
-  catalog.items[0]!.files.push({ path: "manually-added.md", mode: 0o600, sha256: digest(secret) });
-  await assert.rejects(saveCatalog(b.library, catalog), /approval|inspection/i);
-  await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(catalog))), /approval|inspection/i);
-  assert.equal(await readFile(newPath, "utf8"), secret);
-  await evidence(b, "kernel-secret-rejections");
+  const descriptorBefore = structuredClone(catalog.items[0]!.files);
+  const addedDescriptor = { path: "manually-added.md", mode: 0o600, sha256: digest(secret) };
+  const changed = structuredClone(catalog);
+  changed.items[0]!.files.push({ ...addedDescriptor });
+
+  await assert.rejects(saveCatalog(b.library, changed), /Saving an existing catalog requires the original object returned by loadCatalog; detached catalogs have no verified starting revision\./);
+  assert.deepEqual(await rawTree(b.library), before);
+  assert.deepEqual(await readFile(newPath), Buffer.from(secret));
+
+  catalog.items[0]!.files.push({ ...addedDescriptor });
+  await assert.rejects(saveCatalog(b.library, catalog), /Content changes require a prepared inspection and individual approval; use the saved-change API\./);
+  assert.deepEqual(await rawTree(b.library), before);
+  assert.deepEqual(await readFile(newPath), Buffer.from(secret));
+  assert.deepEqual((await loadCatalog(b.library)).items[0]!.files, descriptorBefore);
+
+  await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(changed))), /A catalog-only transaction may change only item names and legal destinations; source metadata, descriptors, and content are fixed\./);
+  assert.deepEqual(await rawTree(b.library), before);
+  assert.deepEqual(await readFile(newPath), Buffer.from(secret));
+  await evidence(b, "catalog-only-secret-descriptor-rejected");
 });
 
 for (const mutation of ["body", "raw catalog", "group", "other item", "mode", "unregistered file", "unregistered directory"] as const) {
@@ -190,12 +233,18 @@ test("S3 stale original/clone/name before-catalog/cross-library revisions reject
   const current = await loadCatalog(b.library); current.groups[0]!.name = "Winner"; await saveCatalog(b.library, current);
   const before = await rawTree(b.library);
   stale.groups[0]!.name = "Stale";
-  await assert.rejects(saveCatalog(b.library, stale), /changed|revision/i);
+  await assert.rejects(saveCatalog(b.library, stale), /Copi library changed after preparation/);
   await assert.rejects(saveCatalog(b.library, structuredClone(current)), /detached|original|revision/i);
   await assert.rejects(saveNameChanges(b.library, structuredClone(current), current), /original|revision/i);
-  await assert.rejects(saveCatalog(other.library, current), /changed|revision/i);
-  await assert.rejects(new StorageTransactions().run(other.library, false, async (s) => s!.assertRevision(revision!)), /changed|revision/i);
+
+  const currentItem = current.items[0]!;
+  const otherContent = path.join(other.library, ...currentItem.content.path.split("/"));
+  await cp(path.join(b.library, ...currentItem.content.path.split("/")), otherContent, { recursive: true });
+  const otherBefore = await rawTree(other.library);
+  await assert.rejects(saveCatalog(other.library, current), /Copi library changed after preparation/);
+  await assert.rejects(new StorageTransactions().run(other.library, false, async (s) => s!.assertRevision(revision!)), /Copi library changed after preparation/);
   assert.deepEqual(await rawTree(b.library), before);
+  assert.deepEqual(await rawTree(other.library), otherBefore);
 });
 
 for (const unsafe of ["", "/absolute", "..", "a/../b", "a\\b", "a\0b", "a//b", "a/", "auth/x", ".envrc", "x/.env-production", "cache/x"]) {
@@ -226,26 +275,106 @@ test("S4 destination independent of all item metadata/body/groups; reference-onl
   assert.deepEqual(await rawTree(b.library), held);
 });
 
-for (const corruption of ["checksum", "file symlink", "directory symlink", "item symlink"] as const) {
-  test(`S6 ${corruption}: reasoned rejection across reader/edit/destination/catalog/kernel`, async () => {
-    const b = await box(); const c = await loadCatalog(b.library);
-    if (corruption === "checksum") await writeFile(b.file, "external corrupted\n");
-    else {
-      const target = corruption === "file symlink" ? b.file : corruption === "directory symlink" ? path.dirname(b.file) : path.dirname(path.dirname(b.file));
-      const held = path.join(b.root, "outside-copy"); await rename(target, held); await symlink(held, target);
+test("S2 directly edited current bytes are read without repairing descriptor metadata during a destination change", async () => {
+  const b = await box();
+  const before = await loadCatalog(b.library);
+  const descriptorBefore = structuredClone(before.items[0]!.files);
+  const edited = Buffer.from("manual current source edit\n");
+  await writeFile(b.file, edited);
+  const sourceStat = await lstat(b.file);
+  const loaded = await loadCatalog(b.library);
+  assert.deepEqual(loaded.items[0]!.files, descriptorBefore);
+  const files = await readSnapshotFiles(b.library, loaded.items[0]!);
+  assert.deepEqual(files.find((file) => file.path === "SKILL.md")!.bytes, edited);
+  assert.equal(files.find((file) => file.path === "SKILL.md")!.sha256, digest(edited));
+  assert.deepEqual(readSavedEdit(await prepareSavedEdit(b.library, b.item.id, "SKILL.md")).file.bytes, edited);
+
+  const destination = { kind: "project" as const, path: "relative/current-edited-content" };
+  await changeSavedDestination(b.library, b.item.id, destination);
+  const after = await loadCatalog(b.library);
+  assert.deepEqual(after.items[0], { ...before.items[0]!, destination });
+  assert.deepEqual(after.groups, before.groups);
+  assert.deepEqual(after.items[0]!.files, descriptorBefore);
+  assert.deepEqual(await readFile(b.file), edited);
+  const afterStat = await lstat(b.file);
+  assert.equal(afterStat.dev, sourceStat.dev);
+  assert.equal(afterStat.ino, sourceStat.ino);
+});
+
+for (const corruption of ["file symlink", "directory symlink", "item symlink"] as const) {
+  test(`S6 ${corruption}: unsafe registered source is rejected at its read/mutation boundary`, async () => {
+    const b = await box({ "SKILL.md": "safe current skill\n", "nested/notes.md": "registered nested note\n" });
+    if (b.item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+    const contentRoot = path.join(b.library, ...b.item.content.path.split("/"));
+    const file = path.join(contentRoot, "SKILL.md");
+    let linkPath: string;
+    let outside: string;
+    if (corruption === "file symlink") {
+      linkPath = file;
+      outside = path.join(b.root, "held-skill.md");
+      await rename(file, outside);
+      await symlink(outside, file);
+    } else if (corruption === "directory symlink") {
+      linkPath = path.join(contentRoot, "nested");
+      outside = path.join(b.root, "held-nested");
+      await rename(linkPath, outside);
+      await symlink(outside, linkPath);
+    } else {
+      linkPath = contentRoot;
+      outside = path.join(b.root, "held-content-root");
+      await rename(contentRoot, outside);
+      await symlink(outside, contentRoot);
     }
-    const before = await rawTree(b.library);
-    const error = /checksum|symbolic|unsafe/i;
-    await assert.rejects(readSnapshotFiles(b.library, b.item), error);
-    await assert.rejects(prepareSavedEdit(b.library, b.item.id, "SKILL.md"), error);
-    await assert.rejects(changeSavedDestination(b.library, b.item.id, { kind: "project", path: "safe/new" }), error);
-    c.items[0]!.files[0]!.sha256 = digest("external corrupted\n");
-    await assert.rejects(saveCatalog(b.library, c), error);
-    await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(c))), error);
-    assert.deepEqual(await rawTree(b.library), before);
-    await evidence(b, "corruption-rejected", { corruption });
+    const outsideFile = corruption === "file symlink" ? outside : path.join(outside, corruption === "directory symlink" ? "notes.md" : "SKILL.md");
+    const outsideBefore = await rawTree(outside);
+    const outsideBytes = await readFile(outsideFile);
+    const outsideStat = await lstat(outsideFile);
+    const libraryBefore = await rawTree(b.library);
+    const contentPathError = corruption === "item symlink"
+      ? /Content contains an unsafe symbolic link\./
+      : /Source tree contains an unsafe symbolic link\./;
+
+    if (corruption === "item symlink") await assert.rejects(loadStoredCatalog(b.library), /Content contains an unsafe symbolic link\./);
+    await assert.rejects(readSnapshotFiles(b.library, b.item), contentPathError);
+    await assert.rejects(prepareSavedEdit(b.library, b.item.id, "SKILL.md"), contentPathError);
+    await assert.rejects(changeSavedDestination(b.library, b.item.id, { kind: "project", path: "safe/new" }), contentPathError);
+
+    assert.deepEqual(await rawTree(b.library), libraryBefore);
+    assert.ok((await lstat(linkPath)).isSymbolicLink());
+    assert.deepEqual(await rawTree(outside), outsideBefore);
+    assert.deepEqual(await readFile(outsideFile), outsideBytes);
+    const outsideAfter = await lstat(outsideFile);
+    assert.equal(outsideAfter.dev, outsideStat.dev);
+    assert.equal(outsideAfter.ino, outsideStat.ino);
+    await evidence(b, "unsafe-registered-content-rejected", { corruption });
   });
 }
+
+test("S3 name-only preview rejects a later direct source edit without replacing it or changing its descriptor", async () => {
+  const b = await box();
+  await writeFile(b.file, "direct source edit before preview\n");
+  const before = await loadCatalog(b.library);
+  const after = structuredClone(before);
+  after.groups[0]!.name = "previewed group rename";
+  const catalogPath = path.join(b.library, "catalog.json");
+  const catalogBytesBefore = await readFile(catalogPath);
+  const descriptorBefore = structuredClone(before.items[0]!.files);
+
+  await writeFile(b.file, "later external edit after preview\n");
+  const externalBytes = await readFile(b.file);
+  const externalStat = await lstat(b.file);
+  const libraryBeforeCommit = await rawTree(b.library);
+  await assert.rejects(saveNameChanges(b.library, before, after), /Copi library changed after preparation \(catalog or saved bytes\)/);
+  assert.deepEqual(await rawTree(b.library), libraryBeforeCommit);
+  assert.deepEqual(await readFile(catalogPath), catalogBytesBefore);
+  assert.deepEqual(await readFile(b.file), externalBytes);
+  const current = await loadCatalog(b.library);
+  assert.equal(current.groups[0]!.name, before.groups[0]!.name);
+  assert.deepEqual(current.items[0]!.files, descriptorBefore);
+  const afterStat = await lstat(b.file);
+  assert.equal(afterStat.dev, externalStat.dev);
+  assert.equal(afterStat.ino, externalStat.ino);
+});
 
 test("S6 wrong next checksum is rejected before mutation", async () => {
   const b = await box(); const p = await proposal(b); const before = await rawTree(b.library);
@@ -254,25 +383,71 @@ test("S6 wrong next checksum is rejected before mutation", async () => {
   assert.deepEqual(await rawTree(b.library), before);
 });
 
+type ProposedSourceFile = Awaited<ReturnType<typeof proposal>>["replacements"][number]["files"][number];
+
+async function assertSourceReplacementStage(library: string, sourceRoot: string, files: readonly ProposedSourceFile[], oldTree: Record<string, string>): Promise<void> {
+  const lock = path.join(library, ".copi-transaction");
+  const stage = path.join(lock, "next-0");
+  const staged = await rawTree(stage);
+  const stagedFiles = Object.entries(staged).filter(([, value]) => value.startsWith("mode:")).map(([relative]) => relative).sort();
+  assert.deepEqual(stagedFiles, files.map((file) => file.path).sort(), "source-change checkpoint must expose the reviewed tree artifact, not a catalog-only stage");
+  for (const file of files) assert.deepEqual(await readFile(path.join(stage, ...file.path.split("/"))), file.bytes);
+  assert.deepEqual(await rawTree(sourceRoot), oldTree, "live source tree remains at its original bytes before swap");
+  await assert.rejects(lstat(path.join(lock, "next-catalog")), { code: "ENOENT" }, "source tree staging occurs before catalog metadata staging");
+}
+
 for (const boundary of ["stage-write", "stage-sync", "journal", "old-renamed", "new-renamed", "catalog-held", "catalog-renamed", "directory-sync", "committed"] as StorageCheckpoint[]) {
   test(`S2 real multi-file transaction fault ${boundary}: exact old state and usable reader`, async () => {
     const b = await box({ "SKILL.md": "old A\n", "nested/second.md": "old B\n" });
     const p = await proposal(b, { "SKILL.md": "new A\n", "nested/second.md": "new B\n", "added.md": "new C\n" });
+    if (b.item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+    const sourceRoot = path.join(b.library, ...b.item.content.path.split("/"));
+    const oldTree = await rawTree(sourceRoot);
+    const originalFile = await readFile(b.file);
     const before = await evidence(b, "fault-before", { boundary }); let count = 0; const reached: string[] = [];
-    await assert.rejects(kernel(b, p, { checkpoint: (point) => { reached.push(point); if (point === boundary && (++count === (boundary.startsWith("stage-") ? 4 : 1))) throw new Error(`independent fault ${boundary}`); } }), /independent fault/i);
-    assert.equal(count, boundary.startsWith("stage-") ? 4 : 1);
+    await assert.rejects(kernel(b, p, { checkpoint: async (point, root) => {
+      reached.push(point);
+      if (point === boundary) {
+        count += 1;
+        if (boundary === "stage-write" || boundary === "stage-sync") {
+          await assertSourceReplacementStage(root, sourceRoot, p.replacements[0]!.files, oldTree);
+          assert.deepEqual(await readFile(b.file), originalFile);
+        }
+        throw new Error(`independent fault ${boundary}`);
+      }
+    } }), /independent fault/i);
+    assert.equal(count, 1);
+    assert.ok(reached.includes(boundary));
     assert.deepEqual(await rawTree(b.library), before);
     assert.equal((await readSnapshotFiles(b.library, (await loadCatalog(b.library)).items[0]!)).length, 2);
     await evidence(b, "fault-after", { boundary, count, reached });
   });
 }
 
-test("S2 real file-stage failure (second file): no leaked partial file", async () => {
-  const b = await box(); const p = await proposal(b, { "SKILL.md": "new\n", "z.md": "second\n" });
-  const before = await rawTree(b.library); let count = 0;
-  await assert.rejects(kernel(b, p, { checkpoint: (point) => { if (point === "stage-sync" && ++count === 2) throw new Error("second-file failure"); } }), /second-file/);
-  assert.equal(count, 2); assert.deepEqual(await rawTree(b.library), before);
-  await evidence(b, "second-file-fault", { count });
+test("S2 catalog-stage sync fault after a checked source-tree stage retains the original tree", async () => {
+  const b = await box({ "SKILL.md": "old\n", "nested/second.md": "old second\n" });
+  const p = await proposal(b, { "SKILL.md": "new\n", "nested/second.md": "new second\n" });
+  if (b.item.content.kind !== "tree") throw new Error("Expected a v2 skill tree fixture.");
+  const sourceRoot = path.join(b.library, ...b.item.content.path.split("/"));
+  const oldTree = await rawTree(sourceRoot);
+  const before = await rawTree(b.library);
+  let stageSyncs = 0;
+  await assert.rejects(kernel(b, p, { checkpoint: async (point, root) => {
+    if (point !== "stage-sync") return;
+    stageSyncs += 1;
+    if (stageSyncs === 1) {
+      await assertSourceReplacementStage(root, sourceRoot, p.replacements[0]!.files, oldTree);
+      return;
+    }
+    assert.equal(stageSyncs, 2);
+    assert.deepEqual(await readFile(path.join(root, ".copi-transaction", "next-catalog")), p.bytes);
+    assert.deepEqual(await rawTree(sourceRoot), oldTree);
+    throw new Error("independent catalog-stage sync fault");
+  } }), /independent catalog-stage sync fault/);
+  assert.equal(stageSyncs, 2);
+  assert.deepEqual(await rawTree(b.library), before);
+  assert.deepEqual(await rawTree(sourceRoot), oldTree);
+  await evidence(b, "catalog-stage-sync-fault", { stageSyncs });
 });
 
 for (const [boundary, rollback, expected] of [["old-renamed", false, "old"], ["catalog-held", false, "old"], ["catalog-renamed", false, "new"], ["finalized", false, "new"], ["rollback-displaced", true, "old"], ["rollback-catalog-held", true, "old"], ["rollback-finalized", true, "old"]] as const) {
@@ -342,55 +517,183 @@ for (const corruption of ["missing journal", "altered journal", "altered backup"
     if (corruption === "missing journal") await rename(path.join(lock, "journal.json"), path.join(b.root, "held-journal"));
     else if (corruption === "altered journal") await writeFile(path.join(lock, "journal.json"), "{}");
     else if (corruption === "missing backup") await rename(path.join(lock, "old-0"), path.join(b.root, "held-backup"));
-    else await writeFile(path.join(lock, "old-0", "files", "SKILL.md"), "tampered backup\n");
+    else await writeFile(path.join(lock, "old-0", "SKILL.md"), "tampered backup\n");
     const before = await evidence(b, "damaged-journal-before", { corruption });
-    await assert.rejects(loadCatalog(b.library), /journal|rollback|altered|unknown/i);
+    const retainedPaths = corruption === "missing journal"
+      ? [path.join(b.root, "held-journal"), path.join(lock, "old-0")]
+      : corruption === "missing backup"
+        ? [path.join(lock, "journal.json"), path.join(b.root, "held-backup")]
+        : [path.join(lock, "journal.json"), path.join(lock, "old-0")];
+    const retainedBefore = await Promise.all(retainedPaths.map((target) => rawTree(target)));
+    if (corruption === "missing backup") {
+      await assert.rejects(loadCatalog(b.library), /V2 recovery does not have exactly one checked original sources inode\./);
+    } else {
+      await assert.rejects(loadCatalog(b.library), /journal|rollback|altered|unknown/i);
+    }
     assert.deepEqual(await rawTree(b.library), before);
+    for (const [index, target] of retainedPaths.entries()) assert.deepEqual(await rawTree(target), retainedBefore[index]);
   });
 }
 
 for (const retained of ["old snapshot", "held catalog", "recreated catalog", "displaced snapshot"] as const) {
-  test(`S3 late external ${retained}: bytes retained, never deleted by cleanup`, async () => {
-    const b = await box(); const p = await proposal(b); const external = Buffer.from("external retained bytes\n"); let target = ""; let reached = false;
+  test(`S3 late external ${retained}: bytes/inode retained, never deleted by cleanup`, async () => {
+    const b = await box(); const p = await proposal(b); const external = Buffer.from("external retained bytes\n");
+    let target = ""; let reached = false; let targetIdentity: { dev: number; ino: number } | undefined;
+    const expectedCauses = retained === "old snapshot"
+      ? ["Original sources inode changed after rename; retained external bytes instead of deleting them.", "V2 registered sources bytes or inode changed externally; refusing recovery."]
+      : retained === "displaced snapshot"
+        ? ["trigger rollback", "V2 retained source stage or backup changed during recovery."]
+        : [];
     await assert.rejects(kernel(b, p, { checkpoint: async (point, root) => {
       const lock = path.join(root, ".copi-transaction");
       if (retained === "displaced snapshot" && point === "before-catalog") throw new Error("trigger rollback");
       if ((retained === "old snapshot" && point === "old-renamed") || (retained === "held catalog" && point === "catalog-held") || (retained === "recreated catalog" && point === "catalog-held") || (retained === "displaced snapshot" && point === "rollback-restored")) {
-        target = retained === "old snapshot" ? path.join(lock, "old-0", "files", "SKILL.md") : retained === "displaced snapshot" ? path.join(lock, "displaced-0", "files", "SKILL.md") : retained === "held catalog" ? path.join(lock, "held-catalog") : path.join(root, "catalog.json");
-        reached = true; await writeFile(target, external);
+        target = retained === "old snapshot" ? path.join(lock, "old-0", "SKILL.md") : retained === "displaced snapshot" ? path.join(lock, "displaced-0", "SKILL.md") : retained === "held catalog" ? path.join(lock, "held-catalog") : path.join(root, "catalog.json");
+        reached = true;
+        await writeFile(target, external);
+        const stat = await lstat(target);
+        targetIdentity = { dev: stat.dev, ino: stat.ino };
       }
-    } }), /recover|external|changed/i);
-    assert.ok(reached); assert.deepEqual(await readFile(target), external);
-    await assert.rejects(loadCatalog(b.library), /external|recovery/i);
-    await evidence(b, "late-inode-retained", { retained, target });
+    } }), (error: unknown) => error instanceof AggregateError &&
+      error.message.startsWith("Copi sources transaction could not safely recover an external change; retained private journal and source bytes.") &&
+      expectedCauses.every((message) => errorChainContains(error, (nested) => nested.message === message)));
+    assert.ok(reached); assert.ok(targetIdentity); assert.deepEqual(await readFile(target), external);
+    const lock = path.join(b.library, ".copi-transaction");
+    const journalPath = path.join(lock, "journal.json");
+    const lockBeforeReader = await rawTree(lock);
+    const journalBeforeReader = await readFile(journalPath);
+    const journalStatBeforeReader = await lstat(journalPath);
+    await assert.rejects(loadCatalog(b.library), (error: unknown) => error instanceof Error && error.message === "Copi transaction recovery stopped after an external change; inspect its owner-only journal. No external bytes were overwritten.");
+    assert.deepEqual(await rawTree(lock), lockBeforeReader);
+    assert.deepEqual(await readFile(journalPath), journalBeforeReader);
+    const journalStatAfterReader = await lstat(journalPath);
+    assert.equal(journalStatAfterReader.dev, journalStatBeforeReader.dev);
+    assert.equal(journalStatAfterReader.ino, journalStatBeforeReader.ino);
+    assert.deepEqual(await readFile(target), external);
+    const targetAfter = await lstat(target);
+    assert.equal(targetAfter.dev, targetIdentity.dev);
+    assert.equal(targetAfter.ino, targetIdentity.ino);
+    await evidence(b, "late-inode-retained", { retained, target, targetIdentity, journalPath, journalStatBeforeReader: { dev: journalStatBeforeReader.dev, ino: journalStatBeforeReader.ino } });
   });
 }
 
-test("S4 root/ancestor symbolic-link swap stops before live outside mutation", async () => {
-  const b = await box(); const p = await proposal(b); const outside = path.join(b.root, "outside-items");
-  await mkdir(path.join(outside, b.item.id, "files"), { recursive: true });
-  await writeFile(path.join(outside, b.item.id, "files", "SKILL.md"), "outside sentinel\n");
-  const before = await rawTree(outside); let crossed = false;
+test("S4 sources-root symlink swap stops before live outside mutation", async () => {
+  const b = await box(); const p = await proposal(b);
+  const sourcesRoot = path.join(b.library, "sources");
+  const outside = path.join(b.root, "outside-sources");
+  const originalSources = path.join(b.root, "original-sources");
+  await cp(sourcesRoot, outside, { recursive: true });
+  const outsideBefore = await rawTree(outside);
+  const originalBefore = await rawTree(sourcesRoot);
+  const outsideFile = path.join(outside, b.item.id, "SKILL.md");
+  const outsideFileBefore = await lstat(outsideFile);
+  const originalRootBefore = await lstat(sourcesRoot);
+  let crossed = false;
   await assert.rejects(kernel(b, p, { checkpoint: async (point) => {
     if (point === "old-renamed") crossed = true;
-    if (point === "before-swap") { await rename(path.join(b.library, "items"), path.join(b.root, "original-items")); await symlink(outside, path.join(b.library, "items")); }
-  } }), /symbolic|unsafe|recover/i);
-  assert.equal(crossed, false); assert.deepEqual(await rawTree(outside), before);
-  await evidence(b, "ancestor-swap");
+    if (point === "before-swap") {
+      await rename(sourcesRoot, originalSources);
+      await symlink(outside, sourcesRoot);
+    }
+  } }), (error: unknown) => error instanceof AggregateError &&
+    error.message.startsWith("Copi sources transaction could not safely recover an external change; retained private journal and source bytes.") &&
+    errorChainContains(error, (nested) => nested.message === "Registered sources tree changed during commit; refusing overwrite.") &&
+    errorChainContains(error, (nested) => nested.message === "Registered sources tree has a missing, unsafe, or symbolic-link parent directory."));
+  assert.equal(crossed, false);
+  const sourceLink = await lstat(sourcesRoot);
+  assert.ok(sourceLink.isSymbolicLink());
+  assert.equal(await readlink(sourcesRoot), outside);
+  assert.deepEqual(await rawTree(outside), outsideBefore);
+  assert.deepEqual(await rawTree(originalSources), originalBefore);
+  const outsideFileAfter = await lstat(outsideFile);
+  assert.equal(outsideFileAfter.dev, outsideFileBefore.dev);
+  assert.equal(outsideFileAfter.ino, outsideFileBefore.ino);
+  const originalRootAfter = await lstat(originalSources);
+  assert.equal(originalRootAfter.dev, originalRootBefore.dev);
+  assert.equal(originalRootAfter.ino, originalRootBefore.ino);
+  const lock = path.join(b.library, ".copi-transaction");
+  const journalPath = path.join(lock, "journal.json");
+  const retainedLock = await rawTree(lock);
+  const journalBefore = await readFile(journalPath);
+  const journalStatBefore = await lstat(journalPath);
+  assert.deepEqual(await rawTree(lock), retainedLock);
+  assert.deepEqual(await readFile(journalPath), journalBefore);
+  const journalStatAfter = await lstat(journalPath);
+  assert.equal(journalStatAfter.dev, journalStatBefore.dev);
+  assert.equal(journalStatAfter.ino, journalStatBefore.ino);
+  await evidence(b, "sources-root-ancestor-swap", { outside, originalSources, journalPath, outsideFile: { dev: outsideFileAfter.dev, ino: outsideFileAfter.ino }, sourceLink: { dev: sourceLink.dev, ino: sourceLink.ino } });
 });
 
-test("S4 legacy private descriptors stay readable but are skipped by apply", async () => {
-  const b = await box(); const c = await loadCatalog(b.library);
-  await writeFile(path.join(path.dirname(b.file), ".envrc"), "private legacy bytes\n");
-  c.items[0]!.files.push({ path: ".envrc", mode: 0o600, sha256: digest("private legacy bytes\n") });
-  await writeFile(path.join(b.library, "catalog.json"), catalogBytes(c));
-  assert.equal((await readSnapshotFiles(b.library, b.item)).length, 2);
-  const project = path.join(b.root, "target"); await mkdir(project);
-  const plan = await planApply(b.library, "independent-team", project);
-  assert.ok(plan.warnings.some((w) => w.code === "private-path-skipped"));
-  assert.ok(!plan.files.some((f) => f.path.includes(".env")));
-  await executeApply(b.library, plan, {});
-  await assert.rejects(lstat(path.join(project, ".pi/skills/independent/.envrc")), { code: "ENOENT" });
+test("S4 v1 reader preserves legacy metadata and bytes; ordinary apply requires explicit migration", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-issue5-v1-acceptance-"));
+  const library = path.join(root, "library");
+  const project = path.join(root, "target");
+  const id = "123e4567-e89b-42d3-a456-426614174099";
+  const savedAt = "2026-10-05T00:00:00.000Z";
+  const skill = Buffer.from("# Legacy skill\nlegacy bytes\n");
+  const privateBytes = Buffer.from("private legacy bytes\n");
+  const filesRoot = path.join(library, "items", id, "files");
+  await mkdir(filesRoot, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(filesRoot, "SKILL.md"), skill, { mode: 0o600 });
+  await writeFile(path.join(filesRoot, ".envrc"), privateBytes, { mode: 0o600 });
+  const catalog: LegacyCatalog = {
+    version: 1,
+    items: [{
+      id, kind: "skill", source: "legacy-origin", scope: "project", sourcePath: path.join(root, "missing-origin", "SKILL.md"),
+      destination: { kind: "project", path: ".pi/skills/legacy" }, name: "Legacy skill", savedAt,
+      files: [
+        { path: "SKILL.md", mode: 0o644, sha256: digest(skill) },
+        { path: ".envrc", mode: 0o600, sha256: digest(privateBytes) },
+      ],
+    }],
+    groups: [{ id: "legacy-team", name: "Legacy team", itemIds: [id] }],
+  };
+  const catalogPath = path.join(library, "catalog.json");
+  const catalogBytesOnDisk = Buffer.from(`${JSON.stringify(catalog, null, 2)}\n`);
+  await writeFile(catalogPath, catalogBytesOnDisk, { mode: 0o600 });
+  await mkdir(project, { recursive: true });
+  const libraryBefore = await rawTree(library);
+  const libraryDigestBefore = digest(JSON.stringify(libraryBefore));
+  const targetBefore = await rawTree(project);
+  const targetDigestBefore = digest(JSON.stringify(targetBefore));
+  const stored = await loadStoredCatalog(library);
+  assert.equal(stored.version, 1);
+  const storedItem = stored.items[0]!;
+  assert.equal(storedItem.id, id);
+  assert.equal(storedItem.source, "legacy-origin");
+  assert.equal(storedItem.sourcePath, path.join(root, "missing-origin", "SKILL.md"));
+  assert.equal(storedItem.kind, "skill");
+  assert.equal(storedItem.scope, "project");
+  assert.equal(storedItem.savedAt, savedAt);
+  const files = await readSnapshotFiles(library, storedItem);
+  assert.deepEqual(files.map((file) => file.path).sort(), [".envrc", "SKILL.md"]);
+  assert.equal(files.find((file) => file.path === "SKILL.md")!.mode, 0o644);
+  assert.equal(files.find((file) => file.path === ".envrc")!.mode, 0o600);
+  assert.deepEqual(files.find((file) => file.path === "SKILL.md")!.bytes, skill);
+  assert.deepEqual(files.find((file) => file.path === ".envrc")!.bytes, privateBytes);
+  assert.equal((await lstat(path.join(filesRoot, "SKILL.md"))).mode & 0o777, 0o600);
+  assert.equal((await lstat(path.join(filesRoot, ".envrc"))).mode & 0o777, 0o600);
+
+  await assert.rejects(planApply(library, "legacy-team", project), /This operation requires catalog v2; explicitly migrate the v1 library first\./);
+
+  assert.equal(digest(JSON.stringify(await rawTree(project))), targetDigestBefore);
+  assert.deepEqual(await rawTree(project), targetBefore);
+  assert.equal(digest(JSON.stringify(await rawTree(library))), libraryDigestBefore);
+  assert.deepEqual(await rawTree(library), libraryBefore);
+  assert.deepEqual(await readFile(catalogPath), catalogBytesOnDisk);
+  const reread = await loadStoredCatalog(library);
+  assert.equal(reread.version, 1);
+  assert.equal(reread.items[0]!.id, id);
+  assert.equal(reread.items[0]!.source, "legacy-origin");
+  assert.equal(reread.items[0]!.sourcePath, path.join(root, "missing-origin", "SKILL.md"));
+  const rereadFiles = await readSnapshotFiles(library, reread.items[0]!);
+  assert.deepEqual(rereadFiles.find((file) => file.path === "SKILL.md")!.bytes, skill);
+  assert.deepEqual(rereadFiles.find((file) => file.path === ".envrc")!.bytes, privateBytes);
+  assert.equal((await lstat(path.join(filesRoot, "SKILL.md"))).mode & 0o777, 0o600);
+  assert.equal((await lstat(path.join(filesRoot, ".envrc"))).mode & 0o777, 0o600);
+  await assert.rejects(lstat(path.join(project, ".pi/skills/legacy/SKILL.md")), { code: "ENOENT" });
+  await assert.rejects(lstat(path.join(project, ".pi/skills/legacy/.envrc")), { code: "ENOENT" });
+  await assert.rejects(lstat(path.join(library, "sources")), { code: "ENOENT" });
 });
 
 // Priority negative test: retain failure; never change expectation to permit successful misuse.

@@ -4,17 +4,49 @@ import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { catalogBytes, importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
+import { assertModernCatalog, catalogBytes, importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
 import { inspectPreparedResource } from "../../src/inspect.ts";
 import { readSavedChange, type PreparedSavedChange } from "../../src/resource-mutations.ts";
 import { StorageTransactions, type StorageOptions } from "../../src/storage-transaction.ts";
 import type { ResourceCandidate } from "../../src/types.ts";
 
 export const digest = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
+
+export function errorChainContains(error: unknown, predicate: (error: Error) => boolean): boolean {
+  const maximumDepth = 8;
+  const maximumNodes = 64;
+  const pending: Array<{ value: unknown; depth: number }> = [{ value: error, depth: 0 }];
+  const visited = new Set<Error>();
+  let examined = 0;
+
+  while (pending.length > 0 && examined < maximumNodes) {
+    const entry = pending.pop();
+    if (!entry || !(entry.value instanceof Error) || visited.has(entry.value)) continue;
+    visited.add(entry.value);
+    examined += 1;
+    if (predicate(entry.value)) return true;
+    if (entry.depth >= maximumDepth) continue;
+
+    const cause: unknown = entry.value.cause;
+    if (cause !== undefined && pending.length < maximumNodes) pending.push({ value: cause, depth: entry.depth + 1 });
+    if (entry.value instanceof AggregateError) {
+      const nestedErrors: unknown = entry.value.errors;
+      if (Array.isArray(nestedErrors)) {
+        for (let index = 0; index < nestedErrors.length && pending.length < maximumNodes; index += 1) {
+          const nested: unknown = nestedErrors[index];
+          pending.push({ value: nested, depth: entry.depth + 1 });
+        }
+      }
+    }
+  }
+  return false;
+}
+
+const sourceTest = import.meta.url.endsWith(".ts");
 export const modules = {
-  catalog: new URL("../../src/catalog.js", import.meta.url).href,
-  mutations: new URL("../../src/resource-mutations.js", import.meta.url).href,
-  storage: new URL("../../src/storage-transaction.js", import.meta.url).href,
+  catalog: new URL(sourceTest ? "../../src/catalog.ts" : "../../src/catalog.js", import.meta.url).href,
+  mutations: new URL(sourceTest ? "../../src/resource-mutations.ts" : "../../src/resource-mutations.js", import.meta.url).href,
+  storage: new URL(sourceTest ? "../../src/storage-transaction.ts" : "../../src/storage-transaction.js", import.meta.url).href,
 };
 export async function box(contents: Record<string, Buffer | string> = { "SKILL.md": "独立 old e\u0301\r\n" }) {
   assert.ok(process.env.TMPDIR && process.env.HOME && process.env.PI_CODING_AGENT_DIR, "explicit isolated environment required");
@@ -32,11 +64,13 @@ export async function box(contents: Record<string, Buffer | string> = { "SKILL.m
   const inspection = await inspectPreparedResource(prepared);
   const item = await importPreparedResource(library, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths });
   assert.ok(item);
+  if (item.content.kind !== "tree") throw new Error("Expected v2 skill tree content.");
   const catalog = await loadCatalog(library);
+  assertModernCatalog(catalog);
   catalog.groups.push({ id: "independent-team", name: "Independent team", itemIds: [item.id] });
   await saveCatalog(library, catalog);
   console.log(`fixture=${root}`); // Keep raw fixture and logs for independent review; no unknown-lock cleanup.
-  return { root, library, sourceRoot, sourcePath, candidate, prepared, inspection, item, file: path.join(library, "items", item.id, "files", "SKILL.md") };
+  return { root, library, sourceRoot, sourcePath, candidate, prepared, inspection, item, file: path.join(library, ...item.content.path.split("/"), "SKILL.md") };
 }
 export type Box = Awaited<ReturnType<typeof box>>;
 export async function rawTree(root: string): Promise<Record<string, string>> {
@@ -61,6 +95,7 @@ export async function evidence(b: Box, label: string, extra: unknown = {}) {
 export const approval = (change: PreparedSavedChange) => ({ confirmed: true, reviewId: change.reviewId, approvedSensitivePaths: readSavedChange(change).sensitivePaths });
 export async function proposal(b: Box, values: Record<string, Buffer | string> = { "SKILL.md": "独立 next\r\n" }) {
   const next = await loadCatalog(b.library);
+  assertModernCatalog(next);
   const files = Object.entries(values).sort(([a], [z]) => a.localeCompare(z)).map(([name, bytes]) => ({ path: name, bytes: Buffer.from(bytes), mode: 0o644 }));
   next.items.find((item) => item.id === b.item.id)!.files = files.map((file) => ({ path: file.path, mode: file.mode, sha256: digest(file.bytes) }));
   return { next, bytes: catalogBytes(next), replacements: [{ itemId: b.item.id, files }] };
@@ -79,7 +114,7 @@ export async function child(b: Box, code: string) {
   const cache = path.join(root, "cache");
   await Promise.all([mkdir(agent, { recursive: true }), mkdir(tmp), mkdir(cache)]);
   await writeFile(path.join(root, "repro.mjs"), code);
-  const processChild = spawn(process.execPath, [path.join(root, "repro.mjs")], { cwd: root, env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agent, TMPDIR: tmp, NPM_CONFIG_CACHE: cache, NPM_CONFIG_USERCONFIG: "/dev/null" } });
+  const processChild = spawn(process.execPath, [...(sourceTest ? ["--experimental-transform-types"] : []), path.join(root, "repro.mjs")], { cwd: root, env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: agent, TMPDIR: tmp, NPM_CONFIG_CACHE: cache, NPM_CONFIG_USERCONFIG: "/dev/null" } });
   let output = "";
   processChild.stdout.on("data", (bytes: Buffer) => { output += bytes.toString(); });
   processChild.stderr.on("data", (bytes: Buffer) => { output += bytes.toString(); });
