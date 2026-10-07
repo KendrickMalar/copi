@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange } from "../src/resource-mutations.ts";
 import { nameKey } from "../src/names.ts";
 import { answer, box, cli, environment, finish, groupSteps, hash, normalized, observe, originals, originalModes,
-  plain, pty, refreshApprovals, refreshRoute, register, route, run, select, setupSteps, snapshot, source, tree,
+  plain, pty, refreshApprovals, refreshRoute, register, route, run, savedContentRoot, select, setupSteps, snapshot, source, tree,
   unchanged, uuid, type Fixture, type Step } from "./helpers/issue3-acceptance.ts";
 
 // Oracles are fixed here from the approved Issues/supplements. No coder helper import.
@@ -73,7 +73,7 @@ test("I1/I2 independent actual registration → text edit → display rename →
   const expectedSource = structuredClone(sourceFixed); expectedSource["MapKit/SKILL.md"]!.hex = Buffer.from(late).toString("hex");
   assert.deepEqual(await tree(b.source), expectedSource);
   assert.equal(await readFile(path.join(b.root, "held-retired.md"), "utf8"), originals["retired.md"]);
-  assert.ok(!(await readFile(path.join(b.library, "items", item.id, "files", "SKILL.md"))).includes(Buffer.from("copi独立追記")));
+  assert.ok(!(await readFile(path.join(savedContentRoot(b, saved), "SKILL.md"))).includes(Buffer.from("copi独立追記")));
   await observe(b, "after-fixed-refresh");
 
   await run(b, "gamma-membership", ["manage"], groupSteps("Gamma", 2));
@@ -88,7 +88,7 @@ test("I1/I2 independent actual registration → text edit → display rename →
   const target = await tree(b.target);
   for (const [file, text] of Object.entries(refreshed)) {
     const applied = await readFile(path.join(b.target, ".pi/skills/MapKit", file));
-    const stored = await readFile(path.join(b.library, "items", item.id, "files", file));
+    const stored = await readFile(path.join(savedContentRoot(b, saved), file));
     assert.deepEqual(applied, Buffer.from(text)); assert.deepEqual(applied, stored);
     assert.equal(hash(applied), saved.files.find(f => f.path === file)!.sha256);
     assert.equal(target[`.pi/skills/MapKit/${file}`]!.mode, refreshModes[file as keyof typeof refreshModes]);
@@ -166,23 +166,46 @@ test("I3/R2 independent source absent reselects same-kind explicit path without 
   await observe(b, "missing-source-after", { held: await tree(held), explicitSource: await tree(next) });
 });
 
-test("I3/N3/N4 independent legacy v1 duplicate group: read-only view, cancelled resolution, then explicit name-only resolution", async () => {
-  const b = await box(), item = await register(b); const catalog = await loadCatalog(b.library);
+test("I3/N3/N4 legacy v1 duplicate names remain read-only: masked reader and cancelled exit preserve legacy bytes", async () => {
+  const b = await box(), item = await register(b), modern = await loadCatalog(b.library);
+  if (modern.version !== 2) throw new Error("Legacy fixture setup requires a modern registration source.");
+  const legacyFiles = await readSnapshotFiles(b.library, item);
+  const legacyFilesRoot = path.join(b.library, "items", item.id, "files");
+  await mkdir(legacyFilesRoot, { recursive: true });
+  for (const file of legacyFiles) {
+    const target = path.join(legacyFilesRoot, ...file.path.split("/"));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, file.bytes, { mode: 0o600 });
+  }
+  const legacyItem = { id: item.id, kind: item.kind, source: item.source, scope: item.scope, sourcePath: item.sourcePath,
+    destination: item.destination, name: item.name, savedAt: item.savedAt, files: item.files };
+  const legacyCatalog = { version: 1, items: [legacyItem], groups: [...modern.groups,
+    { id: randomUUID(), name: "Ａlpha 日本", itemIds: [item.id] }] };
+  await writeFile(path.join(b.library, "catalog.json"), JSON.stringify(legacyCatalog));
+  const before = await observe(b, "legacy-before");
+  const r = await run(b, "legacy-view-cancel", ["manage"], [...route(0), select("Select saved file", 3), answer("Manage saved resources", "\x1b")]);
+  assert.match(plain(r.output), /Legacy catalog v1 is read-only; duplicate names are not changed here/);
+  assert.match(plain(r.output), /Only listing and masked viewing are available/);
+  assert.match(plain(r.output), /Masked saved view/); masked(r.output, oldSecrets);
+  assert.ok(!r.output.includes("Edit saved text") && !r.output.includes("Apply group") && !r.output.includes("Resolve name conflicts"));
+  assert.deepEqual(await readFile(path.join(legacyFilesRoot, "SKILL.md")), Buffer.from(originals["SKILL.md"]));
+  await unchanged(b, before, "legacy-after-cancel");
+});
+
+test("I3/N3/N4 modern v2 duplicate names retain explicit name-only resolution", async () => {
+  const b = await box(), item = await register(b), catalog = await loadCatalog(b.library);
+  if (catalog.version !== 2) throw new Error("Modern conflict fixture requires catalog v2.");
   catalog.groups.push({ id: randomUUID(), name: "Ａlpha 日本", itemIds: [item.id] });
   await writeFile(path.join(b.library, "catalog.json"), JSON.stringify(catalog));
-  const before = await observe(b, "legacy-before");
-  const r = await run(b, "duplicate-view", ["manage"], [...route(0), select("Select saved file", 3), select("Manage saved resources", 2)]);
-  assert.match(plain(r.output), /Duplicate names/); assert.match(plain(r.output), /Masked saved view/); masked(r.output, oldSecrets);
-  assert.ok(!r.output.includes("Edit saved text") && !r.output.includes("Apply group") && !r.output.includes("Manage groups"));
-  await unchanged(b, before, "legacy-after-view");
-  await run(b, "duplicate-final-No", ["manage"], [select("Manage saved resources", 1), select("Select a conflicting name to rename"), answer("New name for", "Chosen Alpha\r"), answer("Save these name changes?", "n\r"), select("Manage saved resources", 2)]);
-  await unchanged(b, before, "legacy-after-No");
-  await run(b, "duplicate-confirmed", ["manage"], [select("Manage saved resources", 1), select("Select a conflicting name to rename"), answer("New name for", "Chosen Alpha\r"), answer("Save these name changes?"), finish]);
-  const after = await observe(b, "legacy-resolved");
+  const before = await observe(b, "modern-duplicate-before");
+  const r = await run(b, "modern-duplicate-resolve", ["manage"], [select("Manage saved resources", 1),
+    select("Select a conflicting name to rename"), answer("New name for", "Chosen Alpha\r"), answer("Save these name changes?"), finish]);
+  assert.match(plain(r.output), /Duplicate names/); assert.match(plain(r.output), /Explicit name changes/);
+  assert.match(plain(r.output), /Explicit name changes; saved contents and destinations stay unchanged/); masked(r.output, oldSecrets);
+  const after = await observe(b, "modern-duplicate-after");
   const expected = structuredClone(before.catalog); expected.groups[0]!.name = "Chosen Alpha";
   assert.deepEqual(after.catalog, expected); assert.deepEqual(after.snapshots, before.snapshots);
   assert.deepEqual(after.source, before.source); assert.deepEqual(after.target, before.target);
-  assert.deepEqual(await tree(path.join(b.library, "items")), Object.fromEntries(Object.entries(before.library).filter(([p]) => p.startsWith("items/") && p !== "items").map(([p, v]) => [p.slice(6), v])));
 });
 
 test("I3/S5 independent API exact approval set: insufficient/No/foreign/duplicate/extra approvals cannot borrow raw consent", async () => {
@@ -218,20 +241,38 @@ test("I3/U4 independent exact million bytes is editable but million-plus-one pro
   assert.ok(!r.output.includes("Approve this masked diff")); await unchanged(b, before, "million-after");
 });
 
-for (const corruption of ["checksum", "source-symlink"] as const) test(`I3/S6/R5 independent ${corruption}: fail closed without repair or outside mutation`, async () => {
+for (const scenario of ["current-content", "source-symlink"] as const) test(`I3/S2/S6/R5 independent ${scenario}: current bytes and inode custody; unsafe source links fail closed`, async () => {
   const b = await box(), item = await register(b);
-  if (corruption === "checksum") await writeFile(path.join(b.library, "items", item.id, "files", "SKILL.md"), "external corrupt bytes\n");
-  else {
+  if (scenario === "current-content") {
+    const file = path.join(savedContentRoot(b, item), "SKILL.md");
+    const descriptor = item.files.find(entry => entry.path === "SKILL.md")!;
+    const inodeBefore = await lstat(file, { bigint: true });
+    const currentText = "# Embedded MapKit\nCurrent registered bytes are the source of truth.\n";
+    await writeFile(file, currentText);
+    const inodeAfterEdit = await lstat(file, { bigint: true });
+    assert.equal(inodeAfterEdit.dev, inodeBefore.dev); assert.equal(inodeAfterEdit.ino, inodeBefore.ino);
+    const currentFiles = await readSnapshotFiles(b.library, item);
+    const current = currentFiles.find(entry => entry.path === "SKILL.md")!;
+    assert.deepEqual(current.bytes, Buffer.from(currentText)); assert.equal(current.sha256, hash(Buffer.from(currentText)));
+    assert.notEqual(current.sha256, descriptor.sha256); assert.equal(current.mode, descriptor.mode);
+    const catalog = await loadCatalog(b.library);
+    if (catalog.version !== 2) throw new Error("Current-content fixture must remain catalog v2.");
+    assert.deepEqual(catalog.items[0]!.files.find(entry => entry.path === "SKILL.md"), descriptor);
+    const before = await observe(b, "current-content-before-view");
+    const r = await run(b, "current-content-view", ["manage"], [...route(0), select("Select saved file", 3), finish]);
+    assert.match(plain(r.output), /Current registered bytes are the source of truth/); masked(r.output, oldSecrets);
+    await unchanged(b, before, "current-content-after-view");
+    const inodeAfterView = await lstat(file, { bigint: true });
+    assert.equal(inodeAfterView.dev, inodeBefore.dev); assert.equal(inodeAfterView.ino, inodeBefore.ino);
+  } else {
     const original = path.join(b.sourcePath, "SKILL.md"), held = path.join(b.root, "held-source-SKILL.md");
     await rename(original, held); await symlink(held, original);
+    const before = { library: await tree(b.library), source: await tree(b.source), target: await tree(b.target), held: await tree(b.root) };
+    const r = await run(b, scenario, ["manage"], refreshRoute(), 1); assert.match(plain(r.output), /symbolic/i);
+    assert.deepEqual(await tree(b.library), before.library); assert.deepEqual(await tree(b.source), before.source); assert.deepEqual(await tree(b.target), before.target);
+    assert.equal(await readFile(path.join(b.root, "held-source-SKILL.md"), "utf8"), originals["SKILL.md"]);
+    await writeFile(path.join(b.root, `${scenario}-custody.json`), JSON.stringify({ before, after: { library: await tree(b.library), source: await tree(b.source), target: await tree(b.target) } }));
   }
-  const before = { library: await tree(b.library), source: await tree(b.source), target: await tree(b.target), held: await tree(b.root) };
-  const steps = corruption === "checksum" ? [...route(1), select("Select saved file", 3)] : refreshRoute();
-  const r = await run(b, corruption, ["manage"], steps, 1); assert.match(plain(r.output), /checksum|symbolic/i);
-  assert.deepEqual(await tree(b.library), before.library); assert.deepEqual(await tree(b.source), before.source); assert.deepEqual(await tree(b.target), before.target);
-  // The held source is outside the selected source boundary, still within this fixture.
-  if (corruption === "source-symlink") assert.equal(await readFile(path.join(b.root, "held-source-SKILL.md"), "utf8"), originals["SKILL.md"]);
-  await writeFile(path.join(b.root, `${corruption}-custody.json`), JSON.stringify({ before, after: { library: await tree(b.library), source: await tree(b.source), target: await tree(b.target) } }));
 });
 
 test("I5/U3 independent documented actual editor keys produce fixed Japanese/blank-line bytes and restore terminal ownership", async () => {

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { loadCatalog, readSnapshotFiles } from "../../src/catalog.ts";
+import type { SavedItem } from "../../src/types.ts";
 // Reuse only the earlier independent transport/FS observer, never coder fixtures or oracles.
 import { cli, down, environment, hash, plain, pty, tree, type Step } from "./issue6-acceptance.ts";
 export { cli, down, environment, hash, plain, pty, tree };
@@ -35,6 +36,16 @@ export async function box() {
       cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/cache",
       tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp",
     },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/tmp",
+    },
   ];
   const matches = (runtime: { home: string; cache: string; tmp: string }) =>
     envHome === runtime.home && envAgent === `${runtime.home}/.pi/agent` && envCache === runtime.cache && assigned === runtime.tmp;
@@ -53,6 +64,9 @@ export async function box() {
   return b;
 }
 export type Fixture = Awaited<ReturnType<typeof box>>;
+export function savedContentRoot(b: Fixture, item: SavedItem): string {
+  return path.join(b.library, ...item.content.path.split("/"));
+}
 export const originals = {
   "SKILL.md": "# Embedded MapKit\napiKey: sk_live_i3OriginalMap123456\n最初の本文\n",
   "a.md": "password: i3OriginalOther123456\nsecond original\n",
@@ -103,8 +117,10 @@ export async function register(b: Fixture, files: Record<string, string | Buffer
   assert.ok(!r.output.includes("sk_live_i3OriginalMap123456") && !r.output.includes("i3OriginalOther123456"));
   assert.deepEqual(await tree(b.source), before);
   const c = await loadCatalog(b.library);
-  assert.equal(c.version, 1); assert.equal(c.items.length, 1); assert.equal(c.groups.length, 1);
+  if (c.version !== 2) throw new Error("New registrations must use catalog v2 sources content.");
+  assert.equal(c.items.length, 1); assert.equal(c.groups.length, 1);
   const item = c.items[0]!;
+  assert.deepEqual(item.content, { kind: "tree", path: `sources/${item.id}` });
   assert.equal(item.name, "MapKit"); assert.equal(item.kind, "skill");
   assert.deepEqual(item.destination, { kind: "project", path: ".pi/skills/MapKit" });
   assert.deepEqual(c.groups[0]!.itemIds, [item.id]);
@@ -112,7 +128,9 @@ export async function register(b: Fixture, files: Record<string, string | Buffer
   return item;
 }
 export async function snapshot(b: Fixture, expected: Record<string, string | Buffer>, modes: Record<string, number>) {
-  const c = await loadCatalog(b.library), item = c.items[0]!;
+  const c = await loadCatalog(b.library);
+  if (c.version !== 2) throw new Error("Saved snapshots must use catalog v2 sources content.");
+  const item = c.items[0]!;
   const actual = await readSnapshotFiles(b.library, item);
   assert.deepEqual(actual.map(f => f.path).sort(), Object.keys(expected).sort());
   assert.deepEqual(item.files.map(f => f.path).sort(), Object.keys(expected).sort());
@@ -121,7 +139,7 @@ export async function snapshot(b: Fixture, expected: Record<string, string | Buf
     assert.deepEqual(f.bytes, bytes); assert.equal(f.sha256, hash(bytes)); assert.equal(f.mode, modes[f.path]);
     const desc = item.files.find(d => d.path === f.path)!;
     assert.equal(desc.sha256, hash(bytes)); assert.equal(desc.mode, modes[f.path]);
-    const inode = (await tree(path.join(b.library, "items", item.id, "files")))[f.path]!;
+    const inode = (await tree(savedContentRoot(b, item)))[f.path]!;
     assert.equal(inode.mode, 0o600); assert.equal(inode.hex, bytes.toString("hex"));
   }
   return item;
