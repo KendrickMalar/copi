@@ -296,6 +296,7 @@ test("file-specific secret approval applies to the same prepared bytes shown mas
   const secretFile = path.join(sourcePath, "credentials.json");
   const libraryDir = path.join(root, "synthetic-home", ".copi");
   await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "---\nname: skill\ndescription: Synthetic skill fixture for secret approval.\n---\n# Skill\n");
   const approvedSecret = "sk_live_approved1234567890";
   const newerSecret = "sk_live_unapproved1234567890";
   const approvedBytes = Buffer.from(`apiKey: ${approvedSecret}\\n`);
@@ -320,8 +321,9 @@ test("file-specific secret approval applies to the same prepared bytes shown mas
   const saved = await saveReviewedCandidate(libraryDir, review, [], ["credentials.json"], true);
   assert.ok(saved);
   const snapshot = await readSnapshotFiles(libraryDir, saved);
-  assert.deepEqual(snapshot[0]?.bytes, approvedBytes);
-  assert.ok(!snapshot[0]?.bytes.includes(Buffer.from(newerSecret)));
+  const savedCredential = snapshot.find((file) => file.path === "credentials.json");
+  assert.deepEqual(savedCredential?.bytes, approvedBytes);
+  assert.ok(!savedCredential?.bytes.includes(Buffer.from(newerSecret)));
 });
 
 test("selected collision preview renders the chosen masked diff or binary summary", () => {
