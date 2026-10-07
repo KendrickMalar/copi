@@ -6,6 +6,7 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { buildMigrationBackupManifest, type MigrationBackupInputEntry } from "./migration-backup.ts";
+import { prepareLegacyMigrationReview, storageTransactions, type LegacyAdoptOnlyMigrationRequest } from "./storage-transaction.ts";
 import { parseStoredCatalog } from "./catalog.ts";
 import type { ChangeApproval } from "./resource-mutations.ts";
 import type { Catalog, LegacyCatalog, LegacySavedItem, SavedItem } from "./types.ts";
@@ -427,6 +428,27 @@ function treeRelativeEntries(tree: ScannedTree, base: string): Array<{ path: str
     .sort((left, right) => compare(left.path, right.path));
 }
 
+function scannedTreeCommitment(rootName: "items" | "sources", scanned: ScannedTree): string {
+  if (!scanned.present) return "absent";
+  const entries: Array<{ path: string; kind: "directory" | "file"; value: string; mode: number; dev: number; ino: number }> = [];
+  const visit = (relative: string): void => {
+    const rootRelative = relative === "." ? rootName : `${rootName}/${relative}`;
+    const directory = scanned.directories.get(rootRelative);
+    if (!directory) throw new Error(`Migration ${rootName} snapshot is missing a directory identity.`);
+    entries.push({ path: relative, kind: "directory", value: "", mode: Number(BigInt(directory.mode) & 0o777n),
+      dev: Number(BigInt(directory.dev)), ino: Number(BigInt(directory.ino)) });
+    for (const name of scanned.entries.get(rootRelative) ?? []) {
+      const child = relative === "." ? name : `${relative}/${name}`;
+      const childRootRelative = `${rootName}/${child}`;
+      const file = scanned.files.get(childRootRelative);
+      if (file) entries.push({ path: child, kind: "file", value: file.sha256, mode: file.mode, dev: Number(file.dev), ino: Number(file.ino) });
+      else visit(child);
+    }
+  };
+  visit(".");
+  return digest(Buffer.from(JSON.stringify(entries)));
+}
+
 function currentSourcePayload(
   root: string,
   item: LegacySavedItem,
@@ -623,7 +645,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     if (!rootCheck.exists) return makeAlreadyV2(reviewId, root, digest(Buffer.from(`absent:${root}`)), false, rootCheck.identities, []);
     const rootNamesBefore = (await readdir(root)).sort(compare);
     const blockers: string[] = [];
-    for (const name of [".copi-transaction", ".copi-transaction-recovery", ".migration-backups"]) {
+    for (const name of [".copi-transaction", ".copi-transaction-recovery"]) {
       const stat = await lstat(path.join(root, name)).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return undefined;
         throw error;
@@ -657,6 +679,11 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
       return makeAlreadyV2(reviewId, root, digest(Buffer.from(`${catalogFile.sha256}:${catalogFile.dev}:${catalogFile.ino}`)), true, rootCheck.identities, rootNamesBefore, rootCheck.rootDirectoryState, catalogFile);
     }
     const legacy = stored;
+    const existingBackups = await lstat(path.join(root, ".migration-backups"), { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (existingBackups) throw new Error("An existing migration backup namespace is preserved and is not adopted automatically.");
     const itemsTree = await scanTree(root, "items");
     const sourcesTree = await scanTree(root, "sources");
     const rootNamesAfter = (await readdir(root)).sort(compare);
@@ -941,5 +968,50 @@ export async function commitMigration(plan: PreparedMigration, approval: ChangeA
     };
   }
 
-  throw new Error("Legacy v1 migration is fail-closed: the storage-kernel migration write path is not implemented; no bytes were written.");
+  if (state.additions.length > 0 || state.selections.length !== state.view.items.length ||
+      state.selections.some((selection) => selection.selection !== "sources")) {
+    throw new Error("Legacy v1 migration remains fail-closed unless every payload is adopted from existing sources; items-only and new-source additions are not implemented.");
+  }
+  await recheckPreparedMigration(state);
+  const oldCatalog = state.oldCatalogBytes;
+  const nextCatalog = state.nextCatalog;
+  const catalogInput = state.inputs.find((input) => input.path === "catalog.json");
+  const itemsTree = state.itemsTree;
+  const sourcesTree = state.sourcesTree;
+  if (!oldCatalog || !nextCatalog || !catalogInput || !itemsTree || !sourcesTree || !state.rootEntries) {
+    throw new Error("The fixed adopt-only migration snapshot is incomplete; no bytes were written.");
+  }
+  const backupDir = `.migration-backups/${randomUUID()}`;
+  const request: LegacyAdoptOnlyMigrationRequest = {
+    root: state.root,
+    oldCatalogBytes: Buffer.from(oldCatalog),
+    oldCatalogIdentity: `${catalogInput.dev}:${catalogInput.ino}`,
+    catalogBytes: Buffer.from(`${JSON.stringify(nextCatalog, null, 2)}\n`, "utf8"),
+    itemsTree: scannedTreeCommitment("items", itemsTree),
+    sourcesTree: scannedTreeCommitment("sources", sourcesTree),
+    rootEntries: [...state.rootEntries],
+    inputs: state.inputs.map((input) => ({
+      path: input.path,
+      bytes: Buffer.from(input.bytes),
+      mode: input.mode,
+      sha256: input.sha256,
+      dev: input.dev,
+      ino: input.ino,
+    })),
+    backupDir,
+    backupManifestBytes: Buffer.from(state.backupManifestBytes ?? []),
+    reviewId: state.view.reviewId,
+    sensitivePaths: [...state.view.sensitivePaths],
+  };
+  const storageReview = prepareLegacyMigrationReview(request);
+  state.used = true;
+  await storageTransactions.run(state.root, false, async (session) => {
+    if (!session || session.root !== state.root) throw new Error("Issued storage lease does not match the reviewed canonical migration root.");
+    await session.commitLegacyMigration(storageReview, approval);
+  });
+  return {
+    catalogVersion: 2,
+    backupDir,
+    preservedPaths: [...state.view.preservedPaths],
+  };
 }

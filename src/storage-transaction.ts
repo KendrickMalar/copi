@@ -3,10 +3,12 @@ import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, rmdir, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
 import { readSourceContent } from "./source-content.ts";
-import { parseStorageJournal, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type SourcesStorageJournal } from "./storage-journal.ts";
+import { parseStorageJournal, validateLegacyMigrationJournalTargets, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type LegacyMigrationStorageJournal, type SourcesStorageJournal } from "./storage-journal.ts";
+import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
@@ -16,8 +18,68 @@ const lockName = ".copi-transaction";
 const privateNames = new Set([".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions", "auth.json", "mcp-auth.json", "oauth.json"]);
 const itemPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const hash = (bytes: Buffer | string): string => createHash("sha256").update(bytes).digest("hex");
+const isNativeProxy = utilTypes.isProxy;
+function snapshotOwnDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || isNativeProxy(value) || Array.isArray(value)) return undefined;
+  try {
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== expectedKeys.length || keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))) return undefined;
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return undefined;
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch { return undefined; }
+}
+function snapshotDenseOwnDataArray(value: unknown): unknown[] | undefined {
+  if (isNativeProxy(value) || !Array.isArray(value)) return undefined;
+  try {
+    const keys = Reflect.ownKeys(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") || lengthDescriptor.enumerable !== false ||
+        typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 ||
+        keys.length !== lengthDescriptor.value + 1) return undefined;
+    const length = lengthDescriptor.value;
+    const allowed = new Set<string>(["length"]);
+    for (const key of keys) {
+      if (typeof key !== "string" || (key !== "length" && (!Number.isSafeInteger(Number(key)) || Number(key) < 0 ||
+          Number(key) >= length || String(Number(key)) !== key))) return undefined;
+      allowed.add(key);
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const key = String(index);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!allowed.has(key) || !descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return undefined;
+      result.push(descriptor.value);
+    }
+    return result;
+  } catch { return undefined; }
+}
 export interface StorageFile { readonly path: string; readonly bytes: Buffer; readonly mode: number }
 export interface StorageReplacement { readonly itemId: string; readonly files: readonly StorageFile[] }
+export interface LegacyMigrationInput extends StorageFile { readonly sha256: string; readonly dev: string; readonly ino: string }
+export interface LegacyAdoptOnlyMigrationRequest {
+  readonly root: string;
+  readonly oldCatalogBytes: Buffer;
+  readonly oldCatalogIdentity: string;
+  readonly catalogBytes: Buffer;
+  readonly itemsTree: string;
+  readonly sourcesTree: string;
+  readonly rootEntries: readonly string[];
+  readonly inputs: readonly LegacyMigrationInput[];
+  readonly backupDir: string;
+  readonly backupManifestBytes: Buffer;
+  readonly reviewId: string;
+  readonly sensitivePaths: readonly string[];
+}
+declare const legacyMigrationReviewBrand: unique symbol;
+export interface LegacyMigrationReview { readonly [legacyMigrationReviewBrand]: true; readonly reviewId: string }
+export interface LegacyMigrationApproval { readonly reviewId: string; readonly confirmed: boolean; readonly approvedSensitivePaths: readonly string[] }
+interface LegacyMigrationReviewState { readonly request: LegacyAdoptOnlyMigrationRequest; used: boolean }
+const legacyMigrationReviews = new WeakMap<LegacyMigrationReview, LegacyMigrationReviewState>();
 declare const storageReviewBrand: unique symbol;
 export interface StorageReview { readonly [storageReviewBrand]: true; readonly reviewId: string }
 export interface StorageReviewView { readonly sensitivePaths: readonly string[]; readonly warnings: readonly InspectionWarning[] }
@@ -31,7 +93,7 @@ interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: 
 export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly catalogIdentity: string | null; readonly format: "v1" | "v2"; readonly tree: string }
 export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-held" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "rollback-catalog-held" | "finalized" | "rollback-finalized";
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
-interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean }
+interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean; migrationRootEntries?: string[] }
 interface DirectoryIdentity { dev: number; ino: number }
 interface InFlightControl { signal: AbortSignal; recovering: boolean }
 interface SessionLease {
@@ -1101,11 +1163,59 @@ async function cleanupUnjournaledLock(root: string, lock: string, lease: Session
   await rmdir(lock);
   await syncDirectory(root);
 }
+async function cleanupLegacyMigrationLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
+  await assertLeaseOwner(lease);
+  const journalPath = path.join(lock, "journal.json");
+  const digestPath = path.join(lock, "journal.digest");
+  const raw = await checkedFile(journalPath);
+  const digestBytes = await checkedFile(digestPath);
+  if (!raw || !digestBytes || digestBytes.toString("utf8") !== hash(raw)) throw new Error("V4 migration journal integrity is missing or altered; preserving all bytes.");
+  const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root, token });
+  if (parsed.version !== 4) throw new Error("V4 cleanup received a different journal version.");
+  const inspected = await inspectLegacyMigrationJournal(root, lock, token, parsed, lease.recoveryClaim !== undefined);
+  if (inspected.currentHash !== parsed.oldCatalog && inspected.currentHash !== parsed.newCatalog) {
+    throw new Error("V4 migration did not reach a checked terminal catalog state; preserving every artifact.");
+  }
+  const files = new Map<string, { bytes: Buffer; dev: number; ino: number }>();
+  for (const name of await readdir(lock)) {
+    if (name === "owner.json") continue;
+    const target = path.join(lock, name);
+    const bytes = await checkedFile(target);
+    const stat = await statMaybe(target);
+    if (!bytes || !stat) throw new Error(`V4 cleanup artifact ${name} is missing or unsafe; preserving all remaining bytes.`);
+    files.set(name, { bytes, dev: stat.dev, ino: stat.ino });
+  }
+  await assertLeaseOwner(lease);
+  const rechecked = await inspectLegacyMigrationJournal(root, lock, token, parsed, lease.recoveryClaim !== undefined);
+  if (rechecked.currentHash !== inspected.currentHash) throw new Error("V4 catalog state changed during cleanup; preserving its journal.");
+  for (const name of [...files.keys()].filter((entry) => entry !== "journal.json" && entry !== "journal.digest").sort()) {
+    await assertLeaseOwner(lease);
+    const target = path.join(lock, name);
+    const bytes = await checkedFile(target);
+    const stat = await statMaybe(target);
+    const expected = files.get(name)!;
+    if (!bytes?.equals(expected.bytes) || !stat || !sameDirectory({ dev: stat.dev, ino: stat.ino }, expected)) {
+      throw new Error(`V4 cleanup artifact ${name} changed; preserving all remaining bytes.`);
+    }
+    await unlink(target);
+  }
+  await assertLeaseOwner(lease);
+  const journalNow = await checkedFile(journalPath);
+  const digestNow = await checkedFile(digestPath);
+  if (!journalNow?.equals(raw) || !digestNow?.equals(digestBytes)) throw new Error("V4 journal changed before cleanup; preserving it.");
+  await unlink(journalPath);
+  await unlink(digestPath);
+  await assertLeaseOwner(lease);
+  await unlink(path.join(lock, "owner.json"));
+  await rmdir(lock);
+  await syncDirectory(root);
+}
 async function cleanupTransactionLock(root: string, lock: string, token: string, lease: SessionLease): Promise<void> {
   await assertLeaseOwner(lease);
   const rawJournal = await checkedFile(path.join(lock, "journal.json"));
   if (rawJournal) {
     const journal = parseStorageJournal(JSON.parse(rawJournal.toString("utf8")) as unknown, { root, token });
+    if (journal.version === 4) { await cleanupLegacyMigrationLock(root, lock, token, lease); return; }
     if (journal.version !== 3) throw new Error("A non-catalog-only transaction journal remains after recovery; refusing cleanup.");
     await cleanupFinalizedCatalogOnlyLock(root, lock, token, lease);
     return;
@@ -1152,6 +1262,313 @@ async function writePrivate(target: string, bytes: Buffer | string): Promise<voi
   const handle = await open(target, "wx", 0o600);
   try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
 }
+async function checkedLegacyMigrationInput(root: string, input: LegacyMigrationInput): Promise<void> {
+  if (input.path !== "catalog.json" && (!safeStoragePath(input.path) ||
+      (!input.path.startsWith("items/") && !input.path.startsWith("sources/")))) {
+    throw new Error("Legacy migration backup input has an unsafe original path.");
+  }
+  const target = path.join(root, ...input.path.split("/"));
+  const before = await lstat(target, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.dev.toString() !== input.dev || before.ino.toString() !== input.ino ||
+      Number(before.mode & 0o777n) !== input.mode) throw new Error(`Legacy migration input ${input.path} changed identity or mode.`);
+  const handle = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.mode !== before.mode || opened.size !== before.size ||
+        opened.mtimeNs !== before.mtimeNs || opened.ctimeNs !== before.ctimeNs) throw new Error(`Legacy migration input ${input.path} changed while opening.`);
+    const bytes = await handle.readFile();
+    const [afterHandle, afterPath] = await Promise.all([handle.stat({ bigint: true }), lstat(target, { bigint: true })]);
+    if (!afterPath.isFile() || afterPath.isSymbolicLink() || afterHandle.dev !== opened.dev || afterHandle.ino !== opened.ino ||
+        afterHandle.size !== opened.size || afterHandle.mtimeNs !== opened.mtimeNs || afterHandle.ctimeNs !== opened.ctimeNs ||
+        afterPath.dev !== opened.dev || afterPath.ino !== opened.ino || afterPath.mode !== opened.mode || afterPath.size !== opened.size ||
+        afterPath.mtimeNs !== opened.mtimeNs || afterPath.ctimeNs !== opened.ctimeNs || hash(bytes) !== input.sha256 || !bytes.equals(input.bytes)) {
+      throw new Error(`Legacy migration input ${input.path} changed while being read.`);
+    }
+  } finally { await handle.close(); }
+}
+async function assertLegacyMigrationSnapshot(root: string, request: LegacyAdoptOnlyMigrationRequest, backupCreated: boolean, catalogHeld = false, catalogChanged = false): Promise<void> {
+  const expectedEntries = [...request.rootEntries.filter((entry) => !(catalogHeld && entry === "catalog.json")), lockName,
+    ...(backupCreated ? [".migration-backups"] : [])].sort();
+  const currentEntries = (await readdir(root)).sort();
+  if (JSON.stringify(currentEntries) !== JSON.stringify(expectedEntries) || await statMaybe(path.join(root, `${lockName}-recovery`))) {
+    throw new Error("Library root entries changed during legacy migration; refusing the catalog switch.");
+  }
+  if ((await tree(path.join(root, "items"), undefined, true) ?? "absent") !== request.itemsTree ||
+      (await tree(path.join(root, "sources"), undefined, true) ?? "absent") !== request.sourcesTree) {
+    throw new Error("Legacy items or sources changed during adoption; refusing the catalog switch.");
+  }
+  for (const input of request.inputs) {
+    if (backupCreated && input.path === "catalog.json" && (catalogHeld || catalogChanged)) continue;
+    await checkedLegacyMigrationInput(root, input);
+  }
+}
+async function actualLegacyMigrationInputs(root: string, catalogBytes: Buffer, catalogMode: number): Promise<MigrationBackupInputEntry[]> {
+  const entries: MigrationBackupInputEntry[] = [];
+  const visit = async (absolute: string, relative: string): Promise<void> => {
+    const beforeDirectory = await lstat(absolute, { bigint: true });
+    if (!beforeDirectory.isDirectory() || beforeDirectory.isSymbolicLink()) throw new Error("Legacy migration backup coverage encountered an unsafe directory.");
+    const names = (await readdir(absolute)).sort();
+    for (const name of names) {
+      const childRelative = `${relative}/${name}`;
+      const child = path.join(absolute, name);
+      const stat = await lstat(child, { bigint: true });
+      if (stat.isSymbolicLink()) throw new Error("Legacy migration backup coverage encountered a symbolic link.");
+      if (stat.isDirectory()) await visit(child, childRelative);
+      else if (stat.isFile()) {
+        const bytes = await readFile(child);
+        const after = await lstat(child, { bigint: true });
+        if (!after.isFile() || after.isSymbolicLink() || stat.dev !== after.dev || stat.ino !== after.ino || stat.mode !== after.mode ||
+            stat.size !== after.size || stat.mtimeNs !== after.mtimeNs || stat.ctimeNs !== after.ctimeNs) {
+          throw new Error("Legacy migration backup input changed while enumerating coverage.");
+        }
+        entries.push({ originalPath: childRelative, sha256: hash(bytes), mode: Number(after.mode & 0o777n) });
+      } else throw new Error("Legacy migration backup coverage encountered a special file.");
+    }
+    const afterDirectory = await lstat(absolute, { bigint: true });
+    if (afterDirectory.dev !== beforeDirectory.dev || afterDirectory.ino !== beforeDirectory.ino ||
+        JSON.stringify((await readdir(absolute)).sort()) !== JSON.stringify(names)) {
+      throw new Error("Legacy migration backup coverage changed while enumerating a directory.");
+    }
+  };
+  for (const name of ["items", "sources"] as const) {
+    const target = path.join(root, name);
+    const stat = await statMaybe(target);
+    if (stat) {
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Legacy migration ${name} tree is unsafe.`);
+      await visit(target, name);
+    }
+  }
+  entries.push({ originalPath: "catalog.json", sha256: hash(catalogBytes), mode: catalogMode });
+  return entries.sort((left, right) => left.originalPath < right.originalPath ? -1 : left.originalPath > right.originalPath ? 1 : 0);
+}
+async function assertLegacyMigrationInputCoverage(root: string, request: LegacyAdoptOnlyMigrationRequest): Promise<void> {
+  const catalogInput = request.inputs.find((input) => input.path === "catalog.json");
+  if (!catalogInput) throw new Error("Legacy migration backup inputs omit catalog.json.");
+  const actual = await actualLegacyMigrationInputs(root, request.oldCatalogBytes, catalogInput.mode);
+  const expected = request.inputs.map(({ path: originalPath, sha256, mode }) => ({ originalPath, sha256, mode }))
+    .sort((left, right) => left.originalPath < right.originalPath ? -1 : left.originalPath > right.originalPath ? 1 : 0);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error("Legacy migration backup does not cover every original catalog/items/sources file exactly.");
+}
+async function writeLegacyMigrationBackup(root: string, request: LegacyAdoptOnlyMigrationRequest): Promise<{ root: string; parent: DirectoryIdentity }> {
+  const parent = path.join(root, ".migration-backups");
+  if (await statMaybe(parent)) throw new Error("An existing migration backup namespace is not adopted; preserve it and stop.");
+  await mkdir(parent, { mode: 0o700 });
+  await chmod(parent, 0o700);
+  const backupRoot = path.join(root, ...request.backupDir.split("/"));
+  await mkdir(backupRoot, { mode: 0o700 });
+  await chmod(backupRoot, 0o700);
+  const filesRoot = path.join(backupRoot, "files");
+  await mkdir(filesRoot, { mode: 0o700 });
+  await chmod(filesRoot, 0o700);
+  const madeDirectories = new Set<string>([filesRoot]);
+  for (const input of request.inputs) {
+    let directory = filesRoot;
+    const parts = input.path.split("/");
+    for (const segment of parts.slice(0, -1)) {
+      directory = path.join(directory, segment);
+      if (!madeDirectories.has(directory)) {
+        await mkdir(directory, { mode: 0o700 });
+        await chmod(directory, 0o700);
+        madeDirectories.add(directory);
+      }
+    }
+    const target = path.join(directory, parts.at(-1)!);
+    await writePrivate(target, input.bytes);
+    await chmod(target, 0o600);
+    await syncDirectory(directory);
+  }
+  await writePrivate(path.join(backupRoot, "manifest.json"), request.backupManifestBytes);
+  await chmod(path.join(backupRoot, "manifest.json"), 0o600);
+  await syncDirectory(filesRoot);
+  await syncDirectory(backupRoot);
+  await syncDirectory(parent);
+  await syncDirectory(root);
+  return { root: backupRoot, parent: await directoryIdentity(parent) };
+}
+async function assertLegacyMigrationBackup(root: string, request: LegacyAdoptOnlyMigrationRequest): Promise<void> {
+  const entries = request.inputs.map(({ path: originalPath, sha256, mode }) => ({ originalPath, sha256, mode }));
+  const expectedManifest = buildMigrationBackupManifest(entries);
+  if (!expectedManifest.equals(request.backupManifestBytes)) throw new Error("Fixed legacy migration backup manifest does not cover the exact reviewed inputs.");
+  const manifestPath = path.join(root, ...request.backupDir.split("/"), "manifest.json");
+  const manifestBytes = await checkedFile(manifestPath);
+  if (!manifestBytes || !manifestBytes.equals(request.backupManifestBytes)) throw new Error("Fixed legacy migration backup manifest is missing or altered.");
+  await verifyMigrationBackup({
+    libraryRoot: root,
+    backupDir: request.backupDir,
+    manifestBytes: request.backupManifestBytes,
+    manifestSha256: hash(request.backupManifestBytes),
+    entries,
+  });
+}
+export function prepareLegacyMigrationReview(value: unknown): LegacyMigrationReview {
+  const fields = snapshotOwnDataRecord(value, ["root", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries", "inputs", "backupDir", "backupManifestBytes", "reviewId", "sensitivePaths"]);
+  if (!fields || typeof fields.root !== "string" || !path.isAbsolute(fields.root) || path.resolve(fields.root) !== fields.root ||
+      typeof fields.oldCatalogIdentity !== "string" || typeof fields.itemsTree !== "string" || typeof fields.sourcesTree !== "string" ||
+      typeof fields.backupDir !== "string" || typeof fields.reviewId !== "string" || !itemPattern.test(fields.reviewId) ||
+      isNativeProxy(fields.oldCatalogBytes) || !Buffer.isBuffer(fields.oldCatalogBytes) ||
+      isNativeProxy(fields.catalogBytes) || !Buffer.isBuffer(fields.catalogBytes) ||
+      isNativeProxy(fields.backupManifestBytes) || !Buffer.isBuffer(fields.backupManifestBytes)) {
+    throw new Error("Legacy migration review must be a fixed own-data snapshot of canonical paths and bytes.");
+  }
+  const rootEntries = snapshotDenseOwnDataArray(fields.rootEntries);
+  const rawInputs = snapshotDenseOwnDataArray(fields.inputs);
+  const sensitivePaths = snapshotDenseOwnDataArray(fields.sensitivePaths);
+  if (!rootEntries || rootEntries.some((entry) => typeof entry !== "string") || !rawInputs || !sensitivePaths ||
+      sensitivePaths.some((entry) => typeof entry !== "string")) {
+    throw new Error("Legacy migration review collections must be dense own-data arrays.");
+  }
+  const inputs: LegacyMigrationInput[] = rawInputs.map((entry) => {
+    const input = snapshotOwnDataRecord(entry, ["path", "bytes", "mode", "sha256", "dev", "ino"]);
+    if (!input || typeof input.path !== "string" || isNativeProxy(input.bytes) || !Buffer.isBuffer(input.bytes) ||
+        typeof input.mode !== "number" || !Number.isInteger(input.mode) || input.mode < 0 || input.mode > 0o777 ||
+        typeof input.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(input.sha256) ||
+        typeof input.dev !== "string" || typeof input.ino !== "string") {
+      throw new Error("Legacy migration review input must be fixed regular-file bytes and identities.");
+    }
+    return { path: input.path, bytes: Buffer.from(input.bytes), mode: input.mode, sha256: input.sha256, dev: input.dev, ino: input.ino };
+  });
+  const request: LegacyAdoptOnlyMigrationRequest = {
+    root: fields.root,
+    oldCatalogBytes: Buffer.from(fields.oldCatalogBytes),
+    oldCatalogIdentity: fields.oldCatalogIdentity,
+    catalogBytes: Buffer.from(fields.catalogBytes),
+    itemsTree: fields.itemsTree,
+    sourcesTree: fields.sourcesTree,
+    rootEntries: rootEntries as string[],
+    inputs,
+    backupDir: fields.backupDir,
+    backupManifestBytes: Buffer.from(fields.backupManifestBytes),
+    reviewId: fields.reviewId,
+    sensitivePaths: (sensitivePaths as string[]).slice().sort(),
+  };
+  const oldValue = parseStoredCatalog(JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown);
+  const nextValue = parseStoredCatalog(JSON.parse(request.catalogBytes.toString("utf8")) as unknown);
+  if (oldValue.version !== 1 || nextValue.version !== 2 || !request.backupDir.startsWith(".migration-backups/") ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.backupDir.slice(".migration-backups/".length))) {
+    throw new Error("Legacy migration review is not a v1-to-v2 adopt-only transition.");
+  }
+  const journal: LegacyMigrationStorageJournal = {
+    version: 4, mode: "legacy-migration", root: request.root, token: "123e4567-e89b-42d3-a456-426614174000",
+    oldCatalog: hash(request.oldCatalogBytes), newCatalog: hash(request.catalogBytes),
+    stableItemsTree: request.itemsTree, stableSourcesTree: request.sourcesTree, stableSourcesTreeNext: request.sourcesTree,
+    backupDir: request.backupDir, backupManifest: hash(request.backupManifestBytes), operations: [], ownedDirectories: [],
+  };
+  validateLegacyMigrationJournalTargets(journal, oldValue, nextValue);
+  const inputsByPath = new Map(request.inputs.map((input) => [input.path, input]));
+  const inspectedPaths: string[] = [];
+  for (const item of nextValue.items) {
+    const source = item.content.kind === "file" ? [inputsByPath.get(item.content.path)] : item.files.map((file) => inputsByPath.get(`${item.content.path}/${file.path}`));
+    if (source.some((entry) => !entry)) throw new Error("Legacy migration review target does not bind to fixed existing sources bytes.");
+    const inspection = inspectFixedResource({
+      candidate: { ...item, sourceRoot: path.dirname(item.sourcePath) },
+      files: item.files.map((file, index) => ({ path: file.path, mode: file.mode, bytes: Buffer.from(source[item.content.kind === "file" ? 0 : index]!.bytes) })),
+      excludedPaths: [],
+    });
+    inspectedPaths.push(...inspection.sensitivePaths.map((filePath) => `${item.id}/${filePath}`));
+  }
+  const exactSensitivePaths = [...new Set(inspectedPaths)].sort();
+  if (JSON.stringify(exactSensitivePaths) !== JSON.stringify(request.sensitivePaths)) {
+    throw new Error("Legacy migration review sensitive paths differ from the fixed selected source bytes.");
+  }
+  const review = Object.freeze({ reviewId: request.reviewId }) as LegacyMigrationReview;
+  legacyMigrationReviews.set(review, { request, used: false });
+  return review;
+}
+
+async function inspectLegacyMigrationJournal(root: string, lock: string, token: string, journal: LegacyMigrationStorageJournal, recoveryClaim = false): Promise<{ currentHash: string | null; oldBytes: Buffer; nextBytes: Buffer }> {
+  if (journal.operations.length !== 0 || journal.ownedDirectories.length !== 0 ||
+      journal.stableSourcesTree !== journal.stableSourcesTreeNext) {
+    throw new Error("Legacy migration v4 recovery is not implemented for additions in this build; adopt-only is supported and additions are preserved.");
+  }
+  const allowed = new Set(["owner.json", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "journal.json", "journal.digest"]);
+  const names = await readdir(lock);
+  if (names.some((name) => !allowed.has(name)) || !["owner.json", "next-catalog", "old-catalog", "journal.json", "journal.digest"].every((name) => names.includes(name))) {
+    throw new Error("Unknown or missing adopt-only migration transaction artifact; preserving every byte.");
+  }
+  if ((await tree(path.join(root, "items"), undefined, true) ?? "absent") !== journal.stableItemsTree ||
+      (await tree(path.join(root, "sources"), undefined, true) ?? "absent") !== journal.stableSourcesTree) {
+    throw new Error("Legacy items or adopted sources changed during v4 recovery; preserving the journal and backup.");
+  }
+  const owner = await readOwner(lock);
+  if (!owner.migrationRootEntries) throw new Error("V4 migration owner is missing its private root-entry commitment.");
+  const currentCatalogPath = path.join(root, "catalog.json");
+  const currentRootNames = (await readdir(root)).sort();
+  const expectedRootNames = [...owner.migrationRootEntries, lockName, ".migration-backups",
+    ...(recoveryClaim ? [`${lockName}-recovery`] : [])].sort();
+  const currentRootCatalog = await checkedFile(currentCatalogPath);
+  const currentHashAtRoot = currentRootCatalog ? hash(currentRootCatalog) : null;
+  const expectedNamesForState = currentHashAtRoot === null
+    ? expectedRootNames.filter((entry) => entry !== "catalog.json")
+    : expectedRootNames;
+  if (JSON.stringify(currentRootNames) !== JSON.stringify(expectedNamesForState)) {
+    throw new Error("V4 migration root entries changed; preserving the journal and every byte.");
+  }
+  const backupRoot = path.join(root, ...journal.backupDir.split("/"));
+  const manifestBytes = await checkedFile(path.join(backupRoot, "manifest.json"));
+  if (!manifestBytes || hash(manifestBytes) !== journal.backupManifest) throw new Error("V4 fixed backup manifest is missing or altered; preserving the migration journal and backup.");
+  const manifest = parseMigrationBackupManifest(manifestBytes);
+  const manifestEntries = manifest.entries.map(({ originalPath, sha256, mode }) => ({ originalPath, sha256, mode }));
+  const backupCatalog = await checkedFile(path.join(backupRoot, "files", "catalog.json"));
+  const catalogEntry = manifest.entries.find((entry) => entry.originalPath === "catalog.json");
+  if (!backupCatalog || !catalogEntry || hash(backupCatalog) !== journal.oldCatalog ||
+      JSON.stringify(await actualLegacyMigrationInputs(root, backupCatalog, catalogEntry.mode)) !== JSON.stringify(manifestEntries)) {
+    throw new Error("V4 backup does not exactly cover the original catalog/items/sources bytes; preserving all custody.");
+  }
+  await verifyMigrationBackup({
+    libraryRoot: root,
+    backupDir: journal.backupDir,
+    manifestBytes,
+    manifestSha256: journal.backupManifest,
+    entries: manifestEntries,
+  });
+  const parsedOld = parseStoredCatalog(JSON.parse(backupCatalog.toString("utf8")) as unknown);
+  if (parsedOld.version !== 1) throw new Error("V4 backup does not contain its committed original v1 catalog.");
+  const oldStage = path.join(lock, "old-catalog");
+  const oldBytes = await checkedFile(oldStage);
+  const oldStageStat = await statMaybe(oldStage);
+  if (!oldBytes || !oldStageStat || hash(oldBytes) !== journal.oldCatalog || !oldBytes.equals(backupCatalog)) {
+    throw new Error("V4 original catalog stage is missing or altered; preserving it.");
+  }
+  const nextStagePath = path.join(lock, "next-catalog");
+  const nextStage = await checkedFile(nextStagePath);
+  const nextStageStat = await statMaybe(nextStagePath);
+  const catalogPath = path.join(root, "catalog.json");
+  const current = await checkedFile(catalogPath);
+  const currentStat = await statMaybe(catalogPath);
+  const heldPath = path.join(lock, "held-catalog");
+  const held = await checkedFile(heldPath);
+  const heldStat = await statMaybe(heldPath);
+  const displacedPath = path.join(lock, "displaced-catalog");
+  const displaced = await checkedFile(displacedPath);
+  const displacedStat = await statMaybe(displacedPath);
+  const currentHash = current ? hash(current) : null;
+  if (currentHash !== journal.oldCatalog && currentHash !== journal.newCatalog &&
+      !(currentHash === null && held && hash(held) === journal.oldCatalog)) {
+    throw new Error("V4 catalog is neither the checked old nor new inode; preserving journal, backup, and all bytes.");
+  }
+  if (held && (!heldStat || hash(held) !== journal.oldCatalog || !sameDirectory({ dev: heldStat.dev, ino: heldStat.ino }, { dev: oldStageStat.dev, ino: oldStageStat.ino }))) {
+    throw new Error("V4 held original catalog inode is missing or altered; preserving it.");
+  }
+  if (currentHash === journal.newCatalog && !held) throw new Error("V4 committed catalog is missing its checked original held inode; preserving the backup and journal.");
+  if (currentHash === journal.oldCatalog && (!currentStat || !sameDirectory({ dev: currentStat.dev, ino: currentStat.ino }, { dev: oldStageStat.dev, ino: oldStageStat.ino }))) {
+    throw new Error("V4 current original catalog lost its reviewed inode; preserving it.");
+  }
+  if (nextStage) {
+    const parsedNext = parseStoredCatalog(JSON.parse(nextStage.toString("utf8")) as unknown);
+    if (!nextStageStat || hash(nextStage) !== journal.newCatalog || parsedNext.version !== 2) throw new Error("V4 next catalog stage is missing or altered.");
+    if (currentHash === journal.newCatalog && (!currentStat || !sameDirectory({ dev: currentStat.dev, ino: currentStat.ino }, { dev: nextStageStat.dev, ino: nextStageStat.ino }))) {
+      throw new Error("V4 installed catalog is not the reviewed staged inode.");
+    }
+    validateLegacyMigrationJournalTargets(journal, parsedOld, parsedNext);
+  } else throw new Error("V4 next catalog stage is missing; preserving journal and backup.");
+  if (displaced && (!displacedStat || hash(displaced) !== journal.newCatalog || !nextStageStat ||
+      !sameDirectory({ dev: displacedStat.dev, ino: displacedStat.ino }, { dev: nextStageStat.dev, ino: nextStageStat.ino }))) {
+    throw new Error("V4 displaced catalog is foreign or altered; preserving it.");
+  }
+  const marker = await checkedFile(path.join(lock, "rollback.json"));
+  if (marker && marker.toString("utf8") !== token) throw new Error("Invalid v4 rollback marker; preserving the journal.");
+  return { currentHash, oldBytes: backupCatalog, nextBytes: nextStage };
+}
 async function replacePrivate(target: string, bytes: Buffer | string): Promise<void> {
   const handle = await open(target, "w", 0o600);
   try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
@@ -1178,6 +1595,14 @@ export async function absentStorageRevision(libraryDir: string): Promise<Storage
 function ownerFrom(value: unknown): Owner {
   const owner = value as Partial<Owner> | null;
   if (!owner || owner.version !== 1 || !Number.isSafeInteger(owner.pid) || typeof owner.pid !== "number" || owner.pid < 1 || typeof owner.host !== "string" || typeof owner.token !== "string" || !itemPattern.test(owner.token)) throw new Error("Copi transaction lock owner is missing or malformed; inspect the lock before recovery.");
+  if (Object.hasOwn(owner, "migrationRootEntries")) {
+    const entries = owner.migrationRootEntries;
+    if (!Array.isArray(entries) || entries.some((entry) => typeof entry !== "string" || !entry || entry.includes("/") || entry.includes("\\") || entry.includes("\0") || entry === "." || entry === "..") ||
+        new Set(entries).size !== entries.length || JSON.stringify([...entries].sort()) !== JSON.stringify(entries) ||
+        entries.some((entry) => entry === lockName || entry === `${lockName}-recovery` || entry === ".migration-backups")) {
+      throw new Error("Copi migration lock owner root-entry commitment is malformed; inspect the lock before recovery.");
+    }
+  }
   return owner as Owner;
 }
 function alive(owner: Owner): boolean {
@@ -1221,7 +1646,8 @@ async function assertLeaseOwner(lease: SessionLease): Promise<void> {
   await storageDirectories(lease.root, lease.lock, false);
   if (!sameDirectory(await directoryIdentity(lease.root), lease.rootIdentity) || !sameDirectory(await directoryIdentity(lease.lock), lease.lockIdentity)) throw new Error("Copi session root or lock directory changed; refusing mutation or cleanup.");
   const actual = await readOwner(lease.lock);
-  if (actual.pid !== lease.owner.pid || actual.host !== lease.owner.host || actual.token !== lease.owner.token || actual.blocked !== lease.owner.blocked) throw new Error("Copi session lock owner changed; refusing mutation or cleanup.");
+  if (actual.pid !== lease.owner.pid || actual.host !== lease.owner.host || actual.token !== lease.owner.token || actual.blocked !== lease.owner.blocked ||
+      JSON.stringify(actual.migrationRootEntries ?? null) !== JSON.stringify(lease.owner.migrationRootEntries ?? null)) throw new Error("Copi session lock owner changed; refusing mutation or cleanup.");
   if (lease.recoveryClaim) {
     if (!sameDirectory(await directoryIdentity(lease.recoveryClaim.path), lease.recoveryClaim.identity) || alive(actual)) throw new Error("Copi recovery lease changed or its previous owner is active; refusing recovery.");
   } else if (actual.pid !== process.pid || actual.host !== os.hostname()) throw new Error("Copi session does not belong to this process and host.");
@@ -1307,7 +1733,7 @@ export class StorageTransactions {
           catch (journalError) {
             // Keep an unverified journal blocked; never delete incomplete cleanup artifacts.
             const handle = await open(path.join(lock, "owner.json"), "w", 0o600);
-            try { await handle.writeFile(JSON.stringify({ ...owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
+            try { await handle.writeFile(JSON.stringify({ ...lease.owner, blocked: true })); await handle.sync(); } finally { await handle.close(); }
             throw journalError;
           }
         } else { await cleanupTransactionLock(root, lock, owner.token, lease); }
@@ -1410,6 +1836,226 @@ export class StorageSession {
     lease.pending.add(operation);
     try { await operation; }
     finally { lease.pending.delete(operation); sessionLeases.delete(worker); }
+  }
+  /** @internal Dedicated v1-to-v2 adopt-only path. Ordinary commit() deliberately remains v2-only. */
+  async commitLegacyMigration(review: LegacyMigrationReview, approvalValue: LegacyMigrationApproval): Promise<void> {
+    const lease = sessionLeases.get(this);
+    if (!lease || lease.stop.signal.aborted || this.root !== lease.root || this.lock !== lease.lock || this.token !== lease.owner.token) {
+      throw new Error("Invalid or expired copi storage session; refusing legacy migration.");
+    }
+    const reviewState = typeof review === "object" && review !== null ? legacyMigrationReviews.get(review) : undefined;
+    if (!reviewState || reviewState.used || review.reviewId !== reviewState.request.reviewId || reviewState.request.root !== this.root) {
+      throw new Error("Legacy migration requires an issued, unused review bound to this root and storage lease.");
+    }
+    const approval = snapshotOwnDataRecord(approvalValue, ["reviewId", "confirmed", "approvedSensitivePaths"]);
+    const approvedPaths = approval ? snapshotDenseOwnDataArray(approval.approvedSensitivePaths) : undefined;
+    if (!approval || approval.reviewId !== reviewState.request.reviewId || approval.confirmed !== true || !approvedPaths ||
+        approvedPaths.some((entry) => typeof entry !== "string") ||
+        new Set(approvedPaths).size !== approvedPaths.length || approvedPaths.length !== reviewState.request.sensitivePaths.length ||
+        reviewState.request.sensitivePaths.some((entry) => !approvedPaths.includes(entry))) {
+      throw new Error("Legacy migration approval must confirm this opaque review and its exact sensitive-path set.");
+    }
+    reviewState.used = true;
+    const request = reviewState.request;
+    const control: InFlightControl = { signal: lease.stop.signal, recovering: false };
+    const worker = new StorageSession(lease.root, lease.lock, lease.owner.token,
+      (point, root) => inFlightCheckpoint(this.checkpoint, control, point, root), false);
+    sessionLeases.set(worker, { ...lease, pending: new Set(), operation: control });
+    const operation = worker.#commitLegacyMigrationInFlight(request);
+    lease.pending.add(operation);
+    try { await operation; }
+    finally { lease.pending.delete(operation); sessionLeases.delete(worker); }
+  }
+  async #commitLegacyMigrationInFlight(request: LegacyAdoptOnlyMigrationRequest): Promise<void> {
+    const lease = sessionLeases.get(this);
+    if (!lease || request.root !== this.root) throw new Error("Invalid or expired copi storage session; refusing legacy migration.");
+    const oldValue = parseStoredCatalog(JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown);
+    const nextValue = parseStoredCatalog(JSON.parse(request.catalogBytes.toString("utf8")) as unknown);
+    if (oldValue.version !== 1 || nextValue.version !== 2 || !request.reviewId ||
+        !request.backupDir.startsWith(".migration-backups/") ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.backupDir.slice(".migration-backups/".length))) {
+      throw new Error("Legacy migration requires an exact approved adoption review and a private UUID backup target.");
+    }
+    const itemsTree = request.itemsTree;
+    const sourcesTree = request.sourcesTree;
+    if (!/^(?:absent|[0-9a-f]{64})$/.test(itemsTree) || !/^(?:absent|[0-9a-f]{64})$/.test(sourcesTree)) {
+      throw new Error("Legacy migration requires fixed items and sources tree commitments.");
+    }
+    const catalogInput = request.inputs.find((input) => input.path === "catalog.json");
+    if (!catalogInput || !catalogInput.bytes.equals(request.oldCatalogBytes) ||
+        request.oldCatalogIdentity !== `${catalogInput.dev}:${catalogInput.ino}`) {
+      throw new Error("Legacy migration catalog bytes and original inode are not bound to the fixed backup inputs.");
+    }
+    const journal: LegacyMigrationStorageJournal = {
+      version: 4,
+      mode: "legacy-migration",
+      root: this.root,
+      token: this.token,
+      oldCatalog: hash(request.oldCatalogBytes),
+      newCatalog: hash(request.catalogBytes),
+      stableItemsTree: itemsTree,
+      stableSourcesTree: sourcesTree,
+      stableSourcesTreeNext: sourcesTree,
+      backupDir: request.backupDir,
+      backupManifest: hash(request.backupManifestBytes),
+      operations: [],
+      ownedDirectories: [],
+    };
+    validateLegacyMigrationJournalTargets(journal, oldValue, nextValue);
+    const inputPaths = new Set(request.inputs.map((input) => input.path));
+    for (const item of nextValue.items) {
+      if (!item.content.path.startsWith("sources/")) throw new Error("Adopt-only migration requires every item payload to already exist in sources/.");
+      const target = path.join(this.root, ...item.content.path.split("/"));
+      const targetStat = await lstat(target, { bigint: true });
+      if (targetStat.isSymbolicLink() || (item.content.kind === "file" ? !targetStat.isFile() : !targetStat.isDirectory())) {
+        throw new Error("Adopt-only migration target is missing or has the wrong filesystem kind.");
+      }
+      const required = item.content.kind === "file"
+        ? [item.content.path]
+        : item.files.map((file) => `${item.content.path}/${file.path}`);
+      if (required.some((relative) => !inputPaths.has(relative))) throw new Error("Adopt-only migration target is not covered by its fixed existing-sources snapshot.");
+    }
+    const backupEntries = request.inputs.map(({ path: originalPath, sha256, mode }) => ({ originalPath, sha256, mode }));
+    if (!buildMigrationBackupManifest(backupEntries).equals(request.backupManifestBytes)) {
+      throw new Error("Migration backup manifest is not the fixed complete input snapshot.");
+    }
+    if (new Set(request.rootEntries).size !== request.rootEntries.length ||
+        JSON.stringify([...request.rootEntries].sort()) !== JSON.stringify(request.rootEntries) ||
+        !request.rootEntries.includes("catalog.json") ||
+        request.rootEntries.some((entry) => entry === lockName || entry === `${lockName}-recovery` || entry === ".migration-backups")) {
+      throw new Error("Adopt-only migration root entries are not a fixed canonical snapshot.");
+    }
+    await this.assertLease(false);
+    await assertLegacyMigrationSnapshot(this.root, request, false);
+    await assertLegacyMigrationInputCoverage(this.root, request);
+    const ownerPath = path.join(this.lock, "owner.json");
+    const ownerTemp = path.join(this.lock, "owner.migration.tmp");
+    const currentOwner = await readOwner(this.lock);
+    if (currentOwner.migrationRootEntries || currentOwner.token !== this.token) throw new Error("Migration owner cannot be rebound to a different or existing root snapshot.");
+    await writePrivate(ownerTemp, JSON.stringify({ ...currentOwner, migrationRootEntries: request.rootEntries }));
+    await rememberUnjournaledFile(this, "owner.migration.tmp", ownerTemp, JSON.stringify({ ...currentOwner, migrationRootEntries: request.rootEntries }));
+    await rename(ownerTemp, ownerPath);
+    forgetUnjournaledArtifact(this, "owner.migration.tmp");
+    lease.owner.migrationRootEntries = [...request.rootEntries];
+    await this.assertLease(false);
+
+    let journalInstalled = false;
+    const backup = await writeLegacyMigrationBackup(this.root, request);
+    const backupIdentity = await directoryIdentity(backup.root);
+    const assertOwnedBackup = async (): Promise<void> => {
+      if (!sameDirectory(await directoryIdentity(backup.root), backupIdentity) ||
+          !sameDirectory(await directoryIdentity(path.join(this.root, ".migration-backups")), backup.parent)) {
+        throw new Error("Migration backup directory identity changed; preserving backup and stopping.");
+      }
+    };
+    try {
+      await this.checkpoint?.("stage-write", this.root);
+      await this.assertLease(false);
+      await assertLegacyMigrationSnapshot(this.root, request, true);
+      await assertLegacyMigrationInputCoverage(this.root, request);
+      await assertLegacyMigrationBackup(this.root, request);
+      await assertOwnedBackup();
+      await this.checkpoint?.("stage-sync", this.root);
+      await this.assertLease(false);
+      await assertLegacyMigrationSnapshot(this.root, request, true);
+      await assertLegacyMigrationBackup(this.root, request);
+
+      const catalogStage = path.join(this.lock, "next-catalog");
+      await writePrivate(catalogStage, request.catalogBytes);
+      await rememberUnjournaledFile(this, "next-catalog", catalogStage, request.catalogBytes);
+      const originalCatalogPath = path.join(this.root, "catalog.json");
+      const oldCatalogStage = path.join(this.lock, "old-catalog");
+      await link(originalCatalogPath, oldCatalogStage);
+      await rememberUnjournaledFile(this, "old-catalog", oldCatalogStage, request.oldCatalogBytes);
+      const oldCurrent = await checkedFile(originalCatalogPath);
+      const oldStat = await statMaybe(originalCatalogPath);
+      const oldStageStat = await statMaybe(oldCatalogStage);
+      if (!oldCurrent?.equals(request.oldCatalogBytes) || !oldStat || !oldStageStat ||
+          request.oldCatalogIdentity !== `${oldStat.dev}:${oldStat.ino}` || !sameDirectory({ dev: oldStat.dev, ino: oldStat.ino }, { dev: oldStageStat.dev, ino: oldStageStat.ino })) {
+        throw new Error("Original v1 catalog changed before migration journaling; preserving its inode.");
+      }
+      await syncDirectory(this.lock);
+      await this.assertLease(false);
+      await assertLegacyMigrationSnapshot(this.root, request, true);
+      await assertLegacyMigrationBackup(this.root, request);
+      const initialNames = new Set(["owner.json", "next-catalog", "old-catalog"]);
+      const lockNames = await readdir(this.lock);
+      if (lockNames.length !== initialNames.size || lockNames.some((name) => !initialNames.has(name))) {
+        throw new Error("Unknown migration transaction stage before v4 journaling; preserving every artifact.");
+      }
+      const journalBytes = Buffer.from(JSON.stringify(journal));
+      const journalTemp = path.join(this.lock, "journal.tmp");
+      await writePrivate(journalTemp, journalBytes);
+      await rememberUnjournaledFile(this, "journal.tmp", journalTemp, journalBytes);
+      const journalPath = path.join(this.lock, "journal.json");
+      await link(journalTemp, journalPath);
+      journalInstalled = true;
+      await unlink(journalTemp);
+      forgetUnjournaledArtifact(this, "journal.tmp");
+      await writePrivate(path.join(this.lock, "journal.digest"), hash(journalBytes));
+      await rememberUnjournaledFile(this, "journal.digest", path.join(this.lock, "journal.digest"), hash(journalBytes));
+      await syncDirectory(this.lock);
+      await this.checkpoint?.("journal", this.root);
+      await this.assertLease(false);
+      const rawJournal = await checkedFile(journalPath);
+      const rawDigest = await checkedFile(path.join(this.lock, "journal.digest"));
+      if (!rawJournal?.equals(journalBytes) || !rawDigest || rawDigest.toString("utf8") !== hash(rawJournal)) {
+        throw new Error("V4 migration journal changed before catalog switch; preserving all bytes.");
+      }
+      await assertLegacyMigrationSnapshot(this.root, request, true);
+      await assertLegacyMigrationBackup(this.root, request);
+      await assertOwnedBackup();
+      await this.checkpoint?.("before-catalog", this.root);
+      await this.assertLease(false);
+
+      const heldPath = path.join(this.lock, "held-catalog");
+      if (await statMaybe(heldPath)) throw new Error("Unexpected held catalog before migration switch.");
+      const currentBeforeHold = await checkedFile(originalCatalogPath);
+      const currentBeforeHoldStat = await statMaybe(originalCatalogPath);
+      if (!currentBeforeHold?.equals(request.oldCatalogBytes) || !currentBeforeHoldStat ||
+          request.oldCatalogIdentity !== `${currentBeforeHoldStat.dev}:${currentBeforeHoldStat.ino}`) {
+        throw new Error("Original catalog changed before migration hold; refusing replacement.");
+      }
+      await rename(originalCatalogPath, heldPath);
+      await syncDirectory(this.root);
+      await this.checkpoint?.("catalog-held", this.root);
+      await this.assertLease(false);
+      await assertLegacyMigrationSnapshot(this.root, request, true, true);
+      await assertLegacyMigrationBackup(this.root, request);
+      await assertOwnedBackup();
+      if (await statMaybe(originalCatalogPath)) throw new Error("A foreign catalog appeared during migration switch; preserving it.");
+      await link(catalogStage, originalCatalogPath);
+      await syncDirectory(this.root);
+      await this.checkpoint?.("catalog-renamed", this.root);
+      await this.assertLease(false);
+      await assertLegacyMigrationSnapshot(this.root, request, true, false, true);
+      await assertLegacyMigrationBackup(this.root, request);
+      await assertOwnedBackup();
+      const installed = await checkedFile(originalCatalogPath);
+      const installedStat = await statMaybe(originalCatalogPath);
+      const stageStat = await statMaybe(catalogStage);
+      if (!installed?.equals(request.catalogBytes) || !installedStat || !stageStat ||
+          !sameDirectory({ dev: installedStat.dev, ino: installedStat.ino }, { dev: stageStat.dev, ino: stageStat.ino })) {
+        throw new Error("Installed v2 catalog is not the exclusive fixed stage inode.");
+      }
+      await this.checkpoint?.("directory-sync", this.root);
+      await this.assertLease(false);
+      await syncDirectory(this.root);
+      await this.checkpoint?.("committed", this.root);
+      await this.assertLease(false);
+      await this.recover(false);
+    } catch (error) {
+      if (!journalInstalled) throw error;
+      const operation = sessionLeases.get(this)?.operation;
+      if (operation) operation.recovering = true;
+      try { await this.recover(true); }
+      catch (recoveryError) {
+        throw new Error("Adopt-only v4 migration could not safely recover; retained journal, backup, and catalog artifacts.", {
+          cause: new AggregateError([error, recoveryError]),
+        });
+      }
+      throw error;
+    }
   }
   async #commitInFlight(expected: StorageRevision, catalog: Buffer, replacements: readonly StorageReplacement[], authorization?: StorageAuthorization): Promise<void> {
     await this.assertLease();
@@ -2521,6 +3167,63 @@ export class StorageSession {
     await rm(path.join(this.lock, "journal.json"));
     await this.checkpoint?.("rollback-finalized", this.root);
   }
+  async #recoverLegacyMigration(journal: LegacyMigrationStorageJournal, rollback: boolean): Promise<void> {
+    await this.assertLease(false);
+    const journalPath = path.join(this.lock, "journal.json");
+    const raw = await checkedFile(journalPath);
+    const digestBytes = await checkedFile(path.join(this.lock, "journal.digest"));
+    if (!raw || !digestBytes || digestBytes.toString("utf8") !== hash(raw)) throw new Error("V4 migration journal integrity is missing or altered; preserving all bytes.");
+    const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
+    if (parsed.version !== 4 || JSON.stringify(parsed) !== JSON.stringify(journal)) throw new Error("V4 migration journal changed dispatch or fixed commitments.");
+    const state = await inspectLegacyMigrationJournal(this.root, this.lock, this.token, journal,
+      sessionLeases.get(this)?.recoveryClaim !== undefined);
+    const marker = await checkedFile(path.join(this.lock, "rollback.json"));
+    if (marker) rollback = true;
+    const catalogPath = path.join(this.root, "catalog.json");
+    if (state.currentHash === journal.oldCatalog) return;
+    if (state.currentHash === journal.newCatalog && !rollback) return;
+    if (state.currentHash === journal.newCatalog) {
+      if (await statMaybe(path.join(this.lock, "displaced-catalog"))) throw new Error("V4 rollback found an unexpected displaced catalog; preserving all bytes.");
+      if (!marker) {
+        await writePrivate(path.join(this.lock, "rollback.json"), this.token);
+        await syncDirectory(this.lock);
+      }
+      await this.checkpoint?.("rollback-started", this.root);
+      await this.assertLease(false);
+      const current = await checkedFile(catalogPath);
+      const nextStage = await checkedFile(path.join(this.lock, "next-catalog"));
+      const currentStat = await statMaybe(catalogPath);
+      const nextStat = await statMaybe(path.join(this.lock, "next-catalog"));
+      if (!current?.equals(state.nextBytes) || !nextStage?.equals(state.nextBytes) || !currentStat || !nextStat ||
+          !sameDirectory({ dev: currentStat.dev, ino: currentStat.ino }, { dev: nextStat.dev, ino: nextStat.ino })) {
+        throw new Error("V4 new catalog inode changed before rollback; preserving it.");
+      }
+      await rename(catalogPath, path.join(this.lock, "displaced-catalog"));
+      await syncDirectory(this.root);
+      await this.checkpoint?.("rollback-catalog-held", this.root);
+      await this.assertLease(false);
+    }
+    if (await statMaybe(catalogPath)) throw new Error("A foreign catalog appeared during v4 recovery; preserving it.");
+    const heldPath = path.join(this.lock, "held-catalog");
+    const held = await checkedFile(heldPath);
+    const oldStage = await checkedFile(path.join(this.lock, "old-catalog"));
+    const restoreFrom = held ? heldPath : path.join(this.lock, "old-catalog");
+    if ((!held || !held.equals(state.oldBytes)) && (!oldStage || !oldStage.equals(state.oldBytes))) {
+      throw new Error("V4 original catalog bytes are unavailable for safe rollback; preserving the backup and journal.");
+    }
+    await link(restoreFrom, catalogPath);
+    await syncDirectory(this.root);
+    await this.checkpoint?.("rollback-restored", this.root);
+    await this.assertLease(false);
+    const restored = await checkedFile(catalogPath);
+    const restoredStat = await statMaybe(catalogPath);
+    const sourceStat = await statMaybe(restoreFrom);
+    if (!restored?.equals(state.oldBytes) || !restoredStat || !sourceStat ||
+        !sameDirectory({ dev: restoredStat.dev, ino: restoredStat.ino }, { dev: sourceStat.dev, ino: sourceStat.ino })) {
+      throw new Error("V4 recovery did not restore the exact original catalog inode.");
+    }
+    await this.checkpoint?.("rollback-finalized", this.root);
+  }
   async recover(rollback: boolean): Promise<void> {
     await this.assertLease(false);
     const raw = await checkedFile(path.join(this.lock, "journal.json"));
@@ -2535,7 +3238,7 @@ export class StorageSession {
     const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
     if (parsed.version === 3) { await this.recoverCatalogOnly(parsed, rollback, raw); return; }
     if (parsed.version === 2) { await this.recoverSources(parsed, rollback, raw); return; }
-    if (parsed.version === 4) throw new Error("Legacy migration v4 recovery is not implemented in this build; preserving the journal and all bytes.");
+    if (parsed.version === 4) { await this.#recoverLegacyMigration(parsed, rollback); return; }
     const journal = parsed;
     await this.assertLease(true);
     if (await this.verifyFinalized()) { await rm(path.join(this.lock, "journal.json")); return; }
