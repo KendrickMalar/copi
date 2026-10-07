@@ -109,4 +109,3 @@ test("v2 source revisions include directory entries and inode identity", async (
   assert.notEqual(revisions.before.tree, revisions.after.tree);
   assert.equal(location.kind, "file");
 });
-
