@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createTwoFilesPatch } from "diff";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
-import { inspectFixedResource } from "./inspect.ts";
+import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { buildMigrationBackupManifest, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { parseStoredCatalog } from "./catalog.ts";
 import type { Catalog, LegacyCatalog, LegacySavedItem, SavedItem } from "./types.ts";
@@ -61,11 +62,14 @@ interface FileState {
   readonly ino: string;
 }
 
-interface DirectoryState {
+interface DirectoryIdentity {
   readonly path: string;
   readonly dev: string;
   readonly ino: string;
   readonly mode: string;
+}
+
+interface DirectoryState extends DirectoryIdentity {
   readonly size: string;
   readonly mtimeNs: string;
   readonly ctimeNs: string;
@@ -107,7 +111,8 @@ interface PreparedMigrationState {
   readonly root: string;
   readonly revision: string;
   readonly rootPresent?: boolean;
-  readonly rootIdentities?: readonly DirectoryState[];
+  readonly rootIdentities?: readonly DirectoryIdentity[];
+  readonly rootDirectoryState?: DirectoryState;
   readonly rootEntries?: readonly string[];
   readonly itemsTree?: ScannedTree;
   readonly sourcesTree?: ScannedTree;
@@ -149,21 +154,25 @@ function excluded(relative: string): boolean {
   });
 }
 
+function identityOfDirectory(target: string, stat: BigIntStats): DirectoryIdentity {
+  return { path: target, dev: stat.dev.toString(), ino: stat.ino.toString(), mode: stat.mode.toString() };
+}
+
 function stateOfDirectory(target: string, stat: BigIntStats): DirectoryState {
   return {
-    path: target,
-    dev: stat.dev.toString(),
-    ino: stat.ino.toString(),
-    mode: stat.mode.toString(),
+    ...identityOfDirectory(target, stat),
     size: stat.size.toString(),
     mtimeNs: stat.mtimeNs.toString(),
     ctimeNs: stat.ctimeNs.toString(),
   };
 }
 
+function sameDirectoryIdentity(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  return left.path === right.path && left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+
 function sameDirectory(left: DirectoryState, right: DirectoryState): boolean {
-  return left.path === right.path && left.dev === right.dev && left.ino === right.ino && left.mode === right.mode &&
-    left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+  return sameDirectoryIdentity(left, right) && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
 function sameFile(left: BigIntStats, right: BigIntStats): boolean {
@@ -171,9 +180,13 @@ function sameFile(left: BigIntStats, right: BigIntStats): boolean {
     left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
-async function checkCanonicalAncestors(target: string): Promise<{ exists: boolean; identities: DirectoryState[] }> {
+async function checkCanonicalAncestors(target: string): Promise<{
+  exists: boolean;
+  identities: DirectoryIdentity[];
+  rootDirectoryState?: DirectoryState;
+}> {
   if (!path.isAbsolute(target) || path.resolve(target) !== target) throw new Error("Library path must resolve to a canonical absolute path.");
-  const identities: DirectoryState[] = [];
+  const identities: DirectoryIdentity[] = [];
   const volume = path.parse(target).root;
   let current = volume;
   const segments = target.slice(volume.length).split(path.sep).filter(Boolean);
@@ -181,7 +194,8 @@ async function checkCanonicalAncestors(target: string): Promise<{ exists: boolea
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || await realpath(current) !== current) {
     throw new Error("Library path has an unsafe filesystem root.");
   }
-  identities.push(stateOfDirectory(current, rootStat));
+  identities.push(identityOfDirectory(current, rootStat));
+  if (segments.length === 0) return { exists: true, identities, rootDirectoryState: stateOfDirectory(current, rootStat) };
   for (const segment of segments) {
     current = path.join(current, segment);
     const stat = await lstat(current, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
@@ -192,18 +206,28 @@ async function checkCanonicalAncestors(target: string): Promise<{ exists: boolea
     if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(current) !== current) {
       throw new Error("Library root or an ancestor is not a canonical real directory.");
     }
-    identities.push(stateOfDirectory(current, stat));
+    identities.push(identityOfDirectory(current, stat));
+    if (current === target) return { exists: true, identities, rootDirectoryState: stateOfDirectory(current, stat) };
   }
-  return { exists: true, identities };
+  throw new Error("Library root could not be identified as a canonical directory.");
 }
 
-async function assertDirectoryChain(identities: readonly DirectoryState[]): Promise<void> {
+async function assertDirectoryChain(identities: readonly DirectoryIdentity[]): Promise<void> {
   for (const expected of identities) {
     const stat = await lstat(expected.path, { bigint: true });
     if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(expected.path) !== expected.path ||
-        !sameDirectory(expected, stateOfDirectory(expected.path, stat))) {
+        !sameDirectoryIdentity(expected, identityOfDirectory(expected.path, stat))) {
       throw new Error("Library root or an ancestor changed during the read-only preview.");
     }
+  }
+}
+
+async function assertDirectoryState(expected: DirectoryState | undefined): Promise<void> {
+  if (!expected) return;
+  const stat = await lstat(expected.path, { bigint: true });
+  if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(expected.path) !== expected.path ||
+      !sameDirectory(expected, stateOfDirectory(expected.path, stat))) {
+    throw new Error("Library root directory changed during the read-only preview.");
   }
 }
 
@@ -373,9 +397,15 @@ function makePrepared(state: PreparedMigrationState): PreparedMigration {
   return plan;
 }
 
-function inventoryDigest(rootIdentities: readonly DirectoryState[], catalog: FileState, trees: readonly ScannedTree[]): string {
+function inventoryDigest(
+  rootIdentities: readonly DirectoryIdentity[],
+  rootDirectoryState: DirectoryState,
+  catalog: FileState,
+  trees: readonly ScannedTree[],
+): string {
   const rows = [
-    ...rootIdentities.map((state) => `R:${JSON.stringify(state)}`),
+    ...rootIdentities.map((identity) => `R:${JSON.stringify(identity)}`),
+    `L:${JSON.stringify(rootDirectoryState)}`,
     `C:${catalog.path}:${catalog.sha256}:${catalog.mode}:${catalog.dev}:${catalog.ino}`,
   ];
   for (const tree of trees) {
@@ -498,13 +528,52 @@ function existingTargetPayload(
   });
 }
 
-function fileMaskedSummary(itemId: string, file: PlannedPayloadFile, descriptor: LegacySavedItem["files"][number]): MigrationMaskedDiff {
-  const label = isText(file.bytes) ? "text" : "binary";
-  const matches = file.sha256 === descriptor.sha256;
-  const summary = matches
-    ? `${label} payload matches the declared legacy snapshot; content is not displayed.`
-    : `${label} payload differs from the declared legacy snapshot; changes are summarized without displaying content.`;
-  return { path: `${itemId}/${file.path}`, summary };
+function fileMaskedSummary(
+  itemId: string,
+  file: PlannedPayloadFile,
+  descriptor: LegacySavedItem["files"][number],
+  registeredSnapshot?: FileState,
+): MigrationMaskedDiff {
+  const currentText = isText(file.bytes) ? new TextDecoder("utf-8", { fatal: true }).decode(file.bytes) : undefined;
+  if (currentText === undefined) {
+    const matches = file.sha256 === descriptor.sha256;
+    return {
+      path: `${itemId}/${file.path}`,
+      summary: matches
+        ? "binary payload matches the declared legacy snapshot; content is not displayed."
+        : "binary payload differs from the declared legacy snapshot; content is not displayed.",
+    };
+  }
+
+  if (!registeredSnapshot || registeredSnapshot.sha256 !== descriptor.sha256) {
+    return {
+      path: `${itemId}/${file.path}`,
+      summary: file.sha256 === descriptor.sha256
+        ? "text payload matches the declared legacy snapshot; content is not displayed."
+        : "text payload differs from the declared legacy snapshot, but the registered snapshot is unavailable or unverified; comparison is not displayed.",
+    };
+  }
+  if (!isText(registeredSnapshot.bytes)) {
+    return {
+      path: `${itemId}/${file.path}`,
+      summary: "selected text payload differs from a binary registered snapshot; content is not displayed.",
+    };
+  }
+  if (registeredSnapshot.sha256 === file.sha256) {
+    return { path: `${itemId}/${file.path}`, summary: "text payload matches the registered legacy snapshot; no content changes." };
+  }
+
+  const beforeText = new TextDecoder("utf-8", { fatal: true }).decode(registeredSnapshot.bytes);
+  const patch = maskSensitiveText(createTwoFilesPatch(
+    "registered legacy snapshot",
+    "selected current source",
+    beforeText,
+    currentText,
+  ));
+  return {
+    path: `${itemId}/${file.path}`,
+    summary: `text payload differs from the registered legacy snapshot; masked diff follows:\n${patch}`,
+  };
 }
 
 function buildNextCatalog(legacy: LegacyCatalog, selections: readonly { item: LegacySavedItem; target: string; kind: "file" | "tree" }[]): Catalog {
@@ -525,13 +594,15 @@ function makeAlreadyV2(
   root: string,
   revision: string,
   rootPresent: boolean,
-  rootIdentities: readonly DirectoryState[],
+  rootIdentities: readonly DirectoryIdentity[],
   rootEntries: readonly string[],
+  rootDirectoryState?: DirectoryState,
   catalogFile?: FileState,
 ): PreparedMigration {
   const state: PreparedMigrationState = {
     root, revision, rootPresent,
     rootIdentities: rootIdentities.map((identity) => ({ ...identity })),
+    ...(rootDirectoryState ? { rootDirectoryState: { ...rootDirectoryState } } : {}),
     rootEntries: [...rootEntries],
     view: { reviewId, status: "already-v2", items: [], conflicts: [], preservedPaths: [], maskedDiffs: [], sensitivePaths: [], warnings: [] },
     ...(catalogFile ? { inputs: [{ ...catalogFile, bytes: Buffer.from(catalogFile.bytes) }] } : { inputs: [] }),
@@ -559,7 +630,9 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     if (blockers.length > 0) {
       return makePrepared({
         root, revision: digest(Buffer.from(`blocked-locks:${root}:${rootNamesBefore.join("\n")}`)),
-        rootPresent: true, rootIdentities: rootCheck.identities, rootEntries: rootNamesBefore,
+        rootPresent: true, rootIdentities: rootCheck.identities,
+        ...(rootCheck.rootDirectoryState ? { rootDirectoryState: rootCheck.rootDirectoryState } : {}),
+        rootEntries: rootNamesBefore,
         view: { reviewId, status: "blocked", items: [], conflicts: blockers,
           preservedPaths: blockers.map((entry) => entry.split(" ")[0]!), maskedDiffs: [], sensitivePaths: [], warnings: [] },
         inputs: [], backupEntries: [], selections: [], additions: [],
@@ -575,7 +648,10 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     const stored = parseCatalogBytes(catalogFile.bytes);
     if (stored.version === 2) {
       await assertDirectoryChain(rootCheck.identities);
-      return makeAlreadyV2(reviewId, root, digest(Buffer.from(`${catalogFile.sha256}:${catalogFile.dev}:${catalogFile.ino}`)), true, rootCheck.identities, rootNamesBefore, catalogFile);
+      await assertDirectoryState(rootCheck.rootDirectoryState);
+      const rootNamesAfter = (await readdir(root)).sort(compare);
+      if (JSON.stringify(rootNamesBefore) !== JSON.stringify(rootNamesAfter)) throw new Error("Library root entries changed during the read-only preview.");
+      return makeAlreadyV2(reviewId, root, digest(Buffer.from(`${catalogFile.sha256}:${catalogFile.dev}:${catalogFile.ino}`)), true, rootCheck.identities, rootNamesBefore, rootCheck.rootDirectoryState, catalogFile);
     }
     const legacy = stored;
     const itemsTree = await scanTree(root, "items");
@@ -583,6 +659,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     const rootNamesAfter = (await readdir(root)).sort(compare);
     if (JSON.stringify(rootNamesBefore) !== JSON.stringify(rootNamesAfter)) throw new Error("Library root entries changed during the read-only preview.");
     await assertDirectoryChain(rootCheck.identities);
+    await assertDirectoryState(rootCheck.rootDirectoryState);
 
     const preservedPaths = new Set<string>();
     const knownRootEntries = new Set(["catalog.json", "items", "sources"]);
@@ -625,7 +702,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
         selection = "sources";
         for (const file of payload) {
           const descriptor = item.files.find((entry) => entry.path === file.path)!;
-          maskedDiffs.push(fileMaskedSummary(item.id, file, descriptor));
+          maskedDiffs.push(fileMaskedSummary(item.id, file, descriptor, itemsTree.files.get(`items/${item.id}/files/${file.path}`)));
         }
       } else {
         payload = itemsPayload(item, itemsTree);
@@ -646,7 +723,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
         }
         for (const file of payload) {
           const descriptor = item.files.find((entry) => entry.path === file.path)!;
-          maskedDiffs.push(fileMaskedSummary(item.id, file, descriptor));
+          maskedDiffs.push(fileMaskedSummary(item.id, file, descriptor, itemsTree.files.get(`items/${item.id}/files/${file.path}`)));
         }
       }
       selected.push({ item, target, kind });
@@ -697,7 +774,9 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     const inputs = [catalogFile, ...itemsTree.files.values(), ...sourcesTree.files.values()].sort((left, right) => compare(left.path, right.path));
     const backupEntries = inputs.map(({ path: originalPath, sha256, mode }) => ({ originalPath, sha256, mode }));
     const backupManifestBytes = buildMigrationBackupManifest(backupEntries);
-    const revision = inventoryDigest(rootCheck.identities, catalogFile, [itemsTree, sourcesTree]);
+    const rootDirectoryState = rootCheck.rootDirectoryState;
+    if (!rootDirectoryState) throw new Error("Library root directory state is unavailable.");
+    const revision = inventoryDigest(rootCheck.identities, rootDirectoryState, catalogFile, [itemsTree, sourcesTree]);
     const conflicts: string[] = [];
     const view: MigrationView = {
       reviewId,
@@ -714,6 +793,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
       revision,
       rootPresent: true,
       rootIdentities: rootCheck.identities.map((identity) => ({ ...identity })),
+      rootDirectoryState: { ...rootDirectoryState },
       rootEntries: [...rootNamesBefore],
       itemsTree,
       sourcesTree,

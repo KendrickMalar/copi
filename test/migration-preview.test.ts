@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -51,6 +51,155 @@ test("previews an existing safe sources payload first and preserves its current 
   });
 });
 
+test("keeps a preview ready while unrelated sibling entries change in a canonical ancestor", async () => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "copi-preview-siblings-"));
+  const root = path.join(parent, "library");
+  await mkdir(root);
+  try {
+    await writeLegacyCatalog(root);
+    await writeLegacySnapshot(root);
+    await Promise.all(Array.from({ length: 240 }, (_, index) =>
+      writeBytes(root, `sources/unregistered-${index}.txt`, Buffer.from(`unregistered ${index}\n`))));
+
+    let running = true;
+    let cycles = 0;
+    let resolveFirstCycle: (() => void) | undefined;
+    const firstCycle = new Promise<void>((resolve) => { resolveFirstCycle = resolve; });
+    const churn = (async () => {
+      while (running) {
+        const sibling = path.join(parent, `unrelated-${cycles}`);
+        await mkdir(sibling);
+        await rm(sibling, { recursive: true });
+        cycles += 1;
+        resolveFirstCycle?.();
+      }
+    })();
+
+    try {
+      await firstCycle;
+      const view = readMigration(await prepareMigration(root));
+      running = false;
+      await churn;
+      assert.ok(cycles > 1, "the parent directory changed while the preview was running");
+      assert.equal(view.status, "ready", view.conflicts.join("; "));
+    } finally {
+      running = false;
+      await churn;
+    }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("blocks a preview when library-owned source nodes change during the scan", async () => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "copi-preview-source-changes-"));
+  const root = path.join(parent, "library");
+  await mkdir(root);
+  const sources = path.join(root, "sources");
+  try {
+    await writeLegacyCatalog(root);
+    await writeLegacySnapshot(root);
+    await Promise.all(Array.from({ length: 240 }, (_, index) =>
+      writeBytes(root, `sources/unregistered-${index}.txt`, Buffer.from(`unregistered ${index}\n`))));
+
+    let running = true;
+    let cycles = 0;
+    let resolveFirstCycle: (() => void) | undefined;
+    const firstCycle = new Promise<void>((resolve) => { resolveFirstCycle = resolve; });
+    const churn = (async () => {
+      while (running) {
+        const sibling = path.join(sources, `transient-${cycles}`);
+        await mkdir(sibling);
+        await rm(sibling, { recursive: true });
+        cycles += 1;
+        resolveFirstCycle?.();
+      }
+    })();
+
+    try {
+      await firstCycle;
+      const view = readMigration(await prepareMigration(root));
+      running = false;
+      await churn;
+      assert.ok(cycles > 1, "the sources directory changed while the preview was running");
+      assert.equal(view.status, "blocked");
+    } finally {
+      running = false;
+      await churn;
+    }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("rejects a canonical library path that traverses a symlinked ancestor", async () => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "copi-preview-ancestor-link-"));
+  const realParent = path.join(parent, "real");
+  const linkedParent = path.join(parent, "linked");
+  const root = path.join(linkedParent, "library");
+  try {
+    await mkdir(realParent);
+    await symlink(realParent, linkedParent, "dir");
+    await mkdir(root);
+    await writeLegacyCatalog(root);
+    await writeLegacySnapshot(root);
+
+    const view = readMigration(await prepareMigration(root));
+
+    assert.equal(view.status, "blocked");
+    assert.ok(view.conflicts.some((conflict) => conflict.includes("canonical real directory")));
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("blocks a preview if an ancestor directory mode changes during the scan", async () => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "copi-preview-ancestor-mode-"));
+  const root = path.join(parent, "library");
+  await mkdir(root);
+  try {
+    await writeLegacyCatalog(root);
+    await writeLegacySnapshot(root);
+    await Promise.all(Array.from({ length: 240 }, (_, index) =>
+      writeBytes(root, `sources/unregistered-${index}.txt`, Buffer.from(`unregistered ${index}\n`))));
+
+    const preview = prepareMigration(root);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    await chmod(parent, 0o750);
+    const view = readMigration(await preview);
+
+    assert.equal(view.status, "blocked");
+    assert.ok(view.conflicts.some((conflict) => conflict.includes("ancestor changed")));
+  } finally {
+    await chmod(parent, 0o700);
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("blocks a preview when the library root directory is replaced during the scan", async () => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), "copi-preview-root-replaced-"));
+  const root = path.join(parent, "library");
+  const displaced = path.join(parent, "displaced-library");
+  await mkdir(root);
+  try {
+    await writeLegacyCatalog(root);
+    await writeLegacySnapshot(root);
+    await Promise.all(Array.from({ length: 240 }, (_, index) =>
+      writeBytes(root, `sources/unregistered-${index}.txt`, Buffer.from(`unregistered ${index}\n`))));
+
+    const preview = prepareMigration(root);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    await rename(root, displaced);
+    await cp(displaced, root, { recursive: true, preserveTimestamps: true });
+    const view = readMigration(await preview);
+
+    assert.equal(view.status, "blocked");
+    assert.ok(view.conflicts.length > 0);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("prefers current sources while retaining mismatched legacy snapshots as separate backup inputs", async () => {
   await withLibrary(async (root) => {
     const currentBytes = Buffer.from("explicitly adopted current source bytes\\n");
@@ -64,6 +213,33 @@ test("prefers current sources while retaining mismatched legacy snapshots as sep
     assert.equal(view.status, "ready");
     assert.equal(view.items[0]?.selection, "sources");
     assert.ok(view.maskedDiffs.some((entry) => entry.summary.includes("differs")));
+    assert.equal(await treeSnapshot(root), before);
+  });
+});
+
+test("shows a masked text patch from the registered snapshot to the adopted current source", async () => {
+  await withLibrary(async (root) => {
+    const beforeBytes = Buffer.from('const apiKey = "SYNTHETIC_OLD_SECRET_VALUE_123456";\nconst stable = true;\n');
+    const currentBytes = Buffer.from('const apiKey = "SYNTHETIC_NEW_SECRET_VALUE_654321";\nconst stable = true;\nconst added = true;\n');
+    const sourcePath = await writeBytes(root, "sources/current/AGENTS.md", currentBytes, 0o755);
+    const item = makeLegacyItem({
+      sourcePath,
+      files: [{ path: "AGENTS.md", mode: 0o640, sha256: digest(beforeBytes) }],
+    });
+    await writeLegacyCatalog(root, [item]);
+    await writeLegacySnapshot(root, beforeBytes);
+    const before = await treeSnapshot(root);
+
+    const view = readMigration(await prepareMigration(root));
+    const diff = view.maskedDiffs.find((entry) => entry.path.endsWith("AGENTS.md"))?.summary ?? "";
+
+    assert.equal(view.status, "ready");
+    assert.match(diff, /^-const apiKey = "\[REDACTED\]";$/m);
+    assert.match(diff, /^\+const apiKey = "\[REDACTED\]";$/m);
+    assert.match(diff, /\+const added = true;/);
+    assert.match(diff, /\[REDACTED\]/);
+    assert.equal(diff.includes("SYNTHETIC_OLD_SECRET_VALUE_123456"), false);
+    assert.equal(diff.includes("SYNTHETIC_NEW_SECRET_VALUE_654321"), false);
     assert.equal(await treeSnapshot(root), before);
   });
 });
@@ -164,6 +340,7 @@ test("returns only safe summaries for binary and secret-bearing payloads", async
     assert.equal(binaryView.status, "ready");
     assert.ok(binaryView.maskedDiffs.some((entry) => entry.summary.toLowerCase().includes("binary")));
     assert.equal(JSON.stringify(binaryView).includes(binary.toString("base64")), false);
+    assert.equal(JSON.stringify(binaryView).includes(binary.toString("hex")), false);
   });
 });
 
