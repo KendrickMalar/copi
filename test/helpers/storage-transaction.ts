@@ -27,6 +27,20 @@ export async function transactionFixture(t: TestContext) {
 }
 export type TransactionFixture = Awaited<ReturnType<typeof transactionFixture>>;
 
+export function fixtureModuleUrl(importerUrl: string, modulePath: string): string {
+  const extension = importerUrl.endsWith(".ts") ? ".ts" : ".js";
+  return new URL(`${modulePath}${extension}`, importerUrl).href;
+}
+
+export function fixtureNodeArgs(importerUrl: string, code: string): string[] {
+  return [
+    ...(importerUrl.endsWith(".ts") ? ["--experimental-transform-types"] : []),
+    "--input-type=module",
+    "-e",
+    code,
+  ];
+}
+
 export async function kernelCommit(box: TransactionFixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
   const kernel = new StorageTransactions(checkpoint ? { checkpoint } : {});
   return kernel.run(box.libraryDir, false, async (session) => {
@@ -35,7 +49,7 @@ export async function kernelCommit(box: TransactionFixture, checkpoint?: (point:
   });
 }
 export function child(box: TransactionFixture, code: string): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, ["--input-type=module", "-e", code], { cwd: box.projectDir, env: { ...process.env, HOME: box.homeDir, PI_CODING_AGENT_DIR: box.agentDir, TMPDIR: process.env.TMPDIR!, NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE!, NPM_CONFIG_USERCONFIG: "/dev/null" } });
+  return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { cwd: box.projectDir, env: { ...process.env, HOME: box.homeDir, PI_CODING_AGENT_DIR: box.agentDir, TMPDIR: process.env.TMPDIR!, NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE!, NPM_CONFIG_USERCONFIG: "/dev/null" } });
 }
 export function childExit(child: ChildProcessWithoutNullStreams) {
   return new Promise<{ code: number | null; signal: NodeJS.Signals | null; output: string }>((resolve, reject) => {
@@ -49,14 +63,17 @@ export function childExit(child: ChildProcessWithoutNullStreams) {
 export function waitForLine(child: ChildProcessWithoutNullStreams, expected: string) {
   return new Promise<void>((resolve, reject) => {
     let output = "";
-    const timer = setTimeout(() => { reject(new Error(`Child did not reach ${expected}: ${output}`)); }, 5_000);
+    let errors = "";
+    const diagnostics = () => [output && `stdout: ${output}`, errors && `stderr: ${errors}`].filter(Boolean).join("\n");
+    const timer = setTimeout(() => { reject(new Error(`Child did not reach ${expected}: ${diagnostics()}`)); }, 5_000);
     child.stdout.on("data", (bytes: Buffer) => { output += bytes.toString(); if (output.includes(expected)) { clearTimeout(timer); resolve(); } });
+    child.stderr.on("data", (bytes: Buffer) => { errors += bytes.toString(); });
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
-    child.once("close", () => { clearTimeout(timer); if (!output.includes(expected)) reject(new Error(`Child stopped before ${expected}: ${output}`)); });
+    child.once("close", () => { clearTimeout(timer); if (!output.includes(expected)) reject(new Error(`Child stopped before ${expected}: ${diagnostics()}`)); });
   });
 }
 export function interruptedCode(box: TransactionFixture, checkpoint: StorageCheckpoint) {
-  const module = new URL("../../src/storage-transaction.js", import.meta.url).href;
+  const module = fixtureModuleUrl(import.meta.url, "../../src/storage-transaction");
   return `import {StorageTransactions} from ${JSON.stringify(module)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}) { console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});
 await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>{await session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes(box.next).toString("base64"))},'base64'),[{itemId:${JSON.stringify(box.item.id)},files:[{path:'source.md',mode:${box.files[0]!.mode},bytes:Buffer.from('new snapshot\\n')}]}]);});`;

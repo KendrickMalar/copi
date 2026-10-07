@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { StorageTransactions, prepareStorageReview, readStorageReview, type StorageCheckpoint } from "../src/storage-transaction.ts";
+import { fixtureModuleUrl, fixtureNodeArgs } from "./helpers/storage-transaction.ts";
 import type { Catalog, SavedItem } from "../src/types.ts";
 
 const coderId = "123e4567-e89b-42d3-a456-426614174000";
@@ -70,7 +71,7 @@ async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root
 }
 
 function child(box: Fixture, checkpoint: string, orphanName?: string): ChildProcessWithoutNullStreams {
-  const moduleUrl = new URL("../src/storage-transaction.ts", import.meta.url).href;
+  const moduleUrl = fixtureModuleUrl(import.meta.url, "../src/storage-transaction");
   const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`).toString("base64");
   const orphanBytes = Buffer.from("unknown cleanup bytes\\n").toString("base64");
   const orphanWrite = orphanName
@@ -79,21 +80,24 @@ function child(box: Fixture, checkpoint: string, orphanName?: string): ChildProc
   const code = `import {writeFile} from 'node:fs/promises'; import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}) { ${orphanWrite} console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});
 await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]));`;
-  return spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", code], { env: process.env });
+  return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { env: process.env });
 }
 
 async function stopAt(childProcess: ChildProcessWithoutNullStreams, marker = "PAUSED"): Promise<void> {
   let output = "";
+  let errors = "";
+  const diagnostics = () => [output && `stdout: ${output}`, errors && `stderr: ${errors}`].filter(Boolean).join("\n");
   await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(`child did not reach ${marker}: ${output}`)), 10_000);
+    const timeout = setTimeout(() => reject(new Error(`child did not reach ${marker}: ${diagnostics()}`)), 10_000);
     childProcess.stdout.on("data", (chunk: Buffer) => {
       output += chunk.toString();
       if (output.includes(marker)) { clearTimeout(timeout); resolve(); }
     });
+    childProcess.stderr.on("data", (chunk: Buffer) => { errors += chunk.toString(); });
     childProcess.once("error", (error) => { clearTimeout(timeout); reject(error); });
     childProcess.once("close", (code, signal) => {
       clearTimeout(timeout);
-      if (!output.includes(marker)) reject(new Error(`child exited before ${marker} (${code}/${signal}): ${output}`));
+      if (!output.includes(marker)) reject(new Error(`child exited before ${marker} (${code}/${signal}): ${diagnostics()}`));
     });
   });
   childProcess.kill("SIGKILL");
@@ -161,12 +165,12 @@ test("file transactions can commit twice after a direct edit and leave no lock r
 
 test("SIGKILL during source-file rollback recovery can be recovered again", async (t) => {
   const box = await fixture(t);
-  const moduleUrl = new URL("../src/storage-transaction.ts", import.meta.url).href;
+  const moduleUrl = fixtureModuleUrl(import.meta.url, "../src/storage-transaction");
   const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`).toString("base64");
   const code = `import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point==='before-catalog')throw new Error('start rollback');if(point==='rollback-restored'){console.log('ROLLBACK_PAUSED');setInterval(()=>{},1000);await new Promise(()=>{});}}});
 await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]));`;
-  const writer = spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", code], { env: process.env });
+  const writer = spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { env: process.env });
   await stopAt(writer, "ROLLBACK_PAUSED");
   await recover(box);
   assert.equal(await readFile(box.coderPath, "utf8"), "old coder\n");

@@ -9,6 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageFile } from "../src/storage-transaction.ts";
+import { fixtureModuleUrl, fixtureNodeArgs } from "./helpers/storage-transaction.ts";
 import { readSourceContent } from "../src/source-content.ts";
 import type { Catalog, SavedItem } from "../src/types.ts";
 
@@ -96,7 +97,7 @@ function newTree(name = "Guide") {
 }
 
 async function startWriter(libraryDir: string, item: SavedItem, files: readonly StorageFile[], checkpoint: StorageCheckpoint): Promise<ChildProcessWithoutNullStreams> {
-  const moduleUrl = new URL("../src/storage-transaction.ts", import.meta.url).href;
+  const moduleUrl = fixtureModuleUrl(import.meta.url, "../src/storage-transaction");
   const next: Catalog = { version: 2, items: [item], groups: [] };
   const catalogBytes = Buffer.from(`${JSON.stringify(next, null, 2)}\n`).toString("base64");
   const replacements = [{ itemId: item.id, files: files.map((file) => ({ path: file.path, mode: file.mode, bytes: file.bytes.toString("base64") })) }];
@@ -104,7 +105,7 @@ async function startWriter(libraryDir: string, item: SavedItem, files: readonly 
 const replacement=${JSON.stringify(replacements[0])};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}){console.log('PAUSED');setInterval(()=>{},1000);await new Promise(()=>{});}}});
 await kernel.run(${JSON.stringify(libraryDir)},true,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:replacement.itemId,files:replacement.files.map(file=>({path:file.path,mode:file.mode,bytes:Buffer.from(file.bytes,'base64')}))}]));`;
-  return spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", code], { env: process.env });
+  return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { env: process.env });
 }
 
 async function stopAt(child: ChildProcessWithoutNullStreams): Promise<void> {

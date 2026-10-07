@@ -6,7 +6,7 @@ import path from "node:path";
 import test, { type TestContext } from "node:test";
 import { assertModernCatalog, catalogBytes, importResource, loadCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageReview } from "../src/storage-transaction.ts";
-import { childExit, interruptedCode, transactionFixture as makeTransactionFixture, waitForLine, type TransactionFixture } from "./helpers/storage-transaction.ts";
+import { childExit, fixtureModuleUrl, fixtureNodeArgs, interruptedCode, transactionFixture as makeTransactionFixture, waitForLine, type TransactionFixture } from "./helpers/storage-transaction.ts";
 import { sandbox } from "./helpers/sandbox.ts";
 import type { Catalog, ResourceCandidate } from "../src/types.ts";
 
@@ -81,11 +81,7 @@ function containsErrnoCode(error: unknown, expected: string): boolean {
 }
 
 function child(box: ModernSingleFileFixture, code: string): ChildProcessWithoutNullStreams {
-  const sourceCode = code
-    .replaceAll("/src/storage-transaction.js", "/src/storage-transaction.ts")
-    .replaceAll("/src/catalog.js", "/src/catalog.ts")
-    .replaceAll("/src/resource-mutations.js", "/src/resource-mutations.ts");
-  return spawn(process.execPath, ["--experimental-transform-types", "--input-type=module", "-e", sourceCode], {
+  return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), {
     cwd: box.projectDir,
     env: {
       ...process.env,
@@ -200,7 +196,7 @@ test("S3 a reader cannot observe mixed state while a writer holds the multi-rena
 
 test("S3 distinct cooperating processes serialize imports without losing either item", async (t) => {
   const box = await transactionFixture(t);
-  const module = new URL("../src/catalog.ts", import.meta.url).href;
+  const module = fixtureModuleUrl(import.meta.url, "../src/catalog");
   const code = (name: string) => `import {importResource} from ${JSON.stringify(module)}; await importResource(${JSON.stringify(box.libraryDir)},${JSON.stringify({ ...box.candidate, name })},{confirmed:true,groupIds:[]}); console.log('saved');`;
   const results = await Promise.all([childExit(child(box, code("Process A"))), childExit(child(box, code("Process B")))]);
   for (const result of results) assert.equal(result.code, 0, result.output);
@@ -405,7 +401,7 @@ for (const boundary of ["stage-write", "stage-sync"] as const) {
 
 test("S3 two editing processes preparing the same revision permit one commit, refuse the other, and retain the winner", async (t) => {
   const box = await transactionFixture(t);
-  const module = new URL("../src/resource-mutations.ts", import.meta.url).href;
+  const module = fixtureModuleUrl(import.meta.url, "../src/resource-mutations");
   const code = (value: string) => `import {prepareSavedEdit,prepareSavedChange,commitSavedChange} from ${JSON.stringify(module)};
 const edit=await prepareSavedEdit(${JSON.stringify(box.libraryDir)},${JSON.stringify(box.item.id)},'source.md');
 const change=await prepareSavedChange(edit,Buffer.from(${JSON.stringify(value)})); console.log('READY');
