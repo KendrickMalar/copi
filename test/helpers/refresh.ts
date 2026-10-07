@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type test from "node:test";
-import { importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
+import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
 import { inspectPreparedResource } from "../../src/inspect.ts";
 import { sandbox } from "./sandbox.ts";
 import type { ResourceCandidate } from "../../src/types.ts";
@@ -19,9 +19,12 @@ export async function refreshFixture(t: test.TestContext, kind: "instruction" | 
   const item = await importPreparedResource(box.libraryDir, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths });
   assert.ok(item);
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.groups.push({ id: "first", name: "First group", itemIds: [item.id] }, { id: "second", name: "Second group", itemIds: [item.id] });
   await saveCatalog(box.libraryDir, catalog);
-  return { ...box, item, candidate, sourceFile, file: path.join(box.libraryDir, "items", item.id, "files", path.basename(sourceFile)) };
+  const contentRoot = path.join(box.libraryDir, ...item.content.path.split("/"));
+  const file = item.content.kind === "file" ? contentRoot : path.join(contentRoot, path.basename(sourceFile));
+  return { ...box, item, candidate, sourceFile, file };
 }
 export async function packageRefreshFixture(t: test.TestContext) {
   const box = await sandbox(t);
@@ -35,7 +38,8 @@ export async function packageRefreshFixture(t: test.TestContext) {
   const candidate = (await discoverResources(options)).candidates.find(entry => entry.name === "declared"); assert.ok(candidate);
   const prepared = await prepareResource(candidate), inspection = await inspectPreparedResource(prepared);
   const item = await importPreparedResource(box.libraryDir, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths }); assert.ok(item);
-  return { ...box, item, candidate, options, sourceFile, file: path.join(box.libraryDir, "items", item.id, "files", "SKILL.md") };
+  const file = path.join(box.libraryDir, ...item.content.path.split("/"), "SKILL.md");
+  return { ...box, item, candidate, options, sourceFile, file };
 }
 export type RefreshFixture = Awaited<ReturnType<typeof refreshFixture>>;
 export async function refreshCustody(box: RefreshFixture) {

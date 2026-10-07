@@ -4,7 +4,7 @@ import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, re
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { importPreparedResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange, type ChangeApproval, type SavedChangeView } from "../src/resource-mutations.ts";
 import type { Catalog, ResourceCandidate, SavedItem } from "../src/types.ts";
@@ -96,6 +96,32 @@ test("R1/R2 metadata-only reselection and mode-only changes are committed withou
   saved = await refresh.commitRefresh(mode, approval(refresh, mode)); assert.equal(saved.files[0]!.mode, 0o755);
 });
 
+test("R3 current v2 source bytes override stale descriptor digests in review, while later edits still conflict", async t => {
+  const refresh = await api(), box = await refreshFixture(t);
+  const oldDigest = box.item.files[0]!.sha256, catalogBytes = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const manual = Buffer.from("manual current snapshot bytes\n");
+  await writeFile(box.file, manual);
+  const current = (await readSnapshotFiles(box.libraryDir, box.item))[0]!;
+  assert.deepEqual(current.bytes, manual);
+  assert.equal(current.sha256, createHash("sha256").update(manual).digest("hex"));
+  const catalog = await loadCatalog(box.libraryDir); assertModernCatalog(catalog);
+  assert.equal(catalog.items[0]!.files[0]!.sha256, oldDigest);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalogBytes);
+
+  const token = await refresh.prepareRefresh(box.libraryDir, box.item.id, box.candidate);
+  const view = refresh.readRefresh(token);
+  assert.equal(view.bytesChanged, true);
+  assert.match(view.diffs[0]!.diff, /manual current snapshot bytes/);
+  assert.match(view.diffs[0]!.diff, /source original/);
+  assert.equal(view.originalCatalog.items[0]!.files[0]!.sha256, oldDigest);
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalogBytes);
+
+  await writeFile(box.file, "external edit after preview\n");
+  const beforeConflict = await refreshCustody(box);
+  await assert.rejects(refresh.commitRefresh(token, approval(refresh, token)), /changed|revision|checksum/i);
+  assert.deepEqual(await refreshCustody(box), beforeConflict);
+});
+
 test("R2 absent origin allows explicitly selected same-kind source and old copy remains readable", async t => {
   const refresh = await api(), box = await refreshFixture(t);
   await rename(box.item.sourcePath, path.join(box.sourceRoot, "moved"));
@@ -130,11 +156,20 @@ for (const mutation of ["catalog", "body", "group", "destination", "source metad
     const token = await refresh.prepareRefresh(box.libraryDir, box.item.id, box.candidate);
     if (mutation === "body") await writeFile(box.file, "external body\n");
     else if (mutation === "catalog") await writeFile(path.join(box.libraryDir, "catalog.json"), ` ${await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")}`);
-    else { const catalog = await loadCatalog(box.libraryDir);
-      if (mutation === "group") catalog.groups[0]!.name = "External group";
-      else if (mutation === "destination") catalog.items[0]!.destination = { kind: "global-only" };
-      else catalog.items[0]!.source = "external source";
-      await saveCatalog(box.libraryDir, catalog);
+    else {
+      const catalog = await loadCatalog(box.libraryDir);
+      assertModernCatalog(catalog);
+      if (mutation === "source metadata") {
+        catalog.items[0]!.source = "external source";
+        await writeFile(path.join(box.libraryDir, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+        const external = await loadCatalog(box.libraryDir);
+        assertModernCatalog(external);
+        assert.equal(external.items[0]!.source, "external source");
+      } else {
+        if (mutation === "group") catalog.groups[0]!.name = "External group";
+        else catalog.items[0]!.destination = { kind: "global-only" };
+        await saveCatalog(box.libraryDir, catalog);
+      }
     }
     const before = await refreshCustody(box);
     await assert.rejects(refresh.commitRefresh(token, approval(refresh, token)), /changed|checksum|revision/i);
@@ -174,7 +209,7 @@ for (const checkpoint of ["stage-write", "old-renamed", "before-catalog", "catal
   });
 }
 
-for (const error of ["wrong kind", "wrong shape", "outside boundary", "source link", "ancestor link", "interior link", "saved link", "private ancestor", "node_modules", "checksum", "unknown physical file"] as const) {
+for (const error of ["wrong kind", "wrong shape", "outside boundary", "source link", "ancestor link", "interior link", "saved link", "private ancestor", "node_modules"] as const) {
   test(`R5/R6 ${error} stops refresh without source/copy writes`, async t => {
     const refresh = await api(), box = await refreshFixture(t), candidate = structuredClone(box.candidate);
     if (error === "wrong kind") candidate.kind = "instruction";
@@ -189,14 +224,51 @@ for (const error of ["wrong kind", "wrong shape", "outside boundary", "source li
     }
     if (error === "interior link") await symlink(box.sourceFile, path.join(box.item.sourcePath, "linked.md"));
     if (error === "saved link") {await rename(box.file, `${box.file}.old`); await symlink(box.sourceFile, box.file);}
-    if (error === "checksum") await writeFile(box.file, "corrupted\n");
-    if (error === "unknown physical file") await writeFile(path.join(path.dirname(box.file), "unknown.md"), "do not remove\n");
     const before = await refreshCustody(box);
     await assert.rejects(refresh.prepareRefresh(box.libraryDir, box.item.id, candidate));
     assert.deepEqual(await refreshCustody(box), before);
-    if (error === "unknown physical file") assert.equal(await readFile(path.join(path.dirname(box.file), "unknown.md"), "utf8"), "do not remove\n");
   });
 }
+
+test("R2 refresh reviews ordinary child removals, preserves cancellation, and rejects child races after preview", async t => {
+  const refresh = await api(), box = await refreshFixture(t);
+  const contentRoot = path.join(box.libraryDir, ...box.item.content.path.split("/"));
+  const unknownPath = path.join(contentRoot, "unknown.md");
+  await writeFile(unknownPath, "unregistered ordinary child\n");
+  const token = await refresh.prepareRefresh(box.libraryDir, box.item.id, box.candidate);
+  const view = refresh.readRefresh(token);
+  const removal = view.diffs.find(entry => entry.path === "unknown.md");
+  assert.ok(removal);
+  assert.equal(removal.bytesChanged, true);
+  assert.match(removal.diff, /-unregistered ordinary child/);
+  assert.equal(view.reviewId, token.reviewId);
+
+  const beforeCancellation = await refreshCustody(box), treeBeforeCancellation = await originTree(contentRoot);
+  await assert.rejects(refresh.commitRefresh(token, { ...approval(refresh, token), confirmed: false }), /confirm/i);
+  assert.deepEqual(await refreshCustody(box), beforeCancellation);
+  assert.deepEqual(await originTree(contentRoot), treeBeforeCancellation);
+
+  const saved = await refresh.commitRefresh(token, approval(refresh, token));
+  assert.deepEqual((await readSnapshotFiles(box.libraryDir, saved)).map(file => file.path), ["SKILL.md"]);
+  await assert.rejects(lstat(unknownPath), { code: "ENOENT" });
+
+  for (const race of ["child edit", "child addition"] as const) {
+    const concurrent = await refreshFixture(t);
+    const concurrentRoot = path.join(concurrent.libraryDir, ...concurrent.item.content.path.split("/"));
+    const beforePreviewPath = path.join(concurrentRoot, "before-preview.md");
+    await writeFile(beforePreviewPath, "ordinary child before preview\n");
+    const concurrentToken = await refresh.prepareRefresh(concurrent.libraryDir, concurrent.item.id, concurrent.candidate);
+    const concurrentView = refresh.readRefresh(concurrentToken);
+    assert.ok(concurrentView.diffs.some(entry => entry.path === "before-preview.md" && /-ordinary child before preview/.test(entry.diff)));
+
+    const changedChild = race === "child edit" ? beforePreviewPath : path.join(concurrentRoot, "after-preview.md");
+    await writeFile(changedChild, race === "child edit" ? "external child edit after preview\n" : "ordinary child added after preview\n");
+    const beforeConflict = await refreshCustody(concurrent), treeBeforeConflict = await originTree(concurrentRoot);
+    await assert.rejects(refresh.commitRefresh(concurrentToken, approval(refresh, concurrentToken)), /changed|checksum|revision/i);
+    assert.deepEqual(await refreshCustody(concurrent), beforeConflict);
+    assert.deepEqual(await originTree(concurrentRoot), treeBeforeConflict);
+  }
+});
 
 // Regression target: a genuine mutable discovery result must not move its
 // declared-package authority to a different capture via serialization/accessors.
@@ -221,7 +293,9 @@ async function originFixture() {
     assigned === "/private/tmp/copi-issue1-coder3.v57BLf/tmp" ||
     assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp" ||
     assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp" ||
-    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp", "Origin fixtures require an exactly approved canonical TMPDIR.");
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/tmp" ||
+    assigned === "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/tmp", "Origin fixtures require an exactly approved canonical TMPDIR.");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-origin-fix1-")));
   const homeDir = path.join(root, "home"), agentDir = path.join(homeDir, ".pi/agent"), projectDir = path.join(root, "project");
   const packageRoot = path.join(agentDir, "npm/node_modules/declared-origin"), sourcePath = path.join(packageRoot, "skills/declared");
@@ -237,7 +311,7 @@ async function originFixture() {
   const item = await importPreparedResource(libraryDir, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths }); assert.ok(item);
   const options: DiscoveryOptions = { homeDir, agentDir, projectDir, scopes: { home: true, project: false } };
   const refresh = await api(), origin = await refresh.discoverRefreshOrigin(item, options); assert.ok(origin);
-  const file = path.join(libraryDir, "items", item.id, "files/SKILL.md");
+  const file = path.join(libraryDir, ...item.content.path.split("/"), "SKILL.md");
   const custody = async () => ({ library: await originTree(libraryDir), approvedSource: await originTree(agentDir), outside: await originTree(outsideRoot), project: await originTree(projectDir) });
   console.log(`origin retained fixture=${root}`);
   return { root, libraryDir, item, origin, refresh, file, sourceFile, agentDir, outsideRoot, forbidden, options, custody };
