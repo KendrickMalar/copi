@@ -7,7 +7,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+function projectRootForTestEntry(entryPath: string): string {
+  const entryDirectory = path.dirname(entryPath);
+  if (entryPath.endsWith(".ts")) return path.resolve(entryDirectory, "..");
+  if (entryPath.endsWith(".js")) return path.resolve(entryDirectory, "../..");
+  throw new Error(`Unsupported native-package test entry: ${entryPath}`);
+}
+
+const projectRoot = projectRootForTestEntry(fileURLToPath(import.meta.url));
 const nativeDir = path.join(projectRoot, "dist", "native");
 const releaseHelper = path.join(nativeDir, "rename-exclusive-arm64");
 const manifestPath = path.join(nativeDir, "rename-exclusive-arm64.manifest.json");

@@ -1,26 +1,34 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdir, readFile, readlink, rename, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
+import { fileURLToPath } from "node:url";
 import { renameExclusiveReviewedSource } from "../src/native-placement.ts";
 import {
   buildMockNativeHelper,
   createLibraryFixture,
-  createPackageFixture,
   fixtureIdentity,
   importPlacementModule,
-  readReleaseHelper,
   type ManifestOverrides,
+  type PackageFixture,
   type PlacementInput,
   type PlacementModule,
   withTestEnvironment,
   writeManifest,
 } from "./helpers/native-placement.ts";
 
-const projectRoot = path.resolve(new URL("..", import.meta.url).pathname);
+const testEntryPath = fileURLToPath(import.meta.url);
+const sourceTestEntry = testEntryPath.endsWith(".ts");
+const compiledTestEntry = testEntryPath.endsWith(".js");
+if (!sourceTestEntry && !compiledTestEntry) throw new Error(`Unsupported native-placement test entry: ${testEntryPath}`);
+const projectRoot = path.resolve(path.dirname(testEntryPath), sourceTestEntry ? ".." : "../..");
+const packageModuleExtension = sourceTestEntry ? ".ts" : ".js";
+const packageSourceModule = sourceTestEntry
+  ? path.join(projectRoot, "src", "native-placement.ts")
+  : path.join(projectRoot, "dist", "src", "native-placement.js");
 const nativeDirectory = path.join(projectRoot, "dist", "native");
 const helperPath = path.join(nativeDirectory, "rename-exclusive-arm64");
 const manifestPath = `${helperPath}.manifest.json`;
@@ -62,6 +70,29 @@ async function withProcessValue<K extends "arch" | "platform", T>(
 
 function unsupportedInput(input: PlacementInput, updates: Partial<PlacementInput>): PlacementInput {
   return { ...input, ...updates };
+}
+
+async function createPackageFixture(
+  t: TestContext,
+  helperBytes?: Buffer,
+  manifestOverrides: ManifestOverrides = {},
+): Promise<PackageFixture> {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-r1b-package-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const modulePath = path.join(root, "src", `native-placement${packageModuleExtension}`);
+  const nativeDir = path.join(root, "dist", "native");
+  const helperPath = path.join(nativeDir, "rename-exclusive-arm64");
+  const manifestPath = `${helperPath}.manifest.json`;
+  await mkdir(path.dirname(modulePath), { recursive: true });
+  await mkdir(nativeDir, { recursive: true });
+  await copyFile(packageSourceModule, modulePath);
+  if (helperBytes !== undefined) await writeFile(helperPath, helperBytes, { mode: 0o755 });
+  await writeManifest(manifestPath, helperBytes ?? Buffer.alloc(0), manifestOverrides);
+  return { root, modulePath, helperPath, manifestPath };
+}
+
+async function readReleaseHelper(): Promise<Buffer> {
+  return readFile(helperPath);
 }
 
 test("uses the packaged release helper to place a reviewed source and preserve its inode and bytes", async (t) => {
