@@ -71,6 +71,60 @@ function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
+function snapshotOwnDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  try {
+    if (Array.isArray(value)) return undefined;
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== expectedKeys.length || ownKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))) {
+      return undefined;
+    }
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return undefined;
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotDenseOwnDataArray(value: unknown): unknown[] | undefined {
+  try {
+    if (!Array.isArray(value)) return undefined;
+    const ownKeys = Reflect.ownKeys(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") || lengthDescriptor.enumerable !== false ||
+        typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 ||
+        ownKeys.length !== lengthDescriptor.value + 1) {
+      return undefined;
+    }
+    const length = lengthDescriptor.value;
+    const ownKeySet = new Set<string>();
+    for (const key of ownKeys) {
+      if (typeof key !== "string" ||
+          (key !== "length" && (!Number.isSafeInteger(Number(key)) || Number(key) < 0 || Number(key) >= length || String(Number(key)) !== key))) {
+        return undefined;
+      }
+      ownKeySet.add(key);
+    }
+    if (!ownKeySet.has("length")) return undefined;
+    const snapshot: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const key = String(index);
+      if (!ownKeySet.has(key)) return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return undefined;
+      snapshot.push(descriptor.value);
+    }
+    return snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
 function safeOriginalPath(value: unknown): value is string {
   if (typeof value !== "string" || value.length === 0 || value.includes("\\") || value.includes("\0") ||
       path.posix.isAbsolute(value) || path.posix.normalize(value) !== value) return false;
@@ -80,14 +134,19 @@ function safeOriginalPath(value: unknown): value is string {
 }
 
 function normalizeInputEntries(value: unknown): MigrationBackupInputEntry[] {
-  if (!Array.isArray(value)) throw new Error("Migration backup entries must be an array.");
-  const entries: MigrationBackupInputEntry[] = value.map((entry: unknown) => {
-    if (!isRecord(entry) || !hasExactKeys(entry, ["originalPath", "sha256", "mode"]) ||
-        !safeOriginalPath(entry.originalPath) || typeof entry.sha256 !== "string" || !sha256Pattern.test(entry.sha256) ||
-        typeof entry.mode !== "number" || !Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777) {
-      throw new Error("Invalid path, SHA-256 digest, mode, or fields in migration backup entry.");
+  const inputEntries = snapshotDenseOwnDataArray(value);
+  if (!inputEntries) throw new Error("Migration backup entries must be a dense array of own-data values.");
+  const entries: MigrationBackupInputEntry[] = inputEntries.map((entry: unknown) => {
+    const fields = snapshotOwnDataRecord(entry, ["originalPath", "sha256", "mode"]);
+    if (!fields || !safeOriginalPath(fields.originalPath) || typeof fields.sha256 !== "string" || !sha256Pattern.test(fields.sha256) ||
+        typeof fields.mode !== "number" || !Number.isInteger(fields.mode) || fields.mode < 0 || fields.mode > 0o777) {
+      throw new Error("Invalid path, SHA-256 digest, mode, or own-data fields in migration backup entry.");
     }
-    return { originalPath: entry.originalPath, sha256: entry.sha256, mode: entry.mode };
+    return {
+      originalPath: fields.originalPath,
+      sha256: fields.sha256,
+      mode: fields.mode,
+    };
   });
   entries.sort((left, right) => compareStrings(left.originalPath, right.originalPath));
   if (!entries.some((entry) => entry.originalPath === "catalog.json")) {
@@ -308,20 +367,20 @@ function expectedTree(manifest: MigrationBackupManifest): Map<string, ExpectedCh
 }
 
 export async function verifyMigrationBackup(expectedValue: MigrationBackupExpected): Promise<void> {
-  if (!isRecord(expectedValue) || !hasExactKeys(expectedValue, ["libraryRoot", "backupDir", "manifestBytes", "manifestSha256", "entries"]) ||
-      typeof expectedValue.libraryRoot !== "string" || typeof expectedValue.backupDir !== "string" ||
-      !Buffer.isBuffer(expectedValue.manifestBytes) || typeof expectedValue.manifestSha256 !== "string" ||
-      !sha256Pattern.test(expectedValue.manifestSha256)) {
-    throw new Error("Invalid fixed migration backup verification expectation.");
+  const expected = snapshotOwnDataRecord(expectedValue, ["libraryRoot", "backupDir", "manifestBytes", "manifestSha256", "entries"]);
+  if (!expected || typeof expected.libraryRoot !== "string" || typeof expected.backupDir !== "string" ||
+      !Buffer.isBuffer(expected.manifestBytes) || typeof expected.manifestSha256 !== "string" ||
+      !sha256Pattern.test(expected.manifestSha256)) {
+    throw new Error("Invalid fixed migration backup verification expectation; own enumerable data fields are required.");
   }
-  const libraryRoot = expectedValue.libraryRoot;
-  const backupDir = expectedValue.backupDir;
+  const libraryRoot = expected.libraryRoot;
+  const backupDir = expected.backupDir;
   if (!backupUuidPattern.test(backupDir) || path.posix.normalize(backupDir) !== backupDir) {
     throw new Error("Migration backup directory must be the canonical relative .migration-backups UUID path.");
   }
-  const manifestBytes = Buffer.from(expectedValue.manifestBytes);
-  const manifestSha256 = expectedValue.manifestSha256;
-  const inputEntries = normalizeInputEntries(expectedValue.entries);
+  const manifestBytes = Buffer.from(expected.manifestBytes);
+  const manifestSha256 = expected.manifestSha256;
+  const inputEntries = normalizeInputEntries(expected.entries);
   if (digest(manifestBytes) !== manifestSha256) throw new Error("Fixed migration backup manifest bytes do not match their expected SHA-256.");
   const expectedManifest = parseMigrationBackupManifest(manifestBytes);
   if (!buildMigrationBackupManifest(inputEntries).equals(manifestBytes) ||

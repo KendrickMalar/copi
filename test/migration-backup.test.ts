@@ -149,6 +149,90 @@ test("builds and parses fixed sorted manifest bytes without embedding original c
   });
 });
 
+test("rejects accessor-bearing verifier expectations without evaluating caller getters", async (t) => {
+  const fixture = await backupFixture(t);
+  const fields: readonly (keyof MigrationBackupExpected)[] = [
+    "libraryRoot", "backupDir", "manifestBytes", "manifestSha256", "entries",
+  ];
+  for (const field of fields) {
+    let reads = 0;
+    const expected = { ...fixture.expected };
+    const value = fixture.expected[field];
+    Object.defineProperty(expected, field, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        reads += 1;
+        return value;
+      },
+    });
+    await assert.rejects(verifyMigrationBackup(expected), /own data|accessor|fixed|expectation/i, field);
+    assert.equal(reads, 0, `${field} getter must not run during verification`);
+  }
+});
+
+test("rejects accessor, symbol, and sparse input entries without evaluating getters", () => {
+  const files = originalFiles();
+  const catalog = inputEntries([files[0]!])[0]!;
+  const source = inputEntries([files[1]!])[0]!;
+  const fields: readonly (keyof MigrationBackupInputEntry)[] = ["originalPath", "sha256", "mode"];
+  for (const field of fields) {
+    let reads = 0;
+    const entry = { originalPath: source.originalPath, sha256: source.sha256, mode: source.mode };
+    const value = source[field];
+    Object.defineProperty(entry, field, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        reads += 1;
+        return value;
+      },
+    });
+    assert.throws(() => buildMigrationBackupManifest([catalog, entry]), /own data|accessor|field|entry/i, field);
+    assert.equal(reads, 0, `${field} getter must not run while building the manifest`);
+  }
+
+  const symbol = Symbol("unrecognized input field");
+  const withSymbol = { ...source, [symbol]: "ignored by Object.keys" };
+  assert.throws(() => buildMigrationBackupManifest([catalog, withSymbol]), /field|entry|symbol/i);
+  const sparse: MigrationBackupInputEntry[] = [];
+  sparse[0] = { originalPath: catalog.originalPath, sha256: catalog.sha256, mode: catalog.mode };
+  sparse.length = 2;
+  assert.throws(() => buildMigrationBackupManifest(sparse), /array|sparse|entry|field/i);
+});
+
+test("uses fixed own-data snapshots when a proxy would rebind getters or callers mutate inputs after entry", async (t) => {
+  const fixture = await backupFixture(t);
+  const manifestBytes = Buffer.from(fixture.expected.manifestBytes);
+  const entries = fixture.entries.map((entry) => ({
+    originalPath: entry.originalPath,
+    sha256: entry.sha256,
+    mode: entry.mode,
+  }));
+  const fixedExpected: MigrationBackupExpected = {
+    libraryRoot: fixture.expected.libraryRoot,
+    backupDir: fixture.expected.backupDir,
+    manifestBytes,
+    manifestSha256: fixture.expected.manifestSha256,
+    entries,
+  };
+  let rootReads = 0;
+  const rebindProxy = new Proxy(fixedExpected, {
+    get(target, property, receiver) {
+      if (property === "libraryRoot") {
+        rootReads += 1;
+        return rootReads === 1 ? "/synthetic/first-validation-root" : Reflect.get(target, property, receiver);
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const verification = verifyMigrationBackup(rebindProxy);
+  manifestBytes.fill(0);
+  entries[0] = { originalPath: "sources/rebound", sha256: digest(Buffer.from("rebound")), mode: 0o600 };
+  await assert.doesNotReject(verification);
+  assert.equal(rootReads, 0, "verification must snapshot own data descriptors instead of invoking proxy getters");
+});
+
 test("rejects invalid input coverage, paths, order, hashes, modes, and manifest keys", () => {
   const valid = originalFiles();
   const entries = inputEntries(valid);
