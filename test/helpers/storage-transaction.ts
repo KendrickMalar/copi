@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { TestContext } from "node:test";
-import { catalogBytes, importResource, loadCatalog } from "../../src/catalog.ts";
+import { assertModernCatalog, catalogBytes, importResource, loadCatalog } from "../../src/catalog.ts";
 import { StorageTransactions, type StorageCheckpoint } from "../../src/storage-transaction.ts";
 import { sandbox } from "./sandbox.ts";
 
@@ -16,11 +16,13 @@ export async function transactionFixture(t: TestContext) {
   const item = await importResource(box.libraryDir, candidate, { confirmed: true, groupIds: [] });
   assert.ok(item);
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
+  if (item.content.kind !== "file") throw new Error("Expected a v2 single-file transaction fixture.");
   const next = structuredClone(catalog);
   const bytes = Buffer.from("new snapshot\n");
   next.items[0]!.files[0]!.sha256 = createHash("sha256").update(bytes).digest("hex");
   const files = [{ path: "source.md", mode: item.files[0]!.mode, bytes }];
-  const file = path.join(box.libraryDir, "items", item.id, "files", "source.md");
+  const file = path.join(box.libraryDir, ...item.content.path.split("/"));
   return { ...box, candidate, item, catalog, next, bytes, files, file };
 }
 export type TransactionFixture = Awaited<ReturnType<typeof transactionFixture>>;

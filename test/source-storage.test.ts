@@ -4,17 +4,15 @@ import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import type { TestContext } from "node:test";
-import { catalogBytes, importResource, loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
+import { assertModernCatalog, catalogBytes, importResource, loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
 import { StorageTransactions } from "../src/storage-transaction.ts";
 import { sandbox } from "./helpers/sandbox.ts";
+import type { SavedItem } from "../src/types.ts";
 
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
 
-type ContentPath = { kind: "file" | "tree"; path: string };
-function contentPath(item: object): ContentPath {
-  const content = (item as { content?: unknown }).content;
-  assert.ok(content && typeof content === "object", "saved item must have a v2 content location");
-  return content as ContentPath;
+function contentPath(item: SavedItem): SavedItem["content"] {
+  return item.content;
 }
 
 async function importedFile(t: TestContext, name = "Coder") {
@@ -50,8 +48,8 @@ test("single-file source replacement preserves sibling and unregistered files in
   await writeFile(note, "unregistered note\n");
   const beforeTester = await readFile(tester);
   const beforeNote = await readFile(note);
-  const next = await loadCatalog(box.libraryDir);
-  const modern = next as { version: number; items: Array<{ id: string; files: Array<{ path: string; mode: number; sha256: string }> }> };
+  const modern = await loadCatalog(box.libraryDir);
+  assertModernCatalog(modern);
   const saved = modern.items.find((entry) => entry.id === item.id)!;
   const replacement = Buffer.from("replacement contents\n");
   saved.files[0]!.sha256 = digest(replacement);
@@ -59,7 +57,7 @@ test("single-file source replacement preserves sibling and unregistered files in
   await new StorageTransactions().run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     const revision = await session.capture();
-    await session.commit(revision, catalogBytes(modern as never), replacements);
+    await session.commit(revision, catalogBytes(modern), replacements);
   });
   assert.deepEqual(await readFile(target), replacement);
   assert.deepEqual(await readFile(tester), beforeTester);
@@ -70,8 +68,8 @@ test("single-file source replacement preserves sibling and unregistered files in
 for (const point of ["before-swap", "old-renamed", "before-catalog"] as const) {
   test(`source transaction preserves external inode edits at ${point}`, async (t) => {
     const { box, item, target } = await importedFile(t);
-    const next = await loadCatalog(box.libraryDir);
-    const modern = next as { version: number; items: Array<{ id: string; files: Array<{ path: string; mode: number; sha256: string }> }> };
+    const modern = await loadCatalog(box.libraryDir);
+    assertModernCatalog(modern);
     const saved = modern.items.find((entry) => entry.id === item.id)!;
     const proposed = Buffer.from("proposed new bytes\n");
     saved.files[0]!.sha256 = digest(proposed);
@@ -88,7 +86,7 @@ for (const point of ["before-swap", "old-renamed", "before-catalog"] as const) {
     } }).run(box.libraryDir, false, async (session) => {
       assert.ok(session);
       const revision = await session.capture();
-      await session.commit(revision, catalogBytes(modern as never), replacements);
+      await session.commit(revision, catalogBytes(modern), replacements);
     }), /changed|external|journal|recover|snapshot/i);
     assert.equal(reached, true);
     const retained = point === "old-renamed" ? path.join(box.libraryDir, ".copi-transaction", "old-0") : target;
