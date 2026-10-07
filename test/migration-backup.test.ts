@@ -201,7 +201,7 @@ test("rejects accessor, symbol, and sparse input entries without evaluating gett
   assert.throws(() => buildMigrationBackupManifest(sparse), /array|sparse|entry|field/i);
 });
 
-test("uses fixed own-data snapshots when a proxy would rebind getters or callers mutate inputs after entry", async (t) => {
+test("snapshots plain own-data verifier expectations before asynchronous filesystem reads", async (t) => {
   const fixture = await backupFixture(t);
   const manifestBytes = Buffer.from(fixture.expected.manifestBytes);
   const entries = fixture.entries.map((entry) => ({
@@ -216,21 +216,125 @@ test("uses fixed own-data snapshots when a proxy would rebind getters or callers
     manifestSha256: fixture.expected.manifestSha256,
     entries,
   };
-  let rootReads = 0;
-  const rebindProxy = new Proxy(fixedExpected, {
-    get(target, property, receiver) {
-      if (property === "libraryRoot") {
-        rootReads += 1;
-        return rootReads === 1 ? "/synthetic/first-validation-root" : Reflect.get(target, property, receiver);
-      }
-      return Reflect.get(target, property, receiver);
-    },
-  });
-  const verification = verifyMigrationBackup(rebindProxy);
+  const verification = verifyMigrationBackup(fixedExpected);
   manifestBytes.fill(0);
   entries[0] = { originalPath: "sources/rebound", sha256: digest(Buffer.from("rebound")), mode: 0o600 };
   await assert.doesNotReject(verification);
-  assert.equal(rootReads, 0, "verification must snapshot own data descriptors instead of invoking proxy getters");
+});
+
+test("rejects descriptor-spoofing proxies before invoking reflection traps", async (t) => {
+  const original = await backupFixture(t);
+  const spoofTarget = await backupFixture(t);
+  assert.deepEqual(spoofTarget.manifestBytes, original.manifestBytes);
+  const before = await Promise.all([treeSnapshot(original.libraryRoot), treeSnapshot(spoofTarget.libraryRoot)]);
+  let reflectionTrapCalls = 0;
+  const descriptorSpoof = new Proxy(original.expected, {
+    ownKeys(target) {
+      reflectionTrapCalls += 1;
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      reflectionTrapCalls += 1;
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      if (!descriptor) return undefined;
+      if (property === "libraryRoot") return { ...descriptor, value: spoofTarget.libraryRoot };
+      if (property === "backupDir") return { ...descriptor, value: spoofTarget.backupDir };
+      return descriptor;
+    },
+  });
+  await assert.rejects(verifyMigrationBackup(descriptorSpoof), /proxy/i);
+  assert.equal(reflectionTrapCalls, 0, "Proxy traps must not run while rejecting a descriptor-spoofing expectation");
+  assert.deepEqual(await Promise.all([treeSnapshot(original.libraryRoot), treeSnapshot(spoofTarget.libraryRoot)]), before,
+    "neither valid backup tree may be written, replaced, or otherwise changed");
+});
+
+test("rejects proxied verifier expectations, manifest buffers, and revoked proxies without invoking get traps", async (t) => {
+  const fixture = await backupFixture(t);
+  const before = await treeSnapshot(fixture.libraryRoot);
+
+  let getTrapCalls = 0;
+  const getProxy = new Proxy(fixture.expected, {
+    get(target, property, receiver) {
+      getTrapCalls += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  await assert.rejects(verifyMigrationBackup(getProxy), /proxy/i);
+  assert.equal(getTrapCalls, 0, "ordinary Proxy get traps must not run during verification");
+
+  let bufferTrapCalls = 0;
+  const proxyBytes = new Proxy(Buffer.from(fixture.expected.manifestBytes), {
+    get(target, property, receiver) {
+      bufferTrapCalls += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  await assert.rejects(verifyMigrationBackup({ ...fixture.expected, manifestBytes: proxyBytes }), /proxy/i);
+  assert.throws(() => parseMigrationBackupManifest(proxyBytes), /proxy/i);
+  assert.equal(bufferTrapCalls, 0, "Buffer Proxy traps must not run while validating fixed manifest bytes");
+
+  const revoked = Proxy.revocable({ ...fixture.expected }, {});
+  revoked.revoke();
+  await assert.rejects(verifyMigrationBackup(revoked.proxy), /proxy/i);
+
+  assert.deepEqual(await treeSnapshot(fixture.libraryRoot), before,
+    "malformed expectations must leave original backup inode identities, modes, and bytes unchanged");
+});
+
+test("rejects proxied and revoked input records and arrays before reflecting their contents", async (t) => {
+  const fixture = await backupFixture(t);
+  const before = await treeSnapshot(fixture.libraryRoot);
+  const entries = inputEntries(fixture.files);
+  const source = entries[1]!;
+
+  let entryTrapCalls = 0;
+  const descriptorSpoof = new Proxy({ ...source }, {
+    ownKeys(target) {
+      entryTrapCalls += 1;
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      entryTrapCalls += 1;
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+      if (!descriptor) return undefined;
+      if (property === "originalPath") return { ...descriptor, value: "sources/descriptor-spoof" };
+      if (property === "sha256") return { ...descriptor, value: digest(Buffer.from("spoofed entry bytes")) };
+      if (property === "mode") return { ...descriptor, value: 0o600 };
+      return descriptor;
+    },
+  });
+  assert.throws(() => buildMigrationBackupManifest([entries[0]!, descriptorSpoof]), /proxy/i);
+  assert.equal(entryTrapCalls, 0, "entry Proxy traps must not run before rejecting untrusted backup records");
+  await assert.rejects(verifyMigrationBackup({ ...fixture.expected, entries: [entries[0]!, descriptorSpoof] }), /proxy/i);
+  assert.deepEqual(await treeSnapshot(fixture.libraryRoot), before, "spoofed entry expectations must not write or replace backup files");
+
+  let arrayTrapCalls = 0;
+  const arrayProxy = new Proxy(entries, {
+    ownKeys(target) {
+      arrayTrapCalls += 1;
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      arrayTrapCalls += 1;
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+  assert.throws(() => buildMigrationBackupManifest(arrayProxy), /proxy/i);
+  assert.equal(arrayTrapCalls, 0, "array Proxy traps must not run before rejecting untrusted entry collections");
+  await assert.rejects(verifyMigrationBackup({ ...fixture.expected, entries: arrayProxy }), /proxy/i);
+  assert.deepEqual(await treeSnapshot(fixture.libraryRoot), before, "proxied entry arrays must not write or replace backup files");
+
+  const revokedEntry = Proxy.revocable({ ...source }, {});
+  revokedEntry.revoke();
+  assert.throws(() => buildMigrationBackupManifest([entries[0]!, revokedEntry.proxy]), /proxy/i);
+  await assert.rejects(verifyMigrationBackup({ ...fixture.expected, entries: [entries[0]!, revokedEntry.proxy] }), /proxy/i);
+  assert.deepEqual(await treeSnapshot(fixture.libraryRoot), before, "revoked entry proxies must not write or replace backup files");
+
+  const revokedArray = Proxy.revocable([...entries], {});
+  revokedArray.revoke();
+  assert.throws(() => buildMigrationBackupManifest(revokedArray.proxy), /proxy/i);
+  await assert.rejects(verifyMigrationBackup({ ...fixture.expected, entries: revokedArray.proxy }), /proxy/i);
+  assert.deepEqual(await treeSnapshot(fixture.libraryRoot), before, "revoked entry arrays must not write or replace backup files");
 });
 
 test("rejects invalid input coverage, paths, order, hashes, modes, and manifest keys", () => {

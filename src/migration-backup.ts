@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
+import { types as utilTypes } from "node:util";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -51,11 +52,16 @@ interface ExpectedChildren {
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const backupUuidPattern = /^\.migration-backups\/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const manifestName = "manifest.json";
+const isNativeProxy = utilTypes.isProxy;
 const privateDirectoryMode = 0o700;
 const privateFileMode = 0o600;
 
 function digest(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function isProxyObject(value: unknown): boolean {
+  return ((typeof value === "object" && value !== null) || typeof value === "function") && isNativeProxy(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -72,7 +78,7 @@ function compareStrings(left: string, right: string): number {
 }
 
 function snapshotOwnDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | undefined {
-  if (typeof value !== "object" || value === null) return undefined;
+  if (typeof value !== "object" || value === null || isProxyObject(value)) return undefined;
   try {
     if (Array.isArray(value)) return undefined;
     const ownKeys = Reflect.ownKeys(value);
@@ -93,7 +99,7 @@ function snapshotOwnDataRecord(value: unknown, expectedKeys: readonly string[]):
 
 function snapshotDenseOwnDataArray(value: unknown): unknown[] | undefined {
   try {
-    if (!Array.isArray(value)) return undefined;
+    if (isProxyObject(value) || !Array.isArray(value)) return undefined;
     const ownKeys = Reflect.ownKeys(value);
     const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
     if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") || lengthDescriptor.enumerable !== false ||
@@ -135,12 +141,12 @@ function safeOriginalPath(value: unknown): value is string {
 
 function normalizeInputEntries(value: unknown): MigrationBackupInputEntry[] {
   const inputEntries = snapshotDenseOwnDataArray(value);
-  if (!inputEntries) throw new Error("Migration backup entries must be a dense array of own-data values.");
+  if (!inputEntries) throw new Error("Migration backup entries must be a dense own-data array; Proxy arrays are not accepted.");
   const entries: MigrationBackupInputEntry[] = inputEntries.map((entry: unknown) => {
     const fields = snapshotOwnDataRecord(entry, ["originalPath", "sha256", "mode"]);
     if (!fields || !safeOriginalPath(fields.originalPath) || typeof fields.sha256 !== "string" || !sha256Pattern.test(fields.sha256) ||
         typeof fields.mode !== "number" || !Number.isInteger(fields.mode) || fields.mode < 0 || fields.mode > 0o777) {
-      throw new Error("Invalid path, SHA-256 digest, mode, or own-data fields in migration backup entry.");
+      throw new Error("Invalid path, SHA-256 digest, mode, Proxy, or own-data fields in migration backup entry.");
     }
     return {
       originalPath: fields.originalPath,
@@ -209,6 +215,7 @@ function parseManifestObject(value: unknown): MigrationBackupManifest {
 }
 
 export function parseMigrationBackupManifest(bytes: Buffer): MigrationBackupManifest {
+  if (isProxyObject(bytes)) throw new Error("Proxy-backed migration backup manifest bytes are not accepted.");
   if (!Buffer.isBuffer(bytes)) throw new Error("Migration backup manifest must be supplied as fixed bytes.");
   let value: unknown;
   try {
@@ -369,9 +376,9 @@ function expectedTree(manifest: MigrationBackupManifest): Map<string, ExpectedCh
 export async function verifyMigrationBackup(expectedValue: MigrationBackupExpected): Promise<void> {
   const expected = snapshotOwnDataRecord(expectedValue, ["libraryRoot", "backupDir", "manifestBytes", "manifestSha256", "entries"]);
   if (!expected || typeof expected.libraryRoot !== "string" || typeof expected.backupDir !== "string" ||
-      !Buffer.isBuffer(expected.manifestBytes) || typeof expected.manifestSha256 !== "string" ||
+      isProxyObject(expected.manifestBytes) || !Buffer.isBuffer(expected.manifestBytes) || typeof expected.manifestSha256 !== "string" ||
       !sha256Pattern.test(expected.manifestSha256)) {
-    throw new Error("Invalid fixed migration backup verification expectation; own enumerable data fields are required.");
+    throw new Error("Invalid fixed migration backup verification expectation; Proxy objects and non-own-data fields are not accepted.");
   }
   const libraryRoot = expected.libraryRoot;
   const backupDir = expected.backupDir;
