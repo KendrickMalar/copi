@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { importPreparedResource, importResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { assertModernCatalog, importPreparedResource, importResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { sandbox } from "./helpers/sandbox.ts";
 import type { ResourceCandidate } from "../src/types.ts";
@@ -20,7 +20,8 @@ async function fixture(t: test.TestContext, content: string | Buffer = "old\r\n�
   const inspection = await inspectPreparedResource(prepared);
   const item = await importPreparedResource(box.libraryDir, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths });
   assert.ok(item);
-  return { ...box, item, candidate, prepared, inspection, file: path.join(box.libraryDir, "items", item.id, "files", "SKILL.md") };
+  const file = path.join(box.libraryDir, ...item.content.path.split("/"), "SKILL.md");
+  return { ...box, item, candidate, prepared, inspection, file };
 }
 
 // RED on the real pre-existing API: dropping inspection must not bypass secret approval.
@@ -39,7 +40,8 @@ test("S5 forged empty inspection cannot override internally detected sensitive p
 });
 
 test("S1–S6 saved-edit backend is available", async () => {
-  const module = await import("../src/" + "resource-mutations.js").catch(() => undefined) as Record<string, unknown> | undefined;
+  const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
+  const module = await import(`../src/resource-mutations.${extension}`).catch(() => undefined) as Record<string, unknown> | undefined;
   assert.equal(typeof module?.prepareSavedEdit, "function", "saved-copy mutation preparation is missing");
 });
 
@@ -49,6 +51,7 @@ function approve(change: PreparedSavedChange) { return { confirmed: true, review
 test("S1 fixed UTF-8 bytes including BOM, decomposed Unicode and line endings survive commit/reload without source", async (t) => {
   const box = await fixture(t);
   const before = await loadCatalog(box.libraryDir);
+  assertModernCatalog(before);
   before.groups.push({ id: "team", name: "Team", itemIds: [box.item.id] });
   await saveCatalog(box.libraryDir, before);
   await rm(box.item.sourcePath, { recursive: true });
@@ -110,6 +113,7 @@ for (const mutation of ["raw catalog", "body", "other item", "group"] as const) 
     else if (mutation === "raw catalog") await writeFile(path.join(box.libraryDir, "catalog.json"), ` ${await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")}`);
     else if (mutation === "group") {
       const catalog = await loadCatalog(box.libraryDir);
+      assertModernCatalog(catalog);
       catalog.groups.push({ id: "new-group", name: "New group", itemIds: [] });
       await saveCatalog(box.libraryDir, catalog);
     } else await importResource(box.libraryDir, { ...box.candidate, name: "Other" }, { confirmed: true, groupIds: [] });
@@ -171,15 +175,42 @@ test("S1 accepts empty text and exactly 1_000_000 bytes; rejects unregistered/tr
   for (const file of ["new.md", "../SKILL.md", "/SKILL.md", "x\\SKILL.md"]) await assert.rejects(prepareSavedEdit(box.libraryDir, box.item.id, file), /registered|unknown|unsafe|path/i);
 });
 
-for (const corruption of ["checksum", "file symlink", "directory symlink"] as const) {
+test("S2 current v2 bytes are previewed despite the old descriptor digest and later external edits conflict", async (t) => {
+  const box = await fixture(t);
+  const catalogPath = path.join(box.libraryDir, "catalog.json"), originalCatalog = await readFile(catalogPath);
+  const oldDigest = box.item.files[0]!.sha256, manual = Buffer.from("manual current bytes\n");
+  await writeFile(box.file, manual);
+
+  const edit = await prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md");
+  const current = readSavedEdit(edit).file;
+  assert.deepEqual(current.bytes, manual);
+  assert.equal(current.sha256, createHash("sha256").update(manual).digest("hex"));
+  const catalog = await loadCatalog(box.libraryDir); assertModernCatalog(catalog);
+  assert.equal(catalog.items[0]!.files[0]!.sha256, oldDigest);
+  assert.deepEqual(await readFile(catalogPath), originalCatalog);
+
+  const change = await prepareSavedChange(edit, Buffer.from("reviewed replacement\n"));
+  const view = readSavedChange(change);
+  assert.equal(view.bytesChanged, true);
+  assert.match(view.diffs[0]!.diff, /manual current bytes/);
+  assert.match(view.diffs[0]!.diff, /reviewed replacement/);
+  assert.deepEqual(await readFile(catalogPath), originalCatalog);
+
+  const external = Buffer.from("external edit after preview\n");
+  await writeFile(box.file, external);
+  await assert.rejects(commitSavedChange(change, approve(change)), /changed|revision/i);
+  assert.deepEqual(await readFile(box.file), external);
+  assert.deepEqual(await readFile(catalogPath), originalCatalog);
+});
+
+for (const corruption of ["file symlink", "directory symlink"] as const) {
   test(`S6 refuses ${corruption} rather than repairing it`, async (t) => {
     const box = await fixture(t);
     const catalog = await readFile(path.join(box.libraryDir, "catalog.json"));
-    if (corruption === "checksum") await writeFile(box.file, "manual");
-    else if (corruption === "file symlink") { await rm(box.file); await symlink(path.join(box.item.sourcePath, "SKILL.md"), box.file); }
+    if (corruption === "file symlink") { await rm(box.file); await symlink(path.join(box.item.sourcePath, "SKILL.md"), box.file); }
     else { const root = path.dirname(box.file); await rm(root, { recursive: true }); await symlink(box.item.sourcePath, root); }
-    await assert.rejects(prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md"), /checksum|symbolic|unsafe/i);
-    await assert.rejects(changeSavedDestination(box.libraryDir, box.item.id, { kind: "project", path: ".pi/skills/new" }), /checksum|symbolic|unsafe/i);
+    await assert.rejects(prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md"), /symbolic|unsafe/i);
+    await assert.rejects(changeSavedDestination(box.libraryDir, box.item.id, { kind: "project", path: ".pi/skills/new" }), /symbolic|unsafe/i);
     assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalog);
   });
 }
@@ -205,6 +236,7 @@ test("S1/S5 generalized replacement retains identity and destination, detects al
 test("S3 apply cannot reuse an old plan after saved bytes/catalog changes", async (t) => {
   const box = await fixture(t);
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.groups.push({ id: "team", name: "Team", itemIds: [box.item.id] });
   await saveCatalog(box.libraryDir, catalog);
   const plan = await planApply(box.libraryDir, "team", box.projectDir);
@@ -232,16 +264,45 @@ test("S4 generic saves/imports cannot bypass excluded destination constraints", 
   const box = await fixture(t);
   await assert.rejects(importResource(box.libraryDir, { ...box.candidate, name: "New", destination: { kind: "project", path: ".envrc" } }, { confirmed: true, groupIds: [] }), /destination|private|excluded/i);
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.items[0]!.destination = { kind: "project", path: "auth/token.json" };
   await assert.rejects(saveCatalog(box.libraryDir, catalog), /destination|private|excluded/i);
 });
 
-test("S1 text-only edit refuses unknown physical files instead of silently deleting them during snapshot swap", async (t) => {
+test("S1 ordinary children are captured in a masked before review, preserved on approval, and additions after review conflict", async (t) => {
   const box = await fixture(t);
   const unknown = path.join(path.dirname(box.file), "unregistered.md");
-  await writeFile(unknown, "manual keep me\n");
-  await assert.rejects(prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md"), /unregistered|layout|unexpected/i);
-  assert.equal(await readFile(unknown, "utf8"), "manual keep me\n");
+  const secret = Buffer.from("apiKey=sk_live_unregisteredsecret123456\n");
+  await writeFile(unknown, secret);
+  const beforeCatalog = await readFile(path.join(box.libraryDir, "catalog.json"));
+  const edit = await prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md");
+  const change = await prepareSavedChange(edit, Buffer.from("reviewed edit\n"));
+  const view = readSavedChange(change), child = view.diffs.find((diff) => diff.path === "unregistered.md");
+  assert.ok(child, "the ordinary child is included in the before-review inventory");
+  assert.equal(child.bytesChanged, false);
+  assert.deepEqual(view.sensitivePaths, ["unregistered.md"]);
+  assert.equal(JSON.stringify(view).includes(secret.toString()), false, "the complete review remains masked");
+
+  await assert.rejects(commitSavedChange(change, { ...approve(change), confirmed: false }), /confirm|cancel/i);
+  assert.deepEqual(await readFile(unknown), secret);
+  assert.equal(await readFile(box.file, "utf8"), "old\r\n日本語\n");
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), beforeCatalog);
+
+  await commitSavedChange(change, approve(change));
+  assert.deepEqual(await readFile(unknown), secret);
+  assert.deepEqual((await readSnapshotFiles(box.libraryDir, box.item)).find((file) => file.path === "unregistered.md")!.bytes, secret);
+  assert.equal(await readFile(box.file, "utf8"), "reviewed edit\n");
+
+  const nextEdit = await prepareSavedEdit(box.libraryDir, box.item.id, "SKILL.md");
+  const staleChange = await prepareSavedChange(nextEdit, Buffer.from("another reviewed edit\n"));
+  const addedAfterPreview = path.join(path.dirname(box.file), "added-after-preview.md");
+  await writeFile(addedAfterPreview, "external new child\n");
+  const catalogAfterExternalAdd = await readFile(path.join(box.libraryDir, "catalog.json"));
+  await assert.rejects(commitSavedChange(staleChange, approve(staleChange)), /changed|revision/i);
+  assert.equal(await readFile(addedAfterPreview, "utf8"), "external new child\n");
+  assert.equal(await readFile(box.file, "utf8"), "reviewed edit\n");
+  assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalogAfterExternalAdd);
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
 });
 
 for (const bytes of [Buffer.from([0]), Buffer.from([0xff]), Buffer.from([0xff, 0xfe, 65, 0]), Buffer.alloc(1_000_001, 65)]) {
@@ -277,6 +338,7 @@ test("S1 replacement mode-only changes are visible as mode changes, not mislabel
 test("S1 replacement records the new source metadata but keeps ID/display name/groups/destination and original source bytes", async (t) => {
   const box = await fixture(t);
   const before = await loadCatalog(box.libraryDir);
+  assertModernCatalog(before);
   before.groups.push({ id: "team", name: "Team", itemIds: [box.item.id] });
   await saveCatalog(box.libraryDir, before);
   const original = await readFile(path.join(box.item.sourcePath, "SKILL.md"));
