@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createTwoFilesPatch } from "diff";
 import { constants, type BigIntStats } from "node:fs";
+import { types as utilTypes } from "node:util";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { buildMigrationBackupManifest, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { parseStoredCatalog } from "./catalog.ts";
+import type { ChangeApproval } from "./resource-mutations.ts";
 import type { Catalog, LegacyCatalog, LegacySavedItem, SavedItem } from "./types.ts";
 
 export type MigrationStatus = "ready" | "blocked" | "already-v2";
@@ -46,7 +48,7 @@ export interface PreparedMigration {
   readonly reviewId: string;
 }
 
-/** Result shape reserved for the later write-capable commitMigration implementation. */
+/** Result shape for migration commits; this authorization slice returns it only for already-v2 no-ops. */
 export interface MigrationResult {
   readonly catalogVersion: 2;
   readonly backupDir: string | null;
@@ -125,6 +127,7 @@ interface PreparedMigrationState {
   readonly backupEntries: readonly MigrationBackupInputEntry[];
   readonly selections: readonly FixedSelection[];
   readonly additions: readonly PlannedAddition[];
+  used: boolean;
 }
 
 const preparedStates = new WeakMap<PreparedMigration, PreparedMigrationState>();
@@ -391,9 +394,9 @@ function cloneView(view: MigrationView): MigrationView {
   };
 }
 
-function makePrepared(state: PreparedMigrationState): PreparedMigration {
+function makePrepared(state: Omit<PreparedMigrationState, "used">): PreparedMigration {
   const plan = Object.freeze({ reviewId: state.view.reviewId }) as PreparedMigration;
-  preparedStates.set(plan, state);
+  preparedStates.set(plan, { ...state, used: false });
   return plan;
 }
 
@@ -599,7 +602,7 @@ function makeAlreadyV2(
   rootDirectoryState?: DirectoryState,
   catalogFile?: FileState,
 ): PreparedMigration {
-  const state: PreparedMigrationState = {
+  const state: Omit<PreparedMigrationState, "used"> = {
     root, revision, rootPresent,
     rootIdentities: rootIdentities.map((identity) => ({ ...identity })),
     ...(rootDirectoryState ? { rootDirectoryState: { ...rootDirectoryState } } : {}),
@@ -825,4 +828,118 @@ export function readMigration(plan: PreparedMigration): MigrationView {
   const state = preparedStates.get(plan);
   if (!state) throw new Error("Prepared migration is unavailable.");
   return cloneView(state.view);
+}
+
+const approvalKeys = ["reviewId", "confirmed", "approvedSensitivePaths"] as const;
+
+function snapshotOwnDataRecord(value: unknown, expectedKeys: readonly string[]): Record<string, unknown> | undefined {
+  if (typeof value !== "object" || value === null || utilTypes.isProxy(value)) return undefined;
+  try {
+    if (Array.isArray(value)) return undefined;
+    const prototype = Object.getPrototypeOf(value) as unknown;
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== expectedKeys.length || ownKeys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))) {
+      return undefined;
+    }
+    const snapshot = Object.create(null) as Record<string, unknown>;
+    for (const key of expectedKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return undefined;
+      snapshot[key] = descriptor.value;
+    }
+    return snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotDenseOwnDataArray(value: unknown): unknown[] | undefined {
+  try {
+    if (utilTypes.isProxy(value) || !Array.isArray(value)) return undefined;
+    const ownKeys = Reflect.ownKeys(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (!lengthDescriptor || !Object.hasOwn(lengthDescriptor, "value") || lengthDescriptor.enumerable !== false ||
+        typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 ||
+        ownKeys.length !== lengthDescriptor.value + 1) return undefined;
+    const length = lengthDescriptor.value;
+    const keys = new Set<string>();
+    for (const key of ownKeys) {
+      if (typeof key !== "string" ||
+          (key !== "length" && (!Number.isSafeInteger(Number(key)) || Number(key) < 0 || Number(key) >= length || String(Number(key)) !== key))) {
+        return undefined;
+      }
+      keys.add(key);
+    }
+    if (!keys.has("length")) return undefined;
+    const snapshot: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!keys.has(String(index)) || !descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return undefined;
+      snapshot.push(descriptor.value);
+    }
+    return snapshot;
+  } catch {
+    return undefined;
+  }
+}
+
+function assertMigrationApproval(state: PreparedMigrationState, approval: ChangeApproval): void {
+  const snapshot = snapshotOwnDataRecord(approval, approvalKeys);
+  if (!snapshot || snapshot.reviewId !== state.view.reviewId || snapshot.confirmed !== true) {
+    throw new Error("Migration approval must be a fixed own-data snapshot matching this review and explicit confirmation.");
+  }
+  const paths = snapshotDenseOwnDataArray(snapshot.approvedSensitivePaths);
+  if (!paths || paths.some((entry) => typeof entry !== "string")) {
+    throw new Error("Migration sensitive approvals must be a dense own-data array of exact paths.");
+  }
+  const approved = paths as string[];
+  const approvedSet = new Set(approved);
+  const expected = state.view.sensitivePaths;
+  if (approvedSet.size !== approved.length || approvedSet.size !== expected.length || expected.some((entry) => !approvedSet.has(entry))) {
+    throw new Error("Individual approval is required for the exact set of sensitive paths in this migration review.");
+  }
+}
+
+function sameDirectoryIdentities(left: readonly DirectoryIdentity[] | undefined, right: readonly DirectoryIdentity[] | undefined): boolean {
+  if (!left || !right || left.length !== right.length) return left === right;
+  return left.every((entry, index) => sameDirectoryIdentity(entry, right[index]!));
+}
+
+async function recheckPreparedMigration(state: PreparedMigrationState): Promise<void> {
+  const current = await prepareMigration(state.root);
+  const currentState = preparedStates.get(current);
+  if (!currentState || currentState.view.status !== state.view.status || currentState.revision !== state.revision ||
+      currentState.rootPresent !== state.rootPresent || !sameDirectoryIdentities(currentState.rootIdentities, state.rootIdentities) ||
+      JSON.stringify(currentState.rootEntries) !== JSON.stringify(state.rootEntries) ||
+      (currentState.rootDirectoryState === undefined) !== (state.rootDirectoryState === undefined) ||
+      (currentState.rootDirectoryState !== undefined && state.rootDirectoryState !== undefined &&
+        !sameDirectory(currentState.rootDirectoryState, state.rootDirectoryState)) ||
+      JSON.stringify(currentState.view.sensitivePaths) !== JSON.stringify(state.view.sensitivePaths)) {
+    throw new Error("Migration inputs, canonical root, catalog, lock state, or review snapshot changed after the read-only preview.");
+  }
+}
+
+export async function commitMigration(plan: PreparedMigration, approval: ChangeApproval): Promise<MigrationResult> {
+  if (typeof plan !== "object" || plan === null || !preparedStates.has(plan)) {
+    throw new Error("Invalid prepared migration token.");
+  }
+  const state = preparedStates.get(plan);
+  if (!state) throw new Error("Prepared migration is unavailable.");
+  if (state.used) throw new Error("Prepared migration was already consumed; prepare and review again.");
+  if (state.view.status === "blocked") throw new Error("Prepared migration is blocked; resolve conflicts and review again.");
+
+  assertMigrationApproval(state, approval);
+  await recheckPreparedMigration(state);
+
+  if (state.view.status === "already-v2") {
+    state.used = true;
+    return {
+      catalogVersion: 2,
+      backupDir: null,
+      preservedPaths: [...state.view.preservedPaths],
+    };
+  }
+
+  throw new Error("Legacy v1 migration is fail-closed: the storage-kernel migration write path is not implemented; no bytes were written.");
 }
