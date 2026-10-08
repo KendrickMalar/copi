@@ -661,7 +661,16 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
   const reviewId = randomUUID();
   try {
     const rootCheck = await checkCanonicalAncestors(root);
-    if (!rootCheck.exists) return makeAlreadyV2(reviewId, root, digest(Buffer.from(`absent:${root}`)), false, rootCheck.identities, []);
+    if (!rootCheck.exists) {
+      // A root rename can expose a brief ENOENT at the start of a preview. Confirm
+      // absence after yielding to pending filesystem operations before treating it as a no-op.
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      const confirmedRootCheck = await checkCanonicalAncestors(root);
+      if (confirmedRootCheck.exists || !sameDirectoryIdentities(rootCheck.identities, confirmedRootCheck.identities)) {
+        throw new Error("Library root or an ancestor changed during the read-only preview.");
+      }
+      return makeAlreadyV2(reviewId, root, digest(Buffer.from(`absent:${root}`)), false, rootCheck.identities, []);
+    }
     const rootNamesBefore = (await readdir(root)).sort(compare);
     const blockers: string[] = [];
     for (const name of [".copi-transaction", ".copi-transaction-recovery", ".copi-migration-resolution.json"]) {
