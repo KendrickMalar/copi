@@ -7,7 +7,9 @@ import { types as utilTypes } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
 import { readSourceContent } from "./source-content.ts";
-import { parseStorageJournal, validateLegacyMigrationJournalTargets, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type LegacyMigrationStorageJournal, type SourcesStorageJournal } from "./storage-journal.ts";
+import { canonicalStorageJournalJson, parseMigrationStartInventory, parseStorageJournal, validateLegacyMigrationJournalTargets, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type LegacyMigrationStorageJournal, type LegacyMigrationStorageJournalV5, type MigrationStartInventory, type SourcesStorageJournal } from "./storage-journal.ts";
+import { projectMigrationInventory, scanMigrationInventory } from "./migration-inventory.ts";
+import { acquireRootLease } from "./storage-root-lease.ts";
 import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
@@ -65,6 +67,7 @@ export interface StorageReplacement { readonly itemId: string; readonly files: r
 export interface LegacyMigrationInput extends StorageFile { readonly sha256: string; readonly dev: string; readonly ino: string }
 interface LegacyAdoptOnlyMigrationRequest {
   readonly root: string;
+  readonly startInventory: MigrationStartInventory;
   readonly oldCatalogBytes: Buffer;
   readonly oldCatalogIdentity: string;
   readonly catalogBytes: Buffer;
@@ -1172,9 +1175,10 @@ async function cleanupLegacyMigrationLock(root: string, lock: string, token: str
   const digestPath = path.join(lock, "journal.digest");
   const raw = await checkedFile(journalPath);
   const digestBytes = await checkedFile(digestPath);
-  if (!raw || !digestBytes || digestBytes.toString("utf8") !== hash(raw)) throw new Error("V4 migration journal integrity is missing or altered; preserving all bytes.");
+  if (!raw || !digestBytes || digestBytes.toString("utf8") !== hash(raw)) throw new Error("Legacy migration journal integrity is missing or altered; preserving all bytes.");
   const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root, token });
-  if (parsed.version !== 4) throw new Error("V4 cleanup received a different journal version.");
+  if (parsed.version !== 4 && parsed.version !== 5) throw new Error("Legacy migration cleanup received a different journal version.");
+  if (parsed.version === 5 && raw.toString("utf8") !== canonicalStorageJournalJson(parsed)) throw new Error("V5 migration journal is not canonical JSON; preserving all bytes.");
   const inspected = await inspectLegacyMigrationJournal(root, lock, token, parsed, lease.recoveryClaim !== undefined);
   if (inspected.currentHash !== parsed.oldCatalog && inspected.currentHash !== parsed.newCatalog) {
     throw new Error("V4 migration did not reach a checked terminal catalog state; preserving every artifact.");
@@ -1218,7 +1222,7 @@ async function cleanupTransactionLock(root: string, lock: string, token: string,
   const rawJournal = await checkedFile(path.join(lock, "journal.json"));
   if (rawJournal) {
     const journal = parseStorageJournal(JSON.parse(rawJournal.toString("utf8")) as unknown, { root, token });
-    if (journal.version === 4) { await cleanupLegacyMigrationLock(root, lock, token, lease); return; }
+    if (journal.version === 4 || journal.version === 5) { await cleanupLegacyMigrationLock(root, lock, token, lease); return; }
     if (journal.version !== 3) throw new Error("A non-catalog-only transaction journal remains after recovery; refusing cleanup.");
     await cleanupFinalizedCatalogOnlyLock(root, lock, token, lease);
     return;
@@ -1289,7 +1293,33 @@ async function checkedLegacyMigrationInput(root: string, input: LegacyMigrationI
     }
   } finally { await handle.close(); }
 }
+function migrationInventoryExclusions(
+  startInventory: MigrationStartInventory,
+  currentInventory: MigrationStartInventory,
+  protocolArtifacts: readonly string[],
+  backupCreated: boolean,
+): string[] {
+  const excluded = [...protocolArtifacts];
+  const backupParent = ".migration-backups";
+  const startHadBackupParent = startInventory.nodes.some((node) => node.path === backupParent);
+  const currentBackupParent = currentInventory.nodes.find((node) => node.path === backupParent);
+  const hasUnownedBackupChildren = currentInventory.nodes.some((node) => node.path !== backupParent && path.posix.dirname(node.path) === backupParent);
+  if (backupCreated && !startHadBackupParent && currentBackupParent?.kind === "directory" && !hasUnownedBackupChildren) {
+    excluded.push(backupParent);
+  }
+  return excluded;
+}
+
 async function assertLegacyMigrationSnapshot(root: string, request: LegacyAdoptOnlyMigrationRequest, backupCreated: boolean, catalogHeld = false, catalogChanged = false): Promise<void> {
+  const protocolArtifacts = [lockName, `${lockName}-recovery`, ...(backupCreated ? [request.backupDir] : []), ...(catalogHeld ? ["catalog.json"] : [])];
+  const omittedProofs = catalogHeld ? [] : ["catalog.json"];
+  const scannedInventory = await scanMigrationInventory(root, { excludedPrefixes: protocolArtifacts });
+  const excluded = migrationInventoryExclusions(request.startInventory, scannedInventory, protocolArtifacts, backupCreated);
+  const expectedInventory = projectMigrationInventory(request.startInventory, excluded, omittedProofs);
+  const currentInventory = projectMigrationInventory(scannedInventory, excluded, omittedProofs);
+  if (expectedInventory.hash !== currentInventory.hash || JSON.stringify(expectedInventory.nodes) !== JSON.stringify(currentInventory.nodes)) {
+    throw new Error("A library node outside the owned migration artifacts changed; preserving the reviewed start inventory.");
+  }
   const expectedEntries = [...request.rootEntries.filter((entry) => !(catalogHeld && entry === "catalog.json")), lockName,
     ...(backupCreated ? [".migration-backups"] : [])].sort();
   const currentEntries = (await readdir(root)).sort();
@@ -1406,7 +1436,7 @@ async function assertLegacyMigrationBackup(root: string, request: LegacyAdoptOnl
 /** @internal Plan-bound bridge; the request is checked against the opaque public preview before issuance. */
 export async function prepareLegacyMigrationReview(plan: PreparedMigration, value: unknown): Promise<LegacyMigrationReview> {
   if (legacyMigrationPlanReviews.has(plan)) throw new Error("Prepared migration already issued a storage review; prepare and review again.");
-  const fields = snapshotOwnDataRecord(value, ["root", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries", "inputs", "backupDir", "backupManifestBytes", "reviewId", "sensitivePaths"]);
+  const fields = snapshotOwnDataRecord(value, ["root", "startInventory", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries", "inputs", "backupDir", "backupManifestBytes", "reviewId", "sensitivePaths"]);
   if (!fields || typeof fields.root !== "string" || !path.isAbsolute(fields.root) || path.resolve(fields.root) !== fields.root ||
       typeof fields.oldCatalogIdentity !== "string" || typeof fields.itemsTree !== "string" || typeof fields.sourcesTree !== "string" ||
       typeof fields.backupDir !== "string" || typeof fields.reviewId !== "string" || !itemPattern.test(fields.reviewId) ||
@@ -1432,8 +1462,10 @@ export async function prepareLegacyMigrationReview(plan: PreparedMigration, valu
     }
     return { path: input.path, bytes: Buffer.from(input.bytes), mode: input.mode, sha256: input.sha256, dev: input.dev, ino: input.ino };
   });
+  const startInventory = parseMigrationStartInventory(fields.startInventory);
   const request: LegacyAdoptOnlyMigrationRequest = {
     root: fields.root,
+    startInventory,
     oldCatalogBytes: Buffer.from(fields.oldCatalogBytes),
     oldCatalogIdentity: fields.oldCatalogIdentity,
     catalogBytes: Buffer.from(fields.catalogBytes),
@@ -1446,6 +1478,14 @@ export async function prepareLegacyMigrationReview(plan: PreparedMigration, valu
     reviewId: fields.reviewId,
     sensitivePaths: (sensitivePaths as string[]).slice().sort(),
   };
+  const inventoryCatalog = request.startInventory.nodes.find((node) => node.path === "catalog.json");
+  const fixedCatalogInput = request.inputs.find((input) => input.path === "catalog.json");
+  if (!inventoryCatalog || inventoryCatalog.kind !== "file" || !fixedCatalogInput ||
+      inventoryCatalog.bytesHash !== hash(request.oldCatalogBytes) || inventoryCatalog.mode !== fixedCatalogInput.mode ||
+      inventoryCatalog.dev !== fixedCatalogInput.dev || inventoryCatalog.ino !== fixedCatalogInput.ino ||
+      request.oldCatalogIdentity !== `${inventoryCatalog.dev}:${inventoryCatalog.ino}`) {
+    throw new Error("Legacy migration start inventory does not bind the exact original catalog proof.");
+  }
   const oldRaw = JSON.parse(request.oldCatalogBytes.toString("utf8")) as unknown;
   const nextRaw = JSON.parse(request.catalogBytes.toString("utf8")) as unknown;
   const oldValue = parseStoredCatalog(oldRaw);
@@ -1486,10 +1526,14 @@ export async function prepareLegacyMigrationReview(plan: PreparedMigration, valu
   return review;
 }
 
-async function inspectLegacyMigrationJournal(root: string, lock: string, token: string, journal: LegacyMigrationStorageJournal, recoveryClaim = false): Promise<{ currentHash: string | null; oldBytes: Buffer; nextBytes: Buffer }> {
-  if (journal.operations.length !== 0 || journal.ownedDirectories.length !== 0 ||
-      journal.stableSourcesTree !== journal.stableSourcesTreeNext) {
+async function inspectLegacyMigrationJournal(root: string, lock: string, token: string, journal: LegacyMigrationStorageJournal | LegacyMigrationStorageJournalV5, recoveryClaim = false): Promise<{ currentHash: string | null; oldBytes: Buffer; nextBytes: Buffer }> {
+  if (journal.version === 4 && (journal.operations.length !== 0 || journal.ownedDirectories.length !== 0 ||
+      journal.stableSourcesTree !== journal.stableSourcesTreeNext)) {
     throw new Error("Legacy migration v4 recovery is not implemented for additions in this build; adopt-only is supported and additions are preserved.");
+  }
+  if (journal.version === 5 && (journal.operations.length !== 0 || journal.ownedDirectories.length !== 0 ||
+      journal.stableSourcesTree !== journal.stableSourcesTreeNext)) {
+    throw new Error("Invalid v5 migration additions; preserving every byte.");
   }
   const allowed = new Set(["owner.json", "next-catalog", "old-catalog", "held-catalog", "displaced-catalog", "rollback.json", "journal.json", "journal.digest"]);
   const names = await readdir(lock);
@@ -1508,6 +1552,17 @@ async function inspectLegacyMigrationJournal(root: string, lock: string, token: 
     ...(recoveryClaim ? [`${lockName}-recovery`] : [])].sort();
   const currentRootCatalog = await checkedFile(currentCatalogPath);
   const currentHashAtRoot = currentRootCatalog ? hash(currentRootCatalog) : null;
+  if (journal.version === 5) {
+    const protocolArtifacts = [lockName, `${lockName}-recovery`, journal.backupDir, ...(currentHashAtRoot === null ? ["catalog.json"] : [])];
+    const omittedProofs = currentHashAtRoot === null ? [] : ["catalog.json"];
+    const scannedInventory = await scanMigrationInventory(root, { excludedPrefixes: protocolArtifacts });
+    const ignored = migrationInventoryExclusions(journal.startInventory, scannedInventory, protocolArtifacts, true);
+    const expectedInventory = projectMigrationInventory(journal.startInventory, ignored, omittedProofs);
+    const currentInventory = projectMigrationInventory(scannedInventory, ignored, omittedProofs);
+    if (expectedInventory.hash !== currentInventory.hash || JSON.stringify(expectedInventory.nodes) !== JSON.stringify(currentInventory.nodes)) {
+      throw new Error("A library node outside owned v5 migration artifacts changed; preserving the start inventory and all bytes.");
+    }
+  }
   const expectedNamesForState = currentHashAtRoot === null
     ? expectedRootNames.filter((entry) => entry !== "catalog.json")
     : expectedRootNames;
@@ -1596,7 +1651,6 @@ async function canonicalRoot(libraryDir: string, create: boolean): Promise<strin
     await mkdir(requested, { recursive: true, mode: 0o700 });
   }
   await checkedDirectory(requested);
-  if (create) await chmod(requested, 0o700);
   return realpath(requested);
 }
 export async function absentStorageRevision(libraryDir: string): Promise<StorageRevision> {
@@ -1701,6 +1755,9 @@ export class StorageTransactions {
   async run<T>(libraryDir: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>): Promise<T> {
     const root = await canonicalRoot(libraryDir, create);
     if (!root) return operation(undefined);
+    const rootLease = await acquireRootLease(root, this.options.waitMilliseconds ?? 5_000);
+    try {
+    if (create) await chmod(root, 0o700);
     const lock = path.join(root, lockName);
     const owner: Owner = { version: 1, pid: process.pid, host: os.hostname(), token: randomUUID() };
     const deadline = Date.now() + (this.options.waitMilliseconds ?? 5_000);
@@ -1758,6 +1815,9 @@ export class StorageTransactions {
         const secondary = cleanupError instanceof Error ? cleanupError.message : "Safe cleanup was refused.";
         throw new AggregateError([operationError, cleanupError], `${primary}; safe cleanup was refused: ${secondary}`);
       }
+    }
+    } finally {
+      await rootLease.close();
     }
   }
   private async recoverDead(root: string, expected: Owner): Promise<void> {
@@ -1900,13 +1960,17 @@ export class StorageSession {
     if (!/^(?:absent|[0-9a-f]{64})$/.test(itemsTree) || !/^(?:absent|[0-9a-f]{64})$/.test(sourcesTree)) {
       throw new Error("Legacy migration requires fixed items and sources tree commitments.");
     }
+    const startInventory = parseMigrationStartInventory(request.startInventory);
     const catalogInput = request.inputs.find((input) => input.path === "catalog.json");
+    const inventoryCatalog = startInventory.nodes.find((node) => node.path === "catalog.json");
     if (!catalogInput || !catalogInput.bytes.equals(request.oldCatalogBytes) ||
-        request.oldCatalogIdentity !== `${catalogInput.dev}:${catalogInput.ino}`) {
+        request.oldCatalogIdentity !== `${catalogInput.dev}:${catalogInput.ino}` || !inventoryCatalog ||
+        inventoryCatalog.kind !== "file" || inventoryCatalog.bytesHash !== hash(request.oldCatalogBytes) ||
+        inventoryCatalog.mode !== catalogInput.mode || inventoryCatalog.dev !== catalogInput.dev || inventoryCatalog.ino !== catalogInput.ino) {
       throw new Error("Legacy migration catalog bytes and original inode are not bound to the fixed backup inputs.");
     }
-    const journal: LegacyMigrationStorageJournal = {
-      version: 4,
+    const journal: LegacyMigrationStorageJournalV5 = {
+      version: 5,
       mode: "legacy-migration",
       root: this.root,
       token: this.token,
@@ -1919,6 +1983,7 @@ export class StorageSession {
       backupManifest: hash(request.backupManifestBytes),
       operations: [],
       ownedDirectories: [],
+      startInventory,
     };
     validateLegacyMigrationJournalTargets(journal, oldValue, nextValue);
     const inputPaths = new Set(request.inputs.map((input) => input.path));
@@ -2002,7 +2067,7 @@ export class StorageSession {
       if (lockNames.length !== initialNames.size || lockNames.some((name) => !initialNames.has(name))) {
         throw new Error("Unknown migration transaction stage before v4 journaling; preserving every artifact.");
       }
-      const journalBytes = Buffer.from(JSON.stringify(journal));
+      const journalBytes = Buffer.from(canonicalStorageJournalJson(journal), "utf8");
       const journalTemp = path.join(this.lock, "journal.tmp");
       await writePrivate(journalTemp, journalBytes);
       await rememberUnjournaledFile(this, "journal.tmp", journalTemp, journalBytes);
@@ -3186,14 +3251,17 @@ export class StorageSession {
     await rm(path.join(this.lock, "journal.json"));
     await this.checkpoint?.("rollback-finalized", this.root);
   }
-  async #recoverLegacyMigration(journal: LegacyMigrationStorageJournal, rollback: boolean): Promise<void> {
+  async #recoverLegacyMigration(journal: LegacyMigrationStorageJournal | LegacyMigrationStorageJournalV5, rollback: boolean): Promise<void> {
     await this.assertLease(false);
     const journalPath = path.join(this.lock, "journal.json");
     const raw = await checkedFile(journalPath);
     const digestBytes = await checkedFile(path.join(this.lock, "journal.digest"));
-    if (!raw || !digestBytes || digestBytes.toString("utf8") !== hash(raw)) throw new Error("V4 migration journal integrity is missing or altered; preserving all bytes.");
+    if (!raw || !digestBytes || digestBytes.toString("utf8") !== hash(raw)) throw new Error("Legacy migration journal integrity is missing or altered; preserving all bytes.");
     const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
-    if (parsed.version !== 4 || JSON.stringify(parsed) !== JSON.stringify(journal)) throw new Error("V4 migration journal changed dispatch or fixed commitments.");
+    if ((parsed.version !== 4 && parsed.version !== 5) || JSON.stringify(parsed) !== JSON.stringify(journal) ||
+        (parsed.version === 5 && raw.toString("utf8") !== canonicalStorageJournalJson(parsed))) {
+      throw new Error("Legacy migration journal changed dispatch, canonical encoding, or fixed commitments.");
+    }
     const state = await inspectLegacyMigrationJournal(this.root, this.lock, this.token, journal,
       sessionLeases.get(this)?.recoveryClaim !== undefined);
     const marker = await checkedFile(path.join(this.lock, "rollback.json"));
@@ -3257,7 +3325,7 @@ export class StorageSession {
     const parsed = parseStorageJournal(JSON.parse(raw.toString("utf8")) as unknown, { root: this.root, token: this.token });
     if (parsed.version === 3) { await this.recoverCatalogOnly(parsed, rollback, raw); return; }
     if (parsed.version === 2) { await this.recoverSources(parsed, rollback, raw); return; }
-    if (parsed.version === 4) { await this.#recoverLegacyMigration(parsed, rollback); return; }
+    if (parsed.version === 4 || parsed.version === 5) { await this.#recoverLegacyMigration(parsed, rollback); return; }
     const journal = parsed;
     await this.assertLease(true);
     if (await this.verifyFinalized()) { await rm(path.join(this.lock, "journal.json")); return; }

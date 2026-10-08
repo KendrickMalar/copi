@@ -8,6 +8,8 @@ import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { buildMigrationBackupManifest, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { prepareLegacyMigrationReview, storageTransactions } from "./storage-transaction.ts";
 import { parseStoredCatalog } from "./catalog.ts";
+import { scanMigrationInventory } from "./migration-inventory.ts";
+import type { MigrationStartInventory } from "./storage-journal.ts";
 import type { ChangeApproval } from "./resource-mutations.ts";
 import type { Catalog, LegacyCatalog, LegacySavedItem, SavedItem } from "./types.ts";
 
@@ -112,6 +114,7 @@ interface PlannedAddition {
 
 interface LegacyAdoptOnlyMigrationRequest {
   readonly root: string;
+  readonly startInventory: MigrationStartInventory;
   readonly oldCatalogBytes: Buffer;
   readonly oldCatalogIdentity: string;
   readonly catalogBytes: Buffer;
@@ -128,6 +131,7 @@ interface LegacyAdoptOnlyMigrationRequest {
 interface PreparedMigrationState {
   readonly root: string;
   readonly revision: string;
+  readonly startInventory?: MigrationStartInventory;
   readonly rootPresent?: boolean;
   readonly rootIdentities?: readonly DirectoryIdentity[];
   readonly rootDirectoryState?: DirectoryState;
@@ -694,6 +698,12 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
       return makeAlreadyV2(reviewId, root, digest(Buffer.from(`${catalogFile.sha256}:${catalogFile.dev}:${catalogFile.ino}`)), true, rootCheck.identities, rootNamesBefore, rootCheck.rootDirectoryState, catalogFile);
     }
     const legacy = stored;
+    const startInventory = await scanMigrationInventory(root);
+    const catalogInventoryNode = startInventory.nodes.find((node) => node.path === "catalog.json");
+    if (!catalogInventoryNode || catalogInventoryNode.kind !== "file" || catalogInventoryNode.bytesHash !== catalogFile.sha256 ||
+        catalogInventoryNode.dev !== catalogFile.dev || catalogInventoryNode.ino !== catalogFile.ino || catalogInventoryNode.mode !== catalogFile.mode) {
+      throw new Error("Migration start inventory no longer matches the reviewed catalog identity and bytes.");
+    }
     const existingBackups = await lstat(path.join(root, ".migration-backups"), { bigint: true }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
       throw error;
@@ -821,7 +831,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     const backupManifestBytes = buildMigrationBackupManifest(backupEntries);
     const rootDirectoryState = rootCheck.rootDirectoryState;
     if (!rootDirectoryState) throw new Error("Library root directory state is unavailable.");
-    const revision = inventoryDigest(rootCheck.identities, rootDirectoryState, catalogFile, [itemsTree, sourcesTree]);
+    const revision = digest(Buffer.from(`${inventoryDigest(rootCheck.identities, rootDirectoryState, catalogFile, [itemsTree, sourcesTree])}:${startInventory.hash}`));
     const conflicts: string[] = [];
     const view: MigrationView = {
       reviewId,
@@ -836,6 +846,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     return makePrepared({
       root,
       revision,
+      startInventory: structuredClone(startInventory),
       rootPresent: true,
       rootIdentities: rootCheck.identities.map((identity) => ({ ...identity })),
       rootDirectoryState: { ...rootDirectoryState },
@@ -971,13 +982,14 @@ export async function assertPreparedMigrationRequest(plan: PreparedMigration, va
     throw new Error("Legacy migration storage reviews require an unused opaque ready plan selecting existing sources.");
   }
   const fields = snapshotOwnDataRecord(value, [
-    "root", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries",
+    "root", "startInventory", "oldCatalogBytes", "oldCatalogIdentity", "catalogBytes", "itemsTree", "sourcesTree", "rootEntries",
     "inputs", "backupDir", "backupManifestBytes", "reviewId", "sensitivePaths",
   ]);
   if (!fields || typeof fields.root !== "string" || typeof fields.oldCatalogIdentity !== "string" ||
       typeof fields.itemsTree !== "string" || typeof fields.sourcesTree !== "string" || typeof fields.backupDir !== "string" ||
       typeof fields.reviewId !== "string" || fields.reviewId !== state.view.reviewId ||
-      !Buffer.isBuffer(fields.oldCatalogBytes) || !Buffer.isBuffer(fields.catalogBytes) || !Buffer.isBuffer(fields.backupManifestBytes)) {
+      !Buffer.isBuffer(fields.oldCatalogBytes) || !Buffer.isBuffer(fields.catalogBytes) || !Buffer.isBuffer(fields.backupManifestBytes) ||
+      !state.startInventory || JSON.stringify(fields.startInventory) !== JSON.stringify(state.startInventory)) {
     throw new Error("Legacy migration review request does not match the fixed prepared plan.");
   }
   const rootEntries = snapshotDenseOwnDataArray(fields.rootEntries);
@@ -1051,12 +1063,13 @@ export async function commitMigration(plan: PreparedMigration, approval: ChangeA
   const catalogInput = state.inputs.find((input) => input.path === "catalog.json");
   const itemsTree = state.itemsTree;
   const sourcesTree = state.sourcesTree;
-  if (!oldCatalog || !nextCatalog || !catalogInput || !itemsTree || !sourcesTree || !state.rootEntries) {
+  if (!oldCatalog || !nextCatalog || !catalogInput || !itemsTree || !sourcesTree || !state.rootEntries || !state.startInventory) {
     throw new Error("The fixed adopt-only migration snapshot is incomplete; no bytes were written.");
   }
   const backupDir = `.migration-backups/${randomUUID()}`;
   const request: LegacyAdoptOnlyMigrationRequest = {
     root: state.root,
+    startInventory: structuredClone(state.startInventory),
     oldCatalogBytes: Buffer.from(oldCatalog),
     oldCatalogIdentity: `${catalogInput.dev}:${catalogInput.ino}`,
     catalogBytes: Buffer.from(`${JSON.stringify(nextCatalog, null, 2)}\n`, "utf8"),

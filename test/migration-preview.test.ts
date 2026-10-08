@@ -409,6 +409,25 @@ test("pending transaction and recovery locks block preview without attempting re
   });
 });
 
+test("blocks a symlink in an unregistered root subtree instead of omitting it from migration inventory", async () => {
+  await withLibrary(async (root) => {
+    await writeLegacyCatalog(root);
+    await writeLegacySnapshot(root);
+    const outside = path.join(path.dirname(root), `copi-unregistered-target-${path.basename(root)}`);
+    await writeBytes(path.dirname(root), path.basename(outside), Buffer.from("preserve outside\n"), 0o600);
+    try {
+      await symlink(outside, path.join(root, "unregistered-link"));
+      const view = readMigration(await prepareMigration(root));
+      assert.equal(view.status, "blocked");
+      assert.ok(view.conflicts.length > 0);
+      assert.equal(await readFile(outside, "utf8"), "preserve outside\n");
+    } finally {
+      await rm(path.join(root, "unregistered-link"), { force: true });
+      await rm(outside, { force: true });
+    }
+  });
+});
+
 test("rejects cloned, forged, and foreign handles while returned view mutation stays detached", async () => {
   await withLibrary(async (root) => {
     await writeLegacyCatalog(root);
