@@ -88,7 +88,7 @@ function isMigrationLockConflict(view: MigrationView): boolean {
 
 async function defaultApi(): Promise<MigrationCommandApi> {
   const module = await import("./migration.ts");
-  return module as unknown as MigrationCommandApi;
+  return module;
 }
 
 function requireResolutionApi(api: MigrationCommandApi): void {

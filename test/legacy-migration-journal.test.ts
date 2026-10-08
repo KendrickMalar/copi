@@ -16,6 +16,7 @@ const otherDigest = "b".repeat(64);
 const thirdDigest = "c".repeat(64);
 const backupDir = ".migration-backups/123e4567-e89b-42d3-a456-426614174000";
 const expected = { root, token };
+const expectedV5 = { root, token: "123e4567-e89b-42d3-a456-426614174099" };
 
 function migrationJournal(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -289,6 +290,93 @@ test("does not treat v4 fields as an extension of a legacy v1 journal", async ()
   const { parseStorageJournal } = await loadCodec();
   const oldV1 = { version: 1, root, token, oldCatalog: null, newCatalog: digest, operations: [], mode: "legacy-migration" };
   assert.throws(() => parseStorageJournal(oldV1, expected));
+});
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value).sort(([left], [right]) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function hashBytes(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function v5Inventory(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const catalogHash = hashBytes("catalog-v1");
+  const nodes = [
+    { path: ".", kind: "directory", mode: 0o700, dev: "1", ino: "2", bytesHash: hashBytes(Buffer.concat([
+      Buffer.from("copi-directory-v1\0"), Buffer.from(canonicalJson([["catalog.json", "file"]])),
+    ])) },
+    { path: "catalog.json", kind: "file", mode: 0o600, dev: "1", ino: "3", bytesHash: catalogHash },
+  ];
+  return {
+    version: 1,
+    nodes,
+    hash: hashBytes(Buffer.concat([Buffer.from("copi-inventory-v1\0"), Buffer.from(canonicalJson(nodes))])),
+    ...overrides,
+  };
+}
+
+function migrationJournalV5(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const startInventory = v5Inventory();
+  const catalogNode = (startInventory.nodes as Array<Record<string, unknown>>).find((node) => node.path === "catalog.json");
+  assert.ok(catalogNode);
+  return {
+    version: 5,
+    mode: "legacy-migration",
+    root,
+    token: "123e4567-e89b-42d3-a456-426614174099",
+    oldCatalog: catalogNode.bytesHash,
+    newCatalog: otherDigest,
+    stableItemsTree: "absent",
+    stableSourcesTree: "absent",
+    stableSourcesTreeNext: "absent",
+    backupDir: ".migration-backups/123e4567-e89b-42d3-a456-426614174000",
+    backupManifest: thirdDigest,
+    operations: [],
+    ownedDirectories: [],
+    startInventory,
+    ...overrides,
+  };
+}
+
+test("strictly parses and detaches an adopt-only v5 journal with a hashed full-start inventory", async () => {
+  const { parseStorageJournal } = await loadCodec();
+  const value = migrationJournalV5();
+  const parsed = parseStorageJournal(value, expectedV5) as unknown as Record<string, unknown>;
+  assert.deepEqual(parsed, value);
+  assert.notEqual(parsed, value);
+  assert.notEqual(parsed.startInventory, value.startInventory);
+  assert.notEqual((parsed.startInventory as Record<string, unknown>).nodes, (value.startInventory as Record<string, unknown>).nodes);
+  assert.equal(parsed.version, 5);
+});
+
+test("rejects v5 non-adopt-only shape and malformed inventory commitments", async () => {
+  const { parseStorageJournal } = await loadCodec();
+  const valid = migrationJournalV5();
+  const inventory = valid.startInventory as Record<string, unknown>;
+  const nodes = inventory.nodes as Array<Record<string, unknown>>;
+  const invalid: unknown[] = [
+    { ...valid, unexpected: true },
+    { ...valid, nextSourcesTree: otherDigest },
+    { ...valid, token: expectedV5.token.toUpperCase() },
+    { ...valid, stableSourcesTreeNext: otherDigest },
+    { ...valid, operations: [{ itemId: idOne }] },
+    { ...valid, ownedDirectories: [{ path: "sources", stage: "next-sources", dev: "1", ino: "2" }] },
+    { ...valid, startInventory: { ...inventory, hash: digest } },
+    { ...valid, startInventory: { ...inventory, nodes: [...nodes, nodes[1]] } },
+    { ...valid, startInventory: { ...inventory, nodes: [nodes[0], { ...nodes[1], extra: true }] } },
+    (() => { const candidate = migrationJournalV5(); Object.defineProperty(candidate, "mode", { enumerable: true, get: () => "legacy-migration" }); return candidate; })(),
+    (() => { const candidate = v5Inventory(); Object.defineProperty(candidate, Symbol("unexpected"), { value: true }); return { ...valid, startInventory: candidate }; })(),
+    { ...valid, startInventory: { ...inventory, nodes: [...nodes].reverse() } },
+    { ...valid, startInventory: { ...inventory, nodes: [nodes[0], { ...nodes[1], path: "items/../escape" }] } },
+    { ...valid, startInventory: { ...inventory, nodes: [nodes[0], { ...nodes[1], ino: "18446744073709551616" }] } },
+  ];
+  for (const value of invalid) assert.throws(() => parseStorageJournal(value, expectedV5));
 });
 
 test("stops safely on a v4 recovery journal until the dedicated kernel is implemented", async () => {

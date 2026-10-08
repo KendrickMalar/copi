@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
+import { types as utilTypes } from "node:util";
 import type { Catalog, LegacyCatalog, SavedItem } from "./types.ts";
 
 export interface LegacyStorageJournal {
@@ -34,6 +36,38 @@ export interface CatalogOnlyStorageJournal {
   operations: [];
 }
 
+export interface MigrationInventoryNode {
+  path: string;
+  kind: "file" | "directory";
+  mode: number;
+  dev: string;
+  ino: string;
+  bytesHash: string;
+}
+
+export interface MigrationStartInventory {
+  version: 1;
+  nodes: MigrationInventoryNode[];
+  hash: string;
+}
+
+export interface LegacyMigrationStorageJournalV5 {
+  version: 5;
+  mode: "legacy-migration";
+  root: string;
+  token: string;
+  oldCatalog: string;
+  newCatalog: string;
+  stableItemsTree: string;
+  stableSourcesTree: string;
+  stableSourcesTreeNext: string;
+  backupDir: string;
+  backupManifest: string;
+  operations: [];
+  ownedDirectories: [];
+  startInventory: MigrationStartInventory;
+}
+
 export interface LegacyMigrationStorageJournal {
   version: 4;
   mode: "legacy-migration";
@@ -51,9 +85,10 @@ export interface LegacyMigrationStorageJournal {
   nextSourcesTree?: string;
 }
 
-export type StorageJournal = LegacyStorageJournal | SourcesStorageJournal | CatalogOnlyStorageJournal | LegacyMigrationStorageJournal;
+export type StorageJournal = LegacyStorageJournal | SourcesStorageJournal | CatalogOnlyStorageJournal | LegacyMigrationStorageJournal | LegacyMigrationStorageJournalV5;
 
 const itemPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const lowercaseUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const excludedNames = new Set([
   ".git", ".cache", ".npm", "auth", "node_modules", "cache", "caches", "history", "sessions",
@@ -142,6 +177,159 @@ function assertNoTargetOverlap(targets: readonly string[]): void {
       }
     }
   }
+}
+
+function hasStrictExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  if (utilTypes.isProxy(value)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(value) as unknown;
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const ownKeys = Reflect.ownKeys(value);
+    if (ownKeys.length !== keys.length || ownKeys.some((key) => typeof key !== "string" || !keys.includes(key))) return false;
+    return keys.every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor !== undefined && Object.hasOwn(descriptor, "value") && descriptor.enumerable === true;
+    });
+  } catch { return false; }
+}
+
+function isStrictDenseArray(value: unknown): value is unknown[] {
+  if (utilTypes.isProxy(value) || !Array.isArray(value)) return false;
+  try {
+    const ownKeys = Reflect.ownKeys(value);
+    const length = Object.getOwnPropertyDescriptor(value, "length");
+    if (!length || !Object.hasOwn(length, "value") || length.enumerable !== false ||
+        typeof length.value !== "number" || !Number.isSafeInteger(length.value) || length.value < 0 ||
+        ownKeys.length !== length.value + 1) return false;
+    for (let index = 0; index < length.value; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true) return false;
+    }
+    return ownKeys.every((key) => key === "length" || typeof key === "string" &&
+      Number.isSafeInteger(Number(key)) && String(Number(key)) === key && Number(key) >= 0 && Number(key) < length.value);
+  } catch { return false; }
+}
+
+function isCanonicalRelativePath(value: unknown): value is string {
+  if (typeof value !== "string" || value.includes("\\") || value.includes("\0") || path.posix.isAbsolute(value) ||
+      Buffer.from(value, "utf8").toString("utf8") !== value) return false;
+  if (value === ".") return true;
+  return value.length > 0 && path.posix.normalize(value) === value &&
+    value.split("/").every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isRecord(value)) {
+    const keys = Object.keys(value).sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new Error("V5 canonical JSON cannot encode an undefined value.");
+  return encoded;
+}
+
+export function canonicalStorageJournalJson(value: unknown): string {
+  return canonicalJson(value);
+}
+
+function inventoryHash(nodes: readonly MigrationInventoryNode[]): string {
+  return createHash("sha256").update("copi-inventory-v1\0", "utf8").update(canonicalJson(nodes), "utf8").digest("hex");
+}
+
+function validateStartInventory(value: unknown): MigrationStartInventory {
+  if (!isRecord(value) || !hasStrictExactKeys(value, ["version", "nodes", "hash"]) || value.version !== 1 ||
+      !isStrictDenseArray(value.nodes) || !isSha256(value.hash)) {
+    throw new Error("Invalid v5 start inventory envelope.");
+  }
+  const nodes: MigrationInventoryNode[] = [];
+  const seenPaths = new Set<string>();
+  const seenIdentities = new Set<string>();
+  let previousPath: string | undefined;
+  for (const node of value.nodes) {
+    if (!isRecord(node) || !hasStrictExactKeys(node, ["path", "kind", "mode", "dev", "ino", "bytesHash"]) ||
+        !isCanonicalRelativePath(node.path) || (node.kind !== "file" && node.kind !== "directory") ||
+        typeof node.mode !== "number" || !Number.isInteger(node.mode) || node.mode < 0 || node.mode > 0o7777 ||
+        !isUint64Decimal(node.dev) || !isUint64Decimal(node.ino) || !isSha256(node.bytesHash)) {
+      throw new Error("Invalid v5 inventory node.");
+    }
+    if (previousPath !== undefined && Buffer.compare(Buffer.from(previousPath), Buffer.from(node.path)) >= 0) {
+      throw new Error("V5 inventory nodes must be uniquely ordered by UTF-8 path bytes.");
+    }
+    if (seenPaths.has(node.path)) throw new Error("Duplicate path in v5 start inventory.");
+    const identity = `${node.dev}:${node.ino}`;
+    if (seenIdentities.has(identity)) throw new Error("V5 start inventory contains an unsafe hardlink alias.");
+    seenPaths.add(node.path);
+    seenIdentities.add(identity);
+    previousPath = node.path;
+    nodes.push({ path: node.path, kind: node.kind, mode: node.mode, dev: node.dev, ino: node.ino, bytesHash: node.bytesHash });
+  }
+  const byPath = new Map(nodes.map((node) => [node.path, node]));
+  const rootNode = byPath.get(".");
+  if (!rootNode || rootNode.kind !== "directory") throw new Error("V5 start inventory must include its root directory.");
+  const children = new Map<string, Array<[string, "file" | "directory"]>>();
+  for (const node of nodes) {
+    if (node.path === ".") continue;
+    const parent = path.posix.dirname(node.path);
+    const parentNode = byPath.get(parent);
+    if (!parentNode || parentNode.kind !== "directory") throw new Error("V5 inventory node has no recorded directory parent.");
+    const list = children.get(parent) ?? [];
+    list.push([path.posix.basename(node.path), node.kind]);
+    children.set(parent, list);
+  }
+  for (const node of nodes) {
+    if (node.kind !== "directory") continue;
+    const listing = children.get(node.path) ?? [];
+    listing.sort(([left], [right]) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+    const expectedHash = createHash("sha256").update("copi-directory-v1\0", "utf8")
+      .update(canonicalJson(listing), "utf8").digest("hex");
+    if (node.bytesHash !== expectedHash) throw new Error(`V5 directory listing commitment is invalid for ${node.path}.`);
+  }
+  if (value.hash !== inventoryHash(nodes)) throw new Error("V5 start inventory hash does not match its canonical nodes.");
+  return { version: 1, nodes, hash: value.hash };
+}
+
+export function parseMigrationStartInventory(value: unknown): MigrationStartInventory {
+  return validateStartInventory(value);
+}
+
+function parseLegacyMigrationJournalV5(value: Record<string, unknown>, expected: { root: string; token: string }): LegacyMigrationStorageJournalV5 {
+  const keys = [
+    "version", "mode", "root", "token", "oldCatalog", "newCatalog", "stableItemsTree", "stableSourcesTree",
+    "stableSourcesTreeNext", "backupDir", "backupManifest", "operations", "ownedDirectories", "startInventory",
+  ];
+  if (!hasStrictExactKeys(value, keys) || value.mode !== "legacy-migration" || !isStrictDenseArray(value.operations) ||
+      value.operations.length !== 0 || !isStrictDenseArray(value.ownedDirectories) || value.ownedDirectories.length !== 0) {
+    throw new Error("Invalid v5 adopt-only legacy-migration journal object.");
+  }
+  assertCommonJournal(value, expected);
+  if (value.oldCatalog === null || !lowercaseUuidPattern.test(value.token) ||
+      !isStableItemsCommitment(value.stableItemsTree) || !isStableSourcesCommitment(value.stableSourcesTree) ||
+      value.stableSourcesTreeNext !== value.stableSourcesTree || !isMigrationBackupDir(value.backupDir) ||
+      !isSha256(value.backupManifest) || !path.isAbsolute(value.root) || path.resolve(value.root) !== value.root) {
+    throw new Error("Invalid v5 catalog, root, token, tree, or backup commitment.");
+  }
+  const startInventory = validateStartInventory(value.startInventory);
+  const catalog = startInventory.nodes.find((node) => node.path === "catalog.json");
+  if (!catalog || catalog.kind !== "file" || catalog.bytesHash !== value.oldCatalog) {
+    throw new Error("V5 start inventory catalog proof does not match the old catalog commitment.");
+  }
+  return {
+    version: 5,
+    mode: "legacy-migration",
+    root: value.root,
+    token: value.token,
+    oldCatalog: value.oldCatalog,
+    newCatalog: value.newCatalog,
+    stableItemsTree: value.stableItemsTree,
+    stableSourcesTree: value.stableSourcesTree,
+    stableSourcesTreeNext: value.stableSourcesTreeNext,
+    backupDir: value.backupDir,
+    backupManifest: value.backupManifest,
+    operations: [],
+    ownedDirectories: [],
+    startInventory,
+  };
 }
 
 function parseLegacyMigrationJournal(value: Record<string, unknown>, expected: { root: string; token: string }): LegacyMigrationStorageJournal {
@@ -244,9 +432,10 @@ function parseLegacyMigrationJournal(value: Record<string, unknown>, expected: {
 
 export function parseStorageJournal(value: unknown, expected: { root: string; token: string }): StorageJournal {
   if (!isRecord(value) ||
-      (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4)) {
+      (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4 && value.version !== 5)) {
     throw new Error("Unsupported or invalid storage journal version.");
   }
+  if (value.version === 5) return parseLegacyMigrationJournalV5(value, expected);
   if (value.version === 4) return parseLegacyMigrationJournal(value, expected);
   if (value.version === 3) {
     const catalogOnlyKeys = [
@@ -409,8 +598,8 @@ function assertCatalogItems(catalog: Catalog, label: string): Map<string, SavedI
   return items;
 }
 
-export function validateLegacyMigrationJournalTargets(journal: LegacyMigrationStorageJournal, previous: LegacyCatalog, next: Catalog): void {
-  if (!journal || journal.version !== 4 || journal.mode !== "legacy-migration" || journal.oldCatalog === null ||
+export function validateLegacyMigrationJournalTargets(journal: LegacyMigrationStorageJournal | LegacyMigrationStorageJournalV5, previous: LegacyCatalog, next: Catalog): void {
+  if (!journal || (journal.version !== 4 && journal.version !== 5) || journal.mode !== "legacy-migration" || journal.oldCatalog === null ||
       !Array.isArray(journal.operations) || !previous || previous.version !== 1 || !Array.isArray(previous.items) ||
       !Array.isArray(previous.groups) || !next || next.version !== 2 || !Array.isArray(next.groups)) {
     throw new Error("Legacy migration target validation requires its fixed v4 journal, v1 catalog, and v2 catalog.");

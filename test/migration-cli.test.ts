@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { main } from "../src/cli.ts";
@@ -9,8 +10,27 @@ import {
   type MigrationCommandApi,
   type MigrationCommandRuntime,
 } from "../src/migrate.ts";
+import { createLegacyLibrary, makeLegacyItem, treeSnapshot, writeBytes, writeLegacyCatalog, writeLegacySnapshot } from "./helpers/legacy-library.ts";
 
 const secretPaths = ["credential.txt", "skill/private.env"];
+
+async function interruptMigrationAtCatalogSwitch(root: string): Promise<void> {
+  const migrationUrl = new URL("../src/migration.js", import.meta.url).href;
+  const transactionUrl = new URL("../src/storage-transaction.js", import.meta.url).href;
+  const script = `
+    const transaction = await import(${JSON.stringify(transactionUrl)});
+    Object.defineProperty(transaction.storageTransactions, "run", { configurable: true, value: (root, create, operation) =>
+      new transaction.StorageTransactions({ checkpoint: (point) => { if (point === "catalog-renamed") process.kill(process.pid, "SIGKILL"); } })
+        .run(root, create, operation) });
+    const migration = await import(${JSON.stringify(migrationUrl)});
+    const plan = await migration.prepareMigration(process.argv[1]);
+    const view = migration.readMigration(plan);
+    if (view.status !== "ready") throw new Error("migration fixture was not ready: " + JSON.stringify(view.conflicts));
+    await migration.commitMigration(plan, { reviewId: view.reviewId, confirmed: true, approvedSensitivePaths: [...view.sensitivePaths] });
+  `;
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", script, root], { encoding: "utf8", timeout: 30_000 });
+  assert.equal(child.signal, "SIGKILL", child.stderr);
+}
 
 function readyViews() {
   return {
@@ -216,4 +236,42 @@ test("main dispatches migrate, rejects mixed help/unknown flags, and help docume
   assert.match(help.stdout, /copi migrate --resolve/);
   assert.match(help.stdout, /never falls back to ordinary migration/);
   assert.match(help.stdout, /v4 journals lack[\s\S]*start inventory/);
+});
+
+test("resolution dry-run reaches the integrated API on a real interrupted synthetic migration without writes", async () => {
+  const fixture = await createLegacyLibrary();
+  try {
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("original source bytes\n"), 0o640);
+    await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    await interruptMigrationAtCatalogSwitch(fixture.root);
+    await writeFile(sourcePath, Buffer.from("ordinary user edit retained\n"));
+
+    const before = await treeSnapshot(fixture.root);
+    const output: string[] = [];
+    const result = await runMigrateCommand(["--resolve", "--dry-run"], fixture.root, {
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      write: (text) => output.push(text),
+    });
+
+    assert.equal(result, 0);
+    assert.match(output.join(""), /Migration resolution: ready/);
+    assert.match(output.join(""), /ordinary user edit retained/);
+    assert.equal(output.join("").includes("Legacy migration:"), false);
+    assert.equal(await treeSnapshot(fixture.root), before, "the real API dry-run must be strictly read-only");
+  } finally { await fixture.dispose(); }
+});
+
+test("README documents the resolution operation limits and approval boundaries", async () => {
+  const readme = await readFile(path.resolve("README.md"), "utf8");
+  assert.match(readme, /Do not hand-edit or remove internal migration-management files/);
+  assert.match(readme, /stage\/journal rehash is a known LIMIT/);
+  assert.ok(readme.includes("`privateRevisionHash` is checked only against a same-process issued plan at commit"));
+  assert.match(readme, /claim-absent\/record-present window/);
+  assert.match(readme, /fresh review and new generation with fresh/);
+  assert.match(readme, /per-sensitive-path, and final approvals/);
+  assert.match(readme, /v4 journals do not have the start inventory/);
+  assert.match(readme, /not general history or a restore feature/);
+  assert.match(readme, /Migration \(M\) and items deletion \(D\) each require separate approval/);
 });

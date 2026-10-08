@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, readdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { commitMigration, prepareMigration, readMigration, type PreparedMigration } from "../src/migration.ts";
 import type { ChangeApproval } from "../src/resource-mutations.ts";
 import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup } from "../src/migration-backup.ts";
+import { scanMigrationInventory } from "../src/migration-inventory.ts";
+import { canonicalStorageJournalJson } from "../src/storage-journal.ts";
 import { prepareLegacyMigrationReview, storageTransactions, StorageTransactions, type LegacyMigrationReview, type StorageSession } from "../src/storage-transaction.ts";
 import {
   createLegacyLibrary,
@@ -94,6 +96,7 @@ async function legacyReviewRequest(
   const catalogStat = await lstat(path.join(root, "catalog.json"), { bigint: true });
   return {
     root,
+    startInventory: await scanMigrationInventory(root),
     oldCatalogBytes: Buffer.from(oldCatalogBytes),
     oldCatalogIdentity: `${catalogStat.dev}:${catalogStat.ino}`,
     catalogBytes: Buffer.from(`${JSON.stringify(nextCatalog, null, 2)}\n`),
@@ -112,6 +115,47 @@ function approvalFor(plan: PreparedMigration): ChangeApproval {
   const view = readMigration(plan);
   return { reviewId: plan.reviewId, confirmed: true, approvedSensitivePaths: [...view.sensitivePaths] };
 }
+
+test("writes a canonical v5 journal containing the complete read-only migration-start inventory", async () => {
+  const fixture = await createLegacyLibrary();
+  let rawJournal: string | undefined;
+  let journal: Record<string, unknown> | undefined;
+  try {
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("fixed source\n"), 0o644);
+    await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    await mkdir(path.join(fixture.root, "items", "empty-inventory-directory"), { mode: 0o711 });
+    await writeBytes(fixture.root, "root-unregistered-inventory.txt", Buffer.from("must stay committed\n"), 0o640);
+    const plan = await prepareMigration(fixture.root);
+    Object.defineProperty(storageTransactions, "run", {
+      configurable: true,
+      value: <T>(root: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>) =>
+        new StorageTransactions({ checkpoint: async (point) => {
+          if (point === "journal") {
+            rawJournal = await readFile(path.join(root, ".copi-transaction", "journal.json"), "utf8");
+            journal = JSON.parse(rawJournal) as Record<string, unknown>;
+          }
+        } }).run(root, create, operation),
+    });
+    try {
+      await commitMigration(plan, approvalFor(plan));
+    } finally { Reflect.deleteProperty(storageTransactions, "run"); }
+    assert.ok(rawJournal);
+    assert.ok(journal);
+    assert.equal(journal.version, 5);
+    assert.equal(rawJournal, canonicalStorageJournalJson(journal));
+    const inventory = journal.startInventory as { hash: string; nodes: Array<{ path: string; kind: string }> };
+    const paths = inventory.nodes.map((node) => node.path);
+    assert.ok(paths.includes("."));
+    assert.ok(paths.includes("catalog.json"));
+    assert.ok(paths.includes("items/empty-inventory-directory"));
+    assert.ok(paths.includes("root-unregistered-inventory.txt"));
+    assert.ok(inventory.hash.length === 64);
+  } finally {
+    Reflect.deleteProperty(storageTransactions, "run");
+    await fixture.dispose();
+  }
+});
 
 test("adopts only existing sources, preserves source custody, and keeps a verified permanent backup", async () => {
   const fixture = await createLegacyLibrary();
@@ -471,6 +515,36 @@ test("stops and preserves the journal when an unrelated root entry changes after
     assert.deepEqual(await readFile(path.join(fixture.root, "unreviewed-root-entry.bin")), Buffer.from("preserve this unrelated entry\n"));
     assert.ok((await readdir(path.join(fixture.root, ".copi-transaction"))).includes("journal.json"));
     assert.ok((await readdir(fixture.root)).includes(".migration-backups"));
+    const catalog = JSON.parse(await readFile(path.join(fixture.root, "catalog.json"), "utf8")) as { version: number };
+    assert.equal(catalog.version, 2);
+  } finally {
+    Reflect.deleteProperty(storageTransactions, "run");
+    await fixture.dispose();
+  }
+});
+
+test("preserves and blocks a new backup sibling outside the journal-owned UUID", async () => {
+  const fixture = await createLegacyLibrary();
+  const siblingPath = ".migration-backups/123e4567-e89b-42d3-a456-426614174001/unowned.bin";
+  const siblingBytes = Buffer.from("unknown backup sibling must be preserved\n");
+  try {
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("reviewed source\n"), 0o755);
+    await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    const plan = await prepareMigration(fixture.root);
+    Object.defineProperty(storageTransactions, "run", {
+      configurable: true,
+      value: <T>(root: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>) =>
+        new StorageTransactions({ checkpoint: async (point) => {
+          if (point === "catalog-renamed") await writeBytes(root, siblingPath, siblingBytes, 0o600);
+        } }).run(root, create, operation),
+    });
+    try {
+      await assert.rejects(commitMigration(plan, approvalFor(plan)), /outside|changed|preserv|recovery/i);
+    } finally { Reflect.deleteProperty(storageTransactions, "run"); }
+
+    assert.deepEqual(await readFile(path.join(fixture.root, siblingPath)), siblingBytes);
+    assert.ok((await readdir(path.join(fixture.root, ".copi-transaction"))).includes("journal.json"));
     const catalog = JSON.parse(await readFile(path.join(fixture.root, "catalog.json"), "utf8")) as { version: number };
     assert.equal(catalog.version, 2);
   } finally {
