@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { listSnapshots, loadCatalog } from "./catalog.ts";
 import { printGroups, printItems, runApplyDryRun, runApplyWizard, runGroupManager, runSetup, safeDisplay } from "./wizard.ts";
 import { runManage } from "./manage.ts";
+import { runMigrateCommand, type MigrationCommandRuntime } from "./migrate.ts";
 
 function usage(): void {
   process.stdout.write(`copi — copy and organize reusable Pi coding-agent resources
@@ -16,6 +17,8 @@ Usage:
   copi list
   copi apply <group> [target]
   copi apply <group> [target] --dry-run
+  copi migrate [--dry-run]
+  copi migrate --resolve [--dry-run]
   copi help
 
 Commands:
@@ -25,6 +28,9 @@ Commands:
   list               List saved snapshots without modifying the library
   apply <group>      Review and apply one group to the current directory or target
   apply --dry-run    Show the masked plan without changing project files
+  migrate            Review and migrate an eligible legacy library (TTY required)
+  migrate --dry-run  Show a read-only masked legacy migration review
+  migrate --resolve  Confirm resolution of eligible post-switch migration leftovers
   help               Show this help
 
 Manage requires an interactive stdin/stdout TTY; UUID input is not required.
@@ -49,6 +55,22 @@ is provided. Private saved files are 0600; apply reproduces the original source 
 File addition, deletion and internal rename through text editing, and applying
 global settings, are outside scope.
 
+Migration dry-runs are read-only and may run without a TTY. Mutating migration and
+resolution require both stdin and stdout to be a TTY; every confirmation defaults to no.
+Resolution first shows the complete masked diff, then asks about each sensitive path,
+then asks for a final confirmation. --resolve never falls back to ordinary migration.
+There is no --yes option. Cancellation, blocked
+reviews, invalid flags and non-TTY mutation exit with status 1. If an ordinary migration
+stops on an internal lock, use copi migrate --resolve --dry-run; never remove a lock by hand.
+
+Resolution only confirms eligible adopted-source edits and cleans up owned migration
+artifacts. A v4 journal has no start inventory, so it stays on the existing recovery/
+hold-stop path. It does not rewrite catalog, sources or items, distribute resources, or delete
+items. Do not use an older copi binary while resolution artifacts remain. v4 journals lack
+the start inventory required for this procedure and remain on the existing hold-stop path.
+A migration backup is not general history or a restore feature. Migration, items deletion,
+main integration and publishing require separate approval.
+
 Interactive changes require a TTY. Setup searches only locations explicitly selected
 and confirmed in the wizard. Directories named auth are excluded entirely; copied
 authentication-specific code may be missing from copied resources. Named authentication files and .env* paths,
@@ -66,11 +88,20 @@ function isInteractive(): boolean {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY);
 }
 
-export async function main(args = process.argv.slice(2), environment = process.env, cwd = process.cwd()): Promise<number> {
+export async function main(
+  args = process.argv.slice(2),
+  environment = process.env,
+  cwd = process.cwd(),
+  migrationRuntime: MigrationCommandRuntime = {},
+): Promise<number> {
   const [command, ...rest] = args;
   if (!command || command === "help" || command === "--help" || command === "-h") {
     usage();
     return 0;
+  }
+  if (command === "migrate" && (rest.includes("--help") || rest.includes("-h"))) {
+    if (rest.length === 1) { usage(); return 0; }
+    throw new Error("Usage: copi migrate [--dry-run] | copi migrate --resolve [--dry-run].");
   }
   if (rest.includes("--help") || rest.includes("-h")) {
     usage();
@@ -84,6 +115,7 @@ export async function main(args = process.argv.slice(2), environment = process.e
     : path.join(homeDir || requireHome(environment), ".pi", "agent");
   const projectDir = path.resolve(cwd);
 
+  if (command === "migrate") return runMigrateCommand(rest, libraryDir, migrationRuntime);
   if (command === "manage") {
     if (rest.length > 0) throw new Error("manage does not accept positional arguments.");
     if (!isInteractive()) throw new Error("manage requires an interactive stdin/stdout TTY; no library was created or searched.");

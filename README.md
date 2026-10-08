@@ -21,6 +21,8 @@ copi groups
 copi list
 copi apply <group> [target]
 copi apply <group> [target] --dry-run
+copi migrate [--dry-run]
+copi migrate --resolve [--dry-run]
 copi help
 ```
 
@@ -31,6 +33,14 @@ copi help
 Resource display names and group names are each unique across the library, in separate namespaces. Comparison uses `trim → NFKC → Unicode 17.0.0 default full case folding → NFKC` (not locale-specific); display names and body text are not automatically normalized or rewritten. For example, `Ａ` and `a`, or `Straße` and `STRASSE`, conflict within one namespace. Legacy duplicate catalogs remain readable: use **Resolve name conflicts** to rename them manually. Until resolved, only listing, masked viewing and conflict resolution are allowed; no automatic renaming occurs.
 
 `groups` lists groups in a non-interactive terminal; group changes require a TTY and are saved only after confirmation. `list` is read-only. `apply --dry-run` prints the planned paths, masked text diffs, and warnings without changing the target. A real apply requires a TTY and confirmation.
+
+`migrate --dry-run` and `migrate --resolve --dry-run` are read-only and may run without a TTY. A mutating `migrate` or `migrate --resolve` requires both stdin and stdout to be a TTY. Reviews print the complete masked diff, then ask for whole-review approval (default no), a separate default-no approval for each sensitive path, and a final default-no confirmation. There is no `--yes` flag. Refusal, EOF, Ctrl-C, blocked state, usage errors, and non-TTY mutation exit with status 1; ready dry-runs, successful operations and a resolution that is not needed exit with status 0.
+
+Ordinary `migrate` adopts only eligible existing `sources` content and keeps a verified backup. If an internal migration lock or resolution record blocks it, the CLI points to `migrate --resolve --dry-run`; do not manually remove internal locks. Resolution is limited to eligible post-switch adopted-source edits: it confirms the reviewed edit, preserves source bytes, retains the verified backup, and removes only owned internal migration leftovers. `migrate --resolve` never falls back to ordinary migration. It does not rewrite the catalog, sources or items, distribute resources, or delete items. A blocked review stops while preserving edits and remaining artifacts; a new review may be needed after a cleanup interruption. Never use an older `copi` binary while resolution artifacts remain. v4 journals do not have the start inventory required for this procedure and remain on the existing recovery/hold-stop path. A migration backup is not general history or a restore feature. Migration, item deletion, main integration and publishing require separate approval. Migration (M) and items deletion (D) each require separate approval from one another.
+
+Do not hand-edit or remove internal migration-management files: `.copi-transaction` stage/journal files, `.copi-transaction-recovery` claims, or `.copi-migration-resolution.json`. A stage/journal rehash is a known LIMIT, not proof of authorization or custody; same-user manual changes to these internal files and manual edits to a completed resolution record are outside the protection boundary. `privateRevisionHash` is checked only against a same-process issued plan at commit; it is not a durable authentication key. The claim-absent/record-present window after claim removal and before completed-record unlink remains unsafe for older binaries; do not run one until all resolution artifacts are gone.
+
+If ordinary source edits occur during interrupted cleanup, recovery can hold-stop and preserve them. When a further pass is eligible, it requires a fresh review and new generation with fresh whole-review, per-sensitive-path, and final approvals; never replay an earlier approval. Out-of-scope changes remain held rather than overwritten.
 
 Groups contain resource IDs, not merged documents. The same saved resource may belong to multiple groups. Import and apply copy files byte-for-byte; they do not automatically split, rewrite, merge, or run resource contents. It does not install dependencies or apply global-only resources to a project. Review every proposed change.
 
