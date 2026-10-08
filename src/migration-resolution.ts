@@ -253,6 +253,64 @@ function parseEncodedFile(value: unknown): EncodedFileProof {
   if (file.bytesHash !== value.rawHash) throw new Error("Migration resolution source file proof does not match its raw bytes.");
   return { rawBase64: value.rawBase64, rawHash: value.rawHash, file };
 }
+function parseBackupInventory(value: unknown, backupDir: string): MigrationStartInventory {
+  if (!exactKeys(value, ["version", "nodes", "hash"]) || value.version !== 1 || !denseArray(value.nodes) ||
+      typeof value.hash !== "string" || !sha256Pattern.test(value.hash)) throw new Error("Invalid migration resolution backup inventory envelope.");
+  const nodes: MigrationInventoryNode[] = [];
+  const seenPaths = new Set<string>();
+  const seenIdentities = new Set<string>();
+  let previousPath: string | undefined;
+  for (const entry of value.nodes) {
+    if (!exactKeys(entry, ["path", "kind", "mode", "dev", "ino", "bytesHash"]) || !validPath(entry.path) ||
+        (entry.kind !== "file" && entry.kind !== "directory") || typeof entry.mode !== "number" || !Number.isInteger(entry.mode) ||
+        entry.mode < 0 || entry.mode > 0o7777 || !validU64(entry.dev) || !validU64(entry.ino) ||
+        typeof entry.bytesHash !== "string" || !sha256Pattern.test(entry.bytesHash) ||
+        (entry.path !== ".migration-backups" && entry.path !== backupDir && !entry.path.startsWith(`${backupDir}/`))) {
+      throw new Error("Invalid or out-of-scope migration resolution backup inventory node.");
+    }
+    if (previousPath !== undefined && compareUtf8(previousPath, entry.path) >= 0) {
+      throw new Error("Migration resolution backup inventory nodes are not in canonical path order.");
+    }
+    const identity = `${entry.dev}:${entry.ino}`;
+    if (seenPaths.has(entry.path) || seenIdentities.has(identity)) throw new Error("Migration resolution backup inventory contains a duplicate path or hardlink identity.");
+    seenPaths.add(entry.path);
+    seenIdentities.add(identity);
+    previousPath = entry.path;
+    nodes.push({ path: entry.path, kind: entry.kind, mode: entry.mode, dev: entry.dev, ino: entry.ino, bytesHash: entry.bytesHash });
+  }
+  const byPath = new Map(nodes.map((node) => [node.path, node]));
+  const parent = byPath.get(".migration-backups");
+  const backupRoot = byPath.get(backupDir);
+  if (!parent || parent.kind !== "directory" || !backupRoot || backupRoot.kind !== "directory") {
+    throw new Error("Migration resolution backup inventory omits its rooted parent or owned UUID directory.");
+  }
+  const children = new Map<string, Array<[string, "file" | "directory"]>>();
+  for (const node of nodes) {
+    if (node.path === ".migration-backups") continue;
+    const parentPath = path.posix.dirname(node.path);
+    const parentNode = byPath.get(parentPath);
+    if (!parentNode || parentNode.kind !== "directory") throw new Error("Migration resolution backup inventory node has no recorded directory parent.");
+    const listing = children.get(parentPath) ?? [];
+    listing.push([path.posix.basename(node.path), node.kind]);
+    children.set(parentPath, listing);
+  }
+  for (const node of nodes) {
+    if (node.kind !== "directory") continue;
+    const listing = children.get(node.path) ?? [];
+    listing.sort(([left], [right]) => compareUtf8(left, right));
+    const expected = sha256(Buffer.concat([
+      Buffer.from("copi-directory-v1\0", "utf8"),
+      Buffer.from(canonicalJson(listing), "utf8"),
+    ]));
+    if (node.bytesHash !== expected) throw new Error(`Migration resolution backup directory listing commitment is invalid for ${node.path}.`);
+  }
+  const hash = sha256(Buffer.concat([
+    Buffer.from("copi-inventory-v1\0", "utf8"),
+    Buffer.from(canonicalJson(nodes), "utf8"),
+  ]));
+  if (value.hash !== hash) throw new Error("Migration resolution backup inventory hash does not match its canonical nodes.");
+  return { version: 1, nodes, hash };
+}
 function parseClaimOwner(value: unknown, expected: { root: string; token: string; resolutionId: string; journalRawHash: string }): ResolutionClaimOwnerV1 {
   if (!exactKeys(value, ["version", "mode", "root", "token", "resolutionId", "nonce", "host", "pid", "lock", "journalRawHash"]) ||
       value.version !== 1 || value.mode !== "legacy-migration-resolution-claim" || value.root !== expected.root || value.token !== expected.token ||
@@ -292,19 +350,8 @@ function parseRecord(value: unknown): ResolutionRecordV1 {
   };
   const claimBytes = Buffer.from(claim.ownerRawBase64, "base64");
   if (claimBytes.toString("base64") !== claim.ownerRawBase64 || sha256(claimBytes) !== claim.owner.bytesHash) throw new Error("Typed claim owner bytes do not match their fixed proof.");
-  const backupInventory = parseMigrationStartInventory(value.backupInventory);
+  const backupInventory = parseBackupInventory(value.backupInventory, value.backupDir as string);
   const approvedInventory = parseMigrationStartInventory(value.approvedInventory);
-  const backupRootName = path.posix.basename(value.backupDir as string);
-  const backupRootNode = inventoryNode(backupInventory, backupRootName);
-  const backupManifestNode = inventoryNode(backupInventory, `${backupRootName}/manifest.json`);
-  const backupParentNode = inventoryNode(backupInventory, ".");
-  const approvedBackupParent = inventoryNode(approvedInventory, ".migration-backups");
-  if (!backupParentNode || backupParentNode.kind !== "directory" || !backupRootNode || backupRootNode.kind !== "directory" ||
-      !backupManifestNode || backupManifestNode.kind !== "file" || backupManifestNode.bytesHash !== value.backupManifest ||
-      !approvedBackupParent || approvedBackupParent.kind !== "directory" || approvedBackupParent.dev !== backupParentNode.dev ||
-      approvedBackupParent.ino !== backupParentNode.ino || approvedBackupParent.mode !== backupParentNode.mode) {
-    throw new Error("Resolution record backup inventory omits the exact UUID tree or backup-parent identity.");
-  }
   const sensitivePaths = value.sensitivePaths as string[];
   if (sensitivePaths.some((entry, index) => !entry || entry.includes("\\") || entry.includes("\0") ||
       (index > 0 && compareUtf8(sensitivePaths[index - 1]!, entry) >= 0))) throw new Error("Migration resolution sensitive paths are not a canonical unique set.");
@@ -316,6 +363,30 @@ function parseRecord(value: unknown): ResolutionRecordV1 {
   if (journal.version !== 5 || raw.toString("utf8") !== canonicalStorageJournalJson(journal) || journal.oldCatalog !== value.oldCatalog ||
       journal.newCatalog !== value.newCatalog || journal.backupDir !== value.backupDir || journal.backupManifest !== value.backupManifest) {
     throw new Error("Resolution record does not retain its exact original canonical v5 journal authority.");
+  }
+  const backupDir = value.backupDir as string;
+  const backupRootNode = inventoryNode(backupInventory, backupDir);
+  const backupManifestNode = inventoryNode(backupInventory, `${backupDir}/manifest.json`);
+  const backupParentNode = inventoryNode(backupInventory, ".migration-backups");
+  const startBackupParent = inventoryNode(journal.startInventory, ".migration-backups");
+  const approvedBackupParent = inventoryNode(approvedInventory, ".migration-backups");
+  const expectedBackupParentHash = sha256(Buffer.concat([
+    Buffer.from("copi-directory-v1\0", "utf8"),
+    Buffer.from(canonicalJson([[path.posix.basename(backupDir), "directory"]]), "utf8"),
+  ]));
+  const backupInventoryIsScoped = backupInventory.nodes.every((node) => node.path === ".migration-backups" ||
+    node.path === backupDir || node.path.startsWith(`${backupDir}/`));
+  const approvedInventoryContainsBackup = approvedInventory.nodes.some((node) => node.path === backupDir || node.path.startsWith(`${backupDir}/`));
+  const baselineParentIsPreserved = startBackupParent !== undefined && startBackupParent.kind === "directory" &&
+    approvedBackupParent !== undefined && canonicalJson(approvedBackupParent) === canonicalJson(startBackupParent) &&
+    backupParentNode !== undefined && backupParentNode.kind === "directory" &&
+    approvedBackupParent.dev === backupParentNode.dev && approvedBackupParent.ino === backupParentNode.ino &&
+    approvedBackupParent.mode === backupParentNode.mode;
+  if (!backupInventoryIsScoped || approvedInventoryContainsBackup || !backupParentNode || backupParentNode.kind !== "directory" ||
+      backupParentNode.bytesHash !== expectedBackupParentHash || !backupRootNode || backupRootNode.kind !== "directory" ||
+      !backupManifestNode || backupManifestNode.kind !== "file" || backupManifestNode.bytesHash !== value.backupManifest ||
+      (startBackupParent ? !baselineParentIsPreserved : approvedBackupParent !== undefined)) {
+    throw new Error("Resolution record does not separate the root-relative owned backup inventory from the approved payload inventory.");
   }
   const ownerBytes = Buffer.from(originalOwner.rawBase64, "base64");
   const ownerValue = parseOwner(JSON.parse(ownerBytes.toString("utf8")) as unknown, value.token);
@@ -551,6 +622,52 @@ function notNeeded(root: string, reviewId: string = randomUUID()): Analysis {
 function filteredInventory(inventory: MigrationStartInventory, excludedPrefixes: readonly string[], omitted: readonly string[] = []): MigrationStartInventory {
   return projectMigrationInventory(inventory, excludedPrefixes, omitted);
 }
+function backupPayloadExclusions(start: MigrationStartInventory, backupDir: string, extra: readonly string[] = []): string[] {
+  return [lockName, claimName, recordName, backupDir,
+    ...(!inventoryNode(start, ".migration-backups") ? [".migration-backups"] : []), ...extra];
+}
+function backupScopedInventory(inventory: MigrationStartInventory, backupDir: string): MigrationStartInventory {
+  const backupName = path.posix.basename(backupDir);
+  const keep = (nodePath: string): boolean => nodePath === "." || nodePath === backupName || nodePath.startsWith(`${backupName}/`);
+  const omitted = inventory.nodes.filter((node) => !keep(node.path)).map((node) => node.path);
+  const projected = filteredInventory(inventory, [], omitted);
+  const nodes = projected.nodes.map((node) => ({
+    ...node,
+    path: node.path === "." ? ".migration-backups" : `.migration-backups/${node.path}`,
+  }));
+  return {
+    version: 1,
+    nodes,
+    hash: sha256(Buffer.concat([
+      Buffer.from("copi-inventory-v1\0", "utf8"),
+      Buffer.from(canonicalJson(nodes), "utf8"),
+    ])),
+  };
+}
+function assertBackupParentListing(start: MigrationStartInventory, current: MigrationStartInventory, backupDir: string): void {
+  const parentPath = ".migration-backups";
+  const baselineParent = inventoryNode(start, parentPath);
+  const currentParent = inventoryNode(current, parentPath);
+  if (!currentParent || currentParent.kind !== "directory" ||
+      baselineParent && (baselineParent.kind !== "directory" || baselineParent.dev !== currentParent.dev ||
+        baselineParent.ino !== currentParent.ino || baselineParent.mode !== currentParent.mode)) {
+    throw new Error("Migration backup parent identity or mode changed from the fixed start inventory.");
+  }
+  const children = (inventory: MigrationStartInventory): string[] => inventory.nodes
+    .filter((node) => node.path !== parentPath && path.posix.dirname(node.path) === parentPath)
+    .map((node) => path.posix.basename(node.path)).sort(compareUtf8);
+  const baselineNames = children(start);
+  const ownedName = path.posix.basename(backupDir);
+  if (baselineNames.includes(ownedName)) throw new Error("Migration start inventory already contains the current backup UUID.");
+  const expectedNames = [...baselineNames, ownedName].sort(compareUtf8);
+  if (canonicalJson(children(current)) !== canonicalJson(expectedNames)) {
+    throw new Error("Migration backup parent listing differs from its start inventory plus the owned UUID.");
+  }
+}
+/**
+ * LIMIT: privateRevisionHash is durable commitment metadata, not authentication for a record read in a later process.
+ * The process-local prepared-plan revision is compared again during commit; manual edits to internal records remain outside this guarantee.
+ */
 function reviewCommitment(record: Omit<ResolutionRecordV1, "privateRevisionHash">, observedRecord: { rawHash: string; proof: FileProof } | null): string {
   const fixed = {
     root: record.root, token: record.token, journalRawHash: record.originalJournal.rawHash,
@@ -717,7 +834,9 @@ function originalCatalogFromBackup(root: string, journal: LegacyMigrationStorage
     return parsed;
   })();
 }
-async function validateBackup(root: string, journal: LegacyMigrationStorageJournalV5, start: MigrationStartInventory): Promise<MigrationStartInventory> {
+async function validateBackup(root: string, journal: LegacyMigrationStorageJournalV5, start: MigrationStartInventory,
+  currentInventory: MigrationStartInventory): Promise<MigrationStartInventory> {
+  assertBackupParentListing(start, currentInventory, journal.backupDir);
   const manifestPath = path.join(root, ...journal.backupDir.split("/"), "manifest.json");
   const loaded = await checkedFile(manifestPath);
   if (sha256(loaded.bytes) !== journal.backupManifest) throw new Error("Verified migration backup manifest hash changed.");
@@ -735,7 +854,14 @@ async function validateBackup(root: string, journal: LegacyMigrationStorageJourn
   }
   await verifyMigrationBackup({ libraryRoot: root, backupDir: journal.backupDir, manifestBytes: loaded.bytes,
     manifestSha256: journal.backupManifest, entries: manifest.entries.map(({ originalPath, sha256: digest, mode }) => ({ originalPath, sha256: digest, mode })) });
-  return await scanMigrationInventory(path.join(root, ".migration-backups"));
+  const namespace = await scanMigrationInventory(path.join(root, ".migration-backups"));
+  const scannedParent = inventoryNode(namespace, ".");
+  const currentParent = inventoryNode(currentInventory, ".migration-backups");
+  if (!scannedParent || scannedParent.kind !== "directory" || !currentParent || currentParent.kind !== "directory" ||
+      scannedParent.dev !== currentParent.dev || scannedParent.ino !== currentParent.ino || scannedParent.mode !== currentParent.mode) {
+    throw new Error("Migration backup parent identity changed while custody was being checked.");
+  }
+  return backupScopedInventory(namespace, journal.backupDir);
 }
 async function verifyStableTrees(inventory: MigrationStartInventory, journal: LegacyMigrationStorageJournalV5): Promise<void> {
   if (stableTreeHash(inventory, "items") !== journal.stableItemsTree || stableTreeHash(inventory, "sources") !== journal.stableSourcesTree ||
@@ -863,23 +989,16 @@ async function readInitialContext(root: string, reviewId: string): Promise<Analy
   await ownerIsDead(owner);
   const start = parseMigrationStartInventory(journal.startInventory);
   await verifyStableTrees(start, journal);
-  const backupInventory = await validateBackup(root, journal, start);
+  const currentInventory = await scanMigrationInventory(root, { excludedPrefixes: [lockName, claimName, recordName] });
+  const backupInventory = await validateBackup(root, journal, start, currentInventory);
   const oldCatalog = await originalCatalogFromBackup(root, journal);
   const { next, proof: currentCatalogProof } = await validateCatalogs(root, journal, oldCatalog);
-  const currentInventory = await scanMigrationInventory(root, { excludedPrefixes: [lockName, claimName, recordName] });
   const baselineLock = inventoryNode(start, lockName);
   const baselineClaim = inventoryNode(start, claimName);
   if (baselineLock || baselineClaim || inventoryNode(start, recordName)) throw new Error("Migration start inventory already contained a resolution or transaction control artifact.");
   const backupParent = inventoryNode(start, ".migration-backups");
   const hasBackupParent = !!backupParent;
-  const backupParentProof = inventoryNode(currentInventory, ".migration-backups");
-  if (!backupParentProof || backupParentProof.kind !== "directory") throw new Error("Migration backup parent is missing.");
-  const expectedBackupNames = (await readdir(path.join(root, ".migration-backups"))).sort(compareUtf8);
-  const baselineBackupNames = start.nodes.filter((node) => node.path !== ".migration-backups" && path.posix.dirname(node.path) === ".migration-backups")
-    .map((node) => path.posix.basename(node.path)).sort(compareUtf8);
-  const expectedBackupSet = [...baselineBackupNames, path.posix.basename(journal.backupDir)].sort(compareUtf8);
-  if (canonicalJson(expectedBackupNames) !== canonicalJson(expectedBackupSet)) throw new Error("Migration backup namespace contains an unowned sibling or missing baseline entry.");
-  const excluded = [lockName, claimName, recordName, journal.backupDir, ...(!hasBackupParent ? [".migration-backups"] : [])];
+  const excluded = backupPayloadExclusions(start, journal.backupDir);
   const classification = verifyAllowedPayloadChanges(root, start, currentInventory, oldCatalog, next, excluded);
   const projected = filteredInventory(currentInventory, excluded);
   const rootNames = (await readdir(root)).sort();
@@ -905,7 +1024,7 @@ async function readInitialContext(root: string, reviewId: string): Promise<Analy
     secrets: changes.sensitivePaths, artifacts: initial.slice(0, 6), record: null, claim: null }));
   return { root, status: "ready", reviewId, view, revision, journal, journalRaw: journalFile.bytes, owner, ownerRaw: ownerFile.bytes,
     ownerProof: ownerFile.proof, originalCatalog: oldCatalog, nextCatalog: next, currentCatalogProof, lockProof: lock,
-    backupInventory, approvedInventory: filteredInventory(currentInventory, [lockName, claimName, recordName]), cleanupArtifacts: initial.slice(0, 6), preservedPaths };
+    backupInventory, approvedInventory: filteredInventory(currentInventory, excluded), cleanupArtifacts: initial.slice(0, 6), preservedPaths };
 }
 async function readRecordedContext(root: string, reviewId: string, recordState: RecordFileState, tempPath?: string): Promise<Analysis> {
   const record = recordState.record;
@@ -942,19 +1061,17 @@ async function readRecordedContext(root: string, reviewId: string, recordState: 
   if (tempPath && temp !== tempPath) throw new Error("Resolution temp changed after review.");
   const start = parseMigrationStartInventory(journal.startInventory);
   const currentInventory = await scanMigrationInventory(root, { excludedPrefixes: [lockName, claimName, recordName, ...(temp ? [path.basename(temp)] : [])] });
-  const backupParentBaseline = inventoryNode(start, ".migration-backups");
-  const exclusions = [lockName, claimName, recordName, record.backupDir,
-    ...(!backupParentBaseline ? [".migration-backups"] : []), ...(temp ? [path.basename(temp)] : [])];
+  const exclusions = backupPayloadExclusions(start, record.backupDir, temp ? [path.basename(temp)] : []);
   const oldCatalog = await originalCatalogFromBackup(root, journal);
   const nextCatalogValue = await parseCurrentCatalog(root, record.currentCatalog);
   validateLegacyMigrationJournalTargets(journal, oldCatalog, nextCatalogValue);
   await verifyStableTreesFromBaseline(journal, start);
-  const backupInventory = await validateBackup(root, journal, start);
+  const backupInventory = await validateBackup(root, journal, start, currentInventory);
   if (!inventoryHashEqual(backupInventory, record.backupInventory)) throw new Error("Verified migration backup inventory differs from the durable resolution record.");
   const currentCatalog = await checkedFile(path.join(root, "catalog.json"));
   if (!compareCatalogIdentity(record.currentCatalog, currentCatalog.proof)) throw new Error("Current catalog bytes, mode, or inode changed after resolution review.");
   const classification = verifyAllowedPayloadChanges(root, start, currentInventory, oldCatalog, nextCatalogValue, exclusions);
-  const currentApproved = filteredInventory(currentInventory, [lockName, claimName, recordName, ...(temp ? [path.basename(temp)] : [])]);
+  const currentApproved = filteredInventory(currentInventory, exclusions);
   const needsGeneration = !inventoryHashEqual(currentApproved, record.approvedInventory);
   const progressIssue = await checkProgressArtifacts(root, record, recordState);
   if (progressIssue) throw new Error(progressIssue);
@@ -1178,20 +1295,19 @@ async function checkLiveRecord(root: string, recordState: RecordFileState): Prom
 async function verifyApprovedInventory(root: string, record: ResolutionRecordV1): Promise<void> {
   const temp = await checkTemps(root, { record, raw: recordBytes(record), proof: (await checkedFile(path.join(root, recordName))).proof });
   const current = await scanMigrationInventory(root, { excludedPrefixes: [lockName, claimName, recordName, ...(temp ? [path.basename(temp)] : [])] });
-  const actual = filteredInventory(current, [lockName, claimName, recordName, ...(temp ? [path.basename(temp)] : [])]);
-  if (!inventoryHashEqual(actual, record.approvedInventory)) throw new Error("The approved payload, catalog, backup, or outside inventory changed after resolution record installation.");
   const journal = parseStorageJournal(JSON.parse(Buffer.from(record.originalJournal.rawBase64, "base64").toString("utf8")) as unknown, { root, token: record.token });
   if (journal.version !== 5) throw new Error("Resolution record no longer has an original v5 journal.");
+  const start = parseMigrationStartInventory(journal.startInventory);
+  const exclusions = backupPayloadExclusions(start, record.backupDir, temp ? [path.basename(temp)] : []);
+  const actual = filteredInventory(current, exclusions);
+  if (!inventoryHashEqual(actual, record.approvedInventory)) throw new Error("The approved payload, catalog, or outside inventory changed after resolution record installation.");
   const catalog = await checkedFile(path.join(root, "catalog.json"));
   if (!compareCatalogIdentity(record.currentCatalog, catalog.proof)) throw new Error("Current v2 catalog differs from its durable resolution record.");
   const oldCatalog = await originalCatalogFromBackup(root, journal);
   const nextCatalog = parseStoredCatalog(JSON.parse(catalog.bytes.toString("utf8")) as unknown);
   if (nextCatalog.version !== 2) throw new Error("Resolution current catalog is no longer v2.");
-  const start = parseMigrationStartInventory(journal.startInventory);
-  const exclusions = [lockName, claimName, recordName, record.backupDir,
-    ...(!inventoryNode(start, ".migration-backups") ? [".migration-backups"] : []), ...(temp ? [path.basename(temp)] : [])];
   verifyAllowedPayloadChanges(root, start, current, oldCatalog, nextCatalog, exclusions);
-  const backupInventory = await validateBackup(root, journal, start);
+  const backupInventory = await validateBackup(root, journal, start, current);
   if (!inventoryHashEqual(backupInventory, record.backupInventory)) throw new Error("Permanent verified backup inventory changed during cleanup.");
 }
 async function removeAction(root: string, record: ResolutionRecordV1, index: number, allowMissing: boolean,
@@ -1374,8 +1490,11 @@ export async function commitMigrationResolution(plan: PreparedMigrationResolutio
     const artifacts = [...lockArtifacts, ...claimArtifacts(claim.directory, claim.owner)];
     const previousInventory = current.approvedInventory!;
     const currentAll = await scanMigrationInventory(state.root, { excludedPrefixes: [lockName, claimName, recordName] });
-    const approvedInventory = filteredInventory(currentAll, [lockName, claimName, recordName]);
-    if (!inventoryHashEqual(approvedInventory, previousInventory)) throw new Error("Migration payload or backup changed while the typed claim was installed.");
+    const startInventory = parseMigrationStartInventory(journal.startInventory);
+    const approvedInventory = filteredInventory(currentAll, backupPayloadExclusions(startInventory, journal.backupDir));
+    if (!inventoryHashEqual(approvedInventory, previousInventory)) throw new Error("Migration payload changed while the typed claim was installed.");
+    const verifiedBackup = await validateBackup(state.root, journal, startInventory, currentAll);
+    if (!inventoryHashEqual(verifiedBackup, current.backupInventory!)) throw new Error("Migration backup custody changed while the typed claim was installed.");
     const recordDraft: Omit<ResolutionRecordV1, "privateRevisionHash"> = {
       version: 1, mode: "legacy-migration-resolution", root: state.root, token: journal.token, resolutionId,
       generation: 1, predecessorHash: null,
