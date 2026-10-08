@@ -200,6 +200,38 @@ test("blocks a preview when the library root directory is replaced during the sc
   }
 });
 
+test("blocks a preview when a 1ms root replacement races with the canonical-root scan", async () => {
+  const statuses: string[] = [];
+  for (let run = 0; run < 20; run += 1) {
+    const parent = await mkdtemp(path.join(os.tmpdir(), "copi-preview-root-replaced-1ms-"));
+    const root = path.join(parent, "library");
+    const displaced = path.join(parent, "displaced-library");
+    await mkdir(root);
+    try {
+      const sourcePath = await writeBytes(root, "sources/current/AGENTS.md", Buffer.from("preview replacement probe\n"), 0o600);
+      await writeLegacyCatalog(root, [makeLegacyItem({ sourcePath })]);
+      await writeLegacySnapshot(root);
+      await Promise.all(Array.from({ length: 240 }, (_, index) =>
+        writeBytes(root, `sources/unregistered-${index}.txt`, Buffer.from(`unregistered ${index}\n`))));
+
+      let settled = false;
+      const preview = prepareMigration(root).then((prepared) => {
+        settled = true;
+        return readMigration(prepared);
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+      assert.equal(settled, false, "the root replacement must overlap the read-only preview");
+      await rename(root, displaced);
+      await cp(displaced, root, { recursive: true, preserveTimestamps: true });
+      statuses.push((await preview).status);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+
+  assert.deepEqual(statuses, Array.from({ length: 20 }, () => "blocked"));
+});
+
 test("prefers current sources while retaining mismatched legacy snapshots as separate backup inputs", async () => {
   await withLibrary(async (root) => {
     const currentBytes = Buffer.from("explicitly adopted current source bytes\\n");
