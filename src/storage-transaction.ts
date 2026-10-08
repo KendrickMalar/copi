@@ -10,6 +10,7 @@ import { readSourceContent } from "./source-content.ts";
 import { canonicalStorageJournalJson, parseMigrationStartInventory, parseStorageJournal, validateLegacyMigrationJournalTargets, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type LegacyMigrationStorageJournal, type LegacyMigrationStorageJournalV5, type MigrationStartInventory, type SourcesStorageJournal } from "./storage-journal.ts";
 import { projectMigrationInventory, scanMigrationInventory } from "./migration-inventory.ts";
 import { acquireRootLease } from "./storage-root-lease.ts";
+import { resumeCompletedMigrationResolution } from "./migration-resolution.ts";
 import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
@@ -1757,6 +1758,7 @@ export class StorageTransactions {
     if (!root) return operation(undefined);
     const rootLease = await acquireRootLease(root, this.options.waitMilliseconds ?? 5_000);
     try {
+    await resumeCompletedMigrationResolution(root, () => rootLease.assertCurrent());
     if (create) await chmod(root, 0o700);
     const lock = path.join(root, lockName);
     const owner: Owner = { version: 1, pid: process.pid, host: os.hostname(), token: randomUUID() };

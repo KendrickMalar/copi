@@ -6,6 +6,7 @@ import path from "node:path";
 const macOsExclusiveLock = 0x20;
 
 export interface StorageRootLease {
+  assertCurrent(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -52,8 +53,18 @@ export async function acquireRootLease(root: string, waitMilliseconds = 0): Prom
     if (canonical !== root || !sameRoot(before, opened) || !sameRoot(opened, after)) {
       throw new Error("Copi storage root identity changed while acquiring its O_EXLOCK lease.");
     }
+    const expectedRoot = opened;
     let closed = false;
     return {
+      async assertCurrent(): Promise<void> {
+        if (closed) throw new Error("Copi storage root O_EXLOCK lease is closed.");
+        const [currentHandle, currentPath, currentCanonical] = await Promise.all([
+          handle!.stat({ bigint: true }), lstat(root, { bigint: true }), realpath(root),
+        ]);
+        if (currentCanonical !== root || !sameRoot(expectedRoot, currentHandle) || !sameRoot(expectedRoot, currentPath)) {
+          throw new Error("Copi storage root identity changed while its O_EXLOCK lease was held.");
+        }
+      },
       async close(): Promise<void> {
         if (closed) return;
         closed = true;

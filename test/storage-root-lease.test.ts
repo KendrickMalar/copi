@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -87,6 +87,23 @@ test("StorageTransactions.run waits for a cooperating root lease and proceeds af
   } finally {
     releaseFirst();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("root lease detects replacement of the canonical root path while its descriptor is held", async () => {
+  const { acquireRootLease } = await import("../src/storage-root-lease.ts");
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-root-lease-identity-"));
+  const moved = `${root}.moved`;
+  const lease = await acquireRootLease(root);
+  try {
+    await lease.assertCurrent();
+    await rename(root, moved);
+    await mkdir(root, { mode: 0o700 });
+    await assert.rejects(lease.assertCurrent(), /identity changed/i);
+  } finally {
+    await lease.close();
+    await rm(root, { recursive: true, force: true });
+    await rm(moved, { recursive: true, force: true });
   }
 });
 

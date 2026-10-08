@@ -161,7 +161,8 @@ export function projectMigrationInventory(
   const allNodes = inventory.nodes.filter((node) => !excluded(node.path));
   const nodes = allNodes.filter((node) => !proofOmissions.has(node.path)).map((node) => {
     if (node.kind !== "directory") return { ...node };
-    const children = allNodes.filter((candidate) => candidate.path !== node.path &&
+    // Omitted proofs are absent from the projected namespace, including the directory child-list commitment.
+    const children = allNodes.filter((candidate) => candidate.path !== node.path && !proofOmissions.has(candidate.path) &&
       path.posix.dirname(candidate.path) === node.path)
       .map((candidate) => [path.posix.basename(candidate.path), candidate.kind] as const)
       .sort(([left], [right]) => compareUtf8(left, right));

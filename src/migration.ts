@@ -51,7 +51,7 @@ export interface PreparedMigration {
   readonly reviewId: string;
 }
 
-/** Result shape for migration commits; this authorization slice returns it only for already-v2 no-ops. */
+/** Result shape shared by migration and post-switch resolution commits. */
 export interface MigrationResult {
   readonly catalogVersion: 2;
   readonly backupDir: string | null;
@@ -664,12 +664,17 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     if (!rootCheck.exists) return makeAlreadyV2(reviewId, root, digest(Buffer.from(`absent:${root}`)), false, rootCheck.identities, []);
     const rootNamesBefore = (await readdir(root)).sort(compare);
     const blockers: string[] = [];
-    for (const name of [".copi-transaction", ".copi-transaction-recovery"]) {
+    for (const name of [".copi-transaction", ".copi-transaction-recovery", ".copi-migration-resolution.json"]) {
       const stat = await lstat(path.join(root, name)).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return undefined;
         throw error;
       });
       if (stat) blockers.push(`${name} exists; preview will not recover, delete, or inspect it.`);
+    }
+    for (const name of rootNamesBefore) {
+      if (name.startsWith(".copi-migration-resolution.") && name !== ".copi-migration-resolution.json") {
+        blockers.push(`${name} exists; preview will not recover, delete, or inspect it.`);
+      }
     }
     if (blockers.length > 0) {
       return makePrepared({
@@ -1101,3 +1106,6 @@ export async function commitMigration(plan: PreparedMigration, approval: ChangeA
     preservedPaths: [...state.view.preservedPaths],
   };
 }
+
+export { prepareMigrationResolution, readMigrationResolution, commitMigrationResolution } from "./migration-resolution.ts";
+export type { PreparedMigrationResolution, MigrationResolutionStatus, MigrationResolutionView } from "./migration-resolution.ts";
