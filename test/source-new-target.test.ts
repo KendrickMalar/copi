@@ -2,16 +2,17 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstatSync, mkdirSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { importResource } from "../src/catalog.ts";
 import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageFile } from "../src/storage-transaction.ts";
 import { fixtureModuleUrl, fixtureNodeArgs } from "./helpers/storage-transaction.ts";
 import { readSourceContent } from "../src/source-content.ts";
-import type { Catalog, SavedItem } from "../src/types.ts";
+import type { Catalog, ResourceCandidate, SavedItem } from "../src/types.ts";
 
 const childProcess = createRequire(import.meta.url)("node:child_process") as { spawn: typeof spawn };
 const testDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -78,7 +79,7 @@ async function commitNewItem(
       ? { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: sensitive } }
       : undefined;
     await session.commit(revision, bytes, replacements, authorization);
-  });
+  }, { requiresNativePlacement: true });
 }
 
 function newFile(name = "Draft", bytes = Buffer.from("reviewed new file\n")) {
@@ -104,7 +105,7 @@ async function startWriter(libraryDir: string, item: SavedItem, files: readonly 
   const code = `import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
 const replacement=${JSON.stringify(replacements[0])};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}){console.log('PAUSED');setInterval(()=>{},1000);await new Promise(()=>{});}}});
-await kernel.run(${JSON.stringify(libraryDir)},true,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:replacement.itemId,files:replacement.files.map(file=>({path:file.path,mode:file.mode,bytes:Buffer.from(file.bytes,'base64')}))}]));`;
+await kernel.run(${JSON.stringify(libraryDir)},true,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:replacement.itemId,files:replacement.files.map(file=>({path:file.path,mode:file.mode,bytes:Buffer.from(file.bytes,'base64')}))}]),{requiresNativePlacement:true});`;
   return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { env: process.env });
 }
 
@@ -135,6 +136,37 @@ function errorContainsCode(error: unknown, code: string): boolean {
   if (Reflect.get(error, "code") === code) return true;
   if (error instanceof AggregateError && [...error.errors].some((entry) => errorContainsCode(entry, code))) return true;
   return error.cause !== undefined && errorContainsCode(error.cause, code);
+}
+
+async function fullInventory(root: string): Promise<string> {
+  const entries: Array<Record<string, string | number | null>> = [];
+  async function visit(current: string, relative: string): Promise<void> {
+    const stat = await lstat(current, { bigint: true });
+    const kind = stat.isDirectory() ? "directory" : stat.isFile() ? "file" : stat.isSymbolicLink() ? "link" : "special";
+    const entry: Record<string, string | number | null> = {
+      path: relative || ".",
+      kind,
+      mode: Number(stat.mode & 0o777n),
+      dev: stat.dev.toString(),
+      ino: stat.ino.toString(),
+      size: stat.size.toString(),
+      mtimeNs: stat.mtimeNs.toString(),
+      ctimeNs: stat.ctimeNs.toString(),
+      value: null,
+    };
+    if (stat.isFile()) entry.value = digest(await readFile(current));
+    else if (stat.isSymbolicLink()) entry.value = await readlink(current);
+    entries.push(entry);
+    if (stat.isDirectory()) {
+      for (const name of (await readdir(current)).sort()) await visit(path.join(current, name), relative ? `${relative}/${name}` : name);
+    }
+  }
+  try { await visit(root, ""); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return JSON.stringify([{ path: ".", kind: "missing" }]);
+    throw error;
+  }
+  return JSON.stringify(entries);
 }
 
 test("first v2 file item stores only reviewed bytes under a private UUID parent and preserves descriptor mode", async (t) => {
@@ -359,6 +391,78 @@ test("new source writes reject unsupported architecture without changing catalog
   await assert.rejects(lstat(path.join(box.libraryDir, ...item.content.path.split("/"))), { code: "ENOENT" });
 });
 
+test("unsupported architecture stops every native-required new-source path before the first library or HOME write", async (t) => {
+  const cases = ["new-sources-root", "file-parent", "tree-target"] as const;
+  for (const mutation of cases) {
+    await t.test(mutation, async (subtest) => {
+      const box = mutation === "new-sources-root"
+        ? await fixture(subtest)
+        : await fixture(subtest, { version: 2, items: [], groups: [] }, true);
+      const { item, files } = mutation === "tree-target" ? newTree("UnsupportedTree") : newFile("UnsupportedFile");
+      const homeBefore = await fullInventory(box.root);
+      const libraryBefore = await fullInventory(box.libraryDir);
+      const checkpoints: StorageCheckpoint[] = [];
+      const originalArch = Object.getOwnPropertyDescriptor(process, "arch");
+      Object.defineProperty(process, "arch", { configurable: true, value: "x64" });
+      let failure: unknown;
+      try {
+        await commitNewItem(box.libraryDir, item, files, [], (point) => { checkpoints.push(point); });
+      } catch (error) {
+        failure = error;
+      } finally {
+        if (originalArch === undefined) Reflect.deleteProperty(process, "arch");
+        else Object.defineProperty(process, "arch", originalArch);
+      }
+      const homeAfter = await fullInventory(box.root);
+      const libraryAfter = await fullInventory(box.libraryDir);
+      console.log(`native-preflight inventory ${JSON.stringify({ mutation, errorCode: failure instanceof Error ? Reflect.get(failure, "code") : null, checkpoints, homeBefore: JSON.parse(homeBefore) as unknown, homeAfter: JSON.parse(homeAfter) as unknown, libraryBefore: JSON.parse(libraryBefore) as unknown, libraryAfter: JSON.parse(libraryAfter) as unknown })}`);
+      assert.ok(failure instanceof Error);
+      assert.ok(errorContainsCode(failure, "unsupported-platform"));
+      assert.deepEqual(checkpoints, [], "no stage-write, journal, or other transaction checkpoint may be reached");
+      assert.equal(homeAfter, homeBefore, "the complete synthetic HOME inventory must be byte/stat-identical");
+      assert.equal(libraryAfter, libraryBefore, "the complete library inventory must be byte/stat-identical");
+      await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+    });
+  }
+});
+
+test("high-level import leaves a missing library and its HOME unchanged on unsupported architecture", async (t) => {
+  const box = await fixture(t);
+  const sourcePath = path.join(box.root, "origin.md");
+  await writeFile(sourcePath, "reviewed source\n", { mode: 0o600 });
+  const candidate: ResourceCandidate = {
+    id: "unsupported-import",
+    kind: "instruction",
+    source: "synthetic fixture",
+    scope: "project",
+    sourceRoot: box.root,
+    sourcePath,
+    name: "Unsupported import",
+    destination: { kind: "project", path: "unsupported.md" },
+  };
+  const homeBefore = await fullInventory(box.root);
+  const libraryBefore = await fullInventory(box.libraryDir);
+  const originalArch = Object.getOwnPropertyDescriptor(process, "arch");
+  Object.defineProperty(process, "arch", { configurable: true, value: "x64" });
+  let failure: unknown;
+  try {
+    await importResource(box.libraryDir, candidate, { confirmed: true, groupIds: [] });
+  } catch (error) {
+    failure = error;
+  } finally {
+    if (originalArch === undefined) Reflect.deleteProperty(process, "arch");
+    else Object.defineProperty(process, "arch", originalArch);
+  }
+  const homeAfter = await fullInventory(box.root);
+  const libraryAfter = await fullInventory(box.libraryDir);
+  console.log(`native-preflight import inventory ${JSON.stringify({ errorCode: failure instanceof Error ? Reflect.get(failure, "code") : null, homeBefore: JSON.parse(homeBefore) as unknown, homeAfter: JSON.parse(homeAfter) as unknown, libraryBefore: JSON.parse(libraryBefore) as unknown, libraryAfter: JSON.parse(libraryAfter) as unknown })}`);
+  assert.ok(failure instanceof Error);
+  assert.ok(errorContainsCode(failure, "unsupported-platform"));
+  assert.equal(homeAfter, homeBefore, "the complete synthetic HOME inventory must be byte/stat-identical");
+  assert.equal(libraryAfter, libraryBefore, "a missing library must remain absent");
+  await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+});
+
 test("raw sensitive new content requires exact opaque individual approval", async (t) => {
   const box = await fixture(t, { version: 2, items: [], groups: [] });
   const secret = Buffer.from("apiKey=sk_live_newtargetsecret123456\n");
@@ -373,7 +477,7 @@ test("raw sensitive new content requires exact opaque individual approval", asyn
   await assert.rejects(new StorageTransactions().run(box.libraryDir, true, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), bytes, replacements);
-  }), /approval|inspection/i);
+  }, { requiresNativePlacement: true }), /approval|inspection/i);
   assert.deepEqual(await readdir(box.libraryDir), ["catalog.json"]);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), { version: 2, items: [], groups: [] });
   await assert.rejects(lstat(path.join(box.libraryDir, ...item.content.path.split("/"))), { code: "ENOENT" });
@@ -384,7 +488,7 @@ test("raw sensitive new content requires exact opaque individual approval", asyn
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: sensitivePaths },
     });
-  });
+  }, { requiresNativePlacement: true });
   assert.deepEqual(await readFile(path.join(box.libraryDir, ...item.content.path.split("/"))), secret);
 });
 

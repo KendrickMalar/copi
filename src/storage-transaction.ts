@@ -12,7 +12,7 @@ import { projectMigrationInventory, scanMigrationInventory } from "./migration-i
 import { acquireRootLease } from "./storage-root-lease.ts";
 import { resumeCompletedMigrationResolution } from "./migration-resolution.ts";
 import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup, type MigrationBackupInputEntry } from "./migration-backup.ts";
-import { renameExclusiveReviewedSource } from "./native-placement.ts";
+import { preflightNativeSourcePlacement, renameExclusiveReviewedSource } from "./native-placement.ts";
 import { inspectFixedResource } from "./inspect.ts";
 import { assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { Catalog, InspectionWarning, LegacyCatalog, SavedItem } from "./types.ts";
@@ -100,6 +100,7 @@ interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: 
 export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly catalogIdentity: string | null; readonly format: "v1" | "v2"; readonly tree: string }
 export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-held" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "rollback-catalog-held" | "finalized" | "rollback-finalized";
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
+interface StorageRunOptions { requiresNativePlacement?: boolean }
 interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean; migrationRootEntries?: string[] }
 interface DirectoryIdentity { dev: number; ino: number }
 interface InFlightControl { signal: AbortSignal; recovering: boolean }
@@ -1753,7 +1754,9 @@ async function inFlightCheckpoint(callback: StorageOptions["checkpoint"], contro
 /** @internal Generalized fixed-byte persistence adapter. Inspection/approval are enforced here too; instance-bound faults cannot disable checks. */
 export class StorageTransactions {
   constructor(private readonly options: StorageOptions = {}) {}
-  async run<T>(libraryDir: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>): Promise<T> {
+  async run<T>(libraryDir: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>, runOptions: StorageRunOptions = {}): Promise<T> {
+    // Run this before canonicalRoot can create the library or the transaction lock.
+    if (runOptions.requiresNativePlacement) await preflightNativeSourcePlacement(libraryDir);
     const root = await canonicalRoot(libraryDir, create);
     if (!root) return operation(undefined);
     const rootLease = await acquireRootLease(root, this.options.waitMilliseconds ?? 5_000);

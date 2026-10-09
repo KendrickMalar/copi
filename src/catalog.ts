@@ -392,12 +392,12 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
 }
 
 async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[], approvedSensitivePaths: readonly string[]): Promise<SavedItem> {
-  const preflight = await loadCatalog(libraryDir);
-  assertModernCatalog(preflight);
-  assertNoNameConflicts(preflight);
-  assertNameAvailable(preflight, "item", candidate.name);
+  const catalogPreflight = await loadCatalogUnlocked(libraryDir);
+  assertModernCatalog(catalogPreflight);
+  assertNoNameConflicts(catalogPreflight);
+  assertNameAvailable(catalogPreflight, "item", candidate.name);
   const groupIds = [...new Set(requestedGroupIds)];
-  if (groupIds.some((id) => !preflight.groups.some((group) => group.id === id))) throw new Error("Cannot import a resource into an unknown group.");
+  if (groupIds.some((id) => !catalogPreflight.groups.some((group) => group.id === id))) throw new Error("Cannot import a resource into an unknown group.");
   return storageTransactions.run(libraryDir, true, async (session) => {
     if (!session) throw new Error("Missing storage session.");
     const revision = await session.capture();
@@ -432,7 +432,7 @@ async function storePreparedResource(libraryDir: string, candidate: ResourceCand
     const review = prepareStorageReview(bytes, replacements);
     await session.commit(revision, bytes, replacements, { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: approvedSensitivePaths.map((filePath) => `${item.id}/${filePath}`) } });
     return structuredClone(item);
-  });
+  }, { requiresNativePlacement: true });
 }
 
 export async function importPreparedResource(libraryDir: string, prepared: PreparedResource, options: PreparedImportOptions): Promise<SavedItem | null> {

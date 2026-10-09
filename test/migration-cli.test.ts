@@ -276,9 +276,11 @@ test("README documents the resolution operation limits and approval boundaries",
   assert.match(readme, /Migration \(M\) and items deletion \(D\) each require separate approval/);
   assert.match(readme, /items-only content and new `sources` additions are not supported/);
   assert.match(readme, /a `ready` preview is not proof that migration can be committed/);
-  assert.match(readme, /macOS arm64.*supported filesystem/s);
-  assert.match(readme, /stops before the requested target placement/);
-  assert.match(readme, /does not use ordinary rename or copy as a fallback/);
+  assert.match(readme, /macOS arm64.*filesystem capability/s);
+  assert.match(readme, /read-only check for the supported platform, packaged helper, and filesystem capability/);
+  assert.match(readme, /stops before the first filesystem write/);
+  assert.match(readme, /nearest existing directory ancestor/);
+  assert.match(readme, /no ordinary rename or copy fallback is used/);
   assert.match(readme, /do not move, rename, or replace the library root, `sources\/`, or a saved item's management directory/);
   assert.match(readme, /editor.*file replacement.*skill.*additions and removals/s);
   assert.match(readme, /`copi migrate --resolve --dry-run`.*`copi migrate --resolve`/s);

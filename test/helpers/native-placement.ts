@@ -15,6 +15,7 @@ export interface PlacementInput {
 }
 
 export interface PlacementModule {
+  preflightNativeSourcePlacement(libraryDir: string): Promise<void>;
   renameExclusiveReviewedSource(input: PlacementInput): Promise<void>;
 }
 
@@ -211,6 +212,23 @@ static int read_one_record(void)
 
 int main(int argc, char **argv)
 {
+    if (argc == 3 && strcmp(argv[1], "--check-exclusive-rename") == 0) {
+        const char *mode = getenv("COPI_NATIVE_TEST_MODE");
+        if (mode != NULL && strcmp(mode, "unsupported-volume") == 0) {
+            return emit("{\"protocolVersion\":1,\"ok\":false,\"error\":{\"code\":\"unsupported-volume\",\"errno\":45}}\n", 1);
+        }
+        if (mode != NULL && strcmp(mode, "filesystem-error") == 0) {
+            return emit("{\"protocolVersion\":1,\"ok\":false,\"error\":{\"code\":\"filesystem-error\",\"errno\":5}}\n", 1);
+        }
+        if (mode != NULL && strcmp(mode, "assert-volume-path") == 0) {
+            const char *expected = getenv("COPI_EXPECT_VOLUME_PATH");
+            return emit(expected != NULL && strcmp(expected, argv[2]) == 0
+                ? "{\"protocolVersion\":1,\"ok\":true}\n"
+                : "{\"protocolVersion\":1,\"ok\":false,\"error\":{\"code\":\"unsupported-protocol\",\"errno\":22}}\n",
+                expected != NULL && strcmp(expected, argv[2]) == 0 ? 0 : 1);
+        }
+        return emit("{\"protocolVersion\":1,\"ok\":true}\n", 0);
+    }
     if (argc != 3 || strcmp(argv[1], "--protocol-version") != 0 || strcmp(argv[2], "1") != 0 || !read_one_record()) {
         return emit("{\"protocolVersion\":1,\"ok\":false,\"error\":{\"code\":\"invalid-request\",\"errno\":22}}\n", 1);
     }

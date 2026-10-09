@@ -462,6 +462,27 @@ static bool query_exclusive_rename_capability(const char *root_path, dev_t expec
     return true;
 }
 
+static int check_exclusive_rename_capability(const char *input_path)
+{
+    char root_path[PATH_MAX];
+    if (!canonical_root(input_path, root_path)) return emit_error("unsafe-path", EINVAL);
+    int root_fd = open_root_directory(root_path);
+    if (root_fd < 0) return emit_error("filesystem-error", errno);
+    struct stat root_info;
+    if (fstat(root_fd, &root_info) != 0) {
+        int saved = errno;
+        close(root_fd);
+        return emit_error("filesystem-error", saved);
+    }
+    if (!query_exclusive_rename_capability(root_path, root_info.st_dev)) {
+        int saved = errno;
+        close(root_fd);
+        return emit_error(saved == ENOTSUP ? "unsupported-volume" : "filesystem-error", saved);
+    }
+    close(root_fd);
+    return emit_success();
+}
+
 static bool destination_is_vacant(int parent_fd, const char *name)
 {
     struct stat ignored;
@@ -630,6 +651,10 @@ static int place_source(const struct request *request, bool inject_collision)
  */
 int main(int argc, char **argv)
 {
+    if (argc == 3 && strcmp(argv[1], "--check-exclusive-rename") == 0) {
+        return check_exclusive_rename_capability(argv[2]);
+    }
+
     bool inject_collision = false;
 #ifdef COPI_NATIVE_TEST_HOOKS
     if (argc == 4 && strcmp(argv[1], "--protocol-version") == 0 && strcmp(argv[2], "1") == 0 &&

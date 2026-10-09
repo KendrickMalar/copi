@@ -249,6 +249,10 @@ function validateInput(value: unknown): ValidatedInput {
   };
 }
 
+function assertSupportedNativePlatform(): void {
+  if (process.platform !== "darwin" || process.arch !== "arm64") throw placementError("unsupported-platform");
+}
+
 async function pathInfoWithoutSymlinks(pathname: string): Promise<BigIntStats> {
   const root = path.parse(pathname).root;
   let current = root;
@@ -400,6 +404,38 @@ async function loadPackagedHelper(): Promise<HelperPaths> {
   return paths;
 }
 
+async function nearestExistingVolumeDirectory(libraryDir: string): Promise<string> {
+  const requested = path.resolve(libraryDir);
+  if (requested === path.parse(requested).root) throw placementError("unsafe-path");
+  let current = requested;
+  while (true) {
+    let info: BigIntStats;
+    try {
+      info = await lstat(current, { bigint: true });
+    } catch (error) {
+      if (systemErrno(error) === osConstants.errno.ENOENT) {
+        const parent = path.dirname(current);
+        if (parent === current) throw placementError("filesystem-error", osConstants.errno.ENOENT);
+        current = parent;
+        continue;
+      }
+      throw asNativePlacementError(error, "filesystem-error");
+    }
+    if (current === requested && info.isSymbolicLink()) throw placementError("unsafe-path");
+    if (!info.isDirectory() && !info.isSymbolicLink()) throw placementError("unsafe-path");
+    let canonical: string;
+    try { canonical = await realpath(current); }
+    catch (error) { throw asNativePlacementError(error, "unsafe-path"); }
+    let canonicalInfo: BigIntStats;
+    try { canonicalInfo = await lstat(canonical, { bigint: true }); }
+    catch (error) { throw asNativePlacementError(error, "filesystem-error"); }
+    if (!canonicalInfo.isDirectory() || canonicalInfo.isSymbolicLink() || await realpath(canonical).catch(() => "") !== canonical) {
+      throw placementError("unsafe-path");
+    }
+    return canonical;
+  }
+}
+
 function nativeErrnoMatches(code: NativeErrorCode, errno: number): boolean {
   const errnos = osConstants.errno;
   if (!Number.isInteger(errno) || errno <= 0 || !knownErrnos.has(errno)) return false;
@@ -460,7 +496,7 @@ function terminate(child: ChildProcessWithoutNullStreams | undefined): void {
   }
 }
 
-function runNativeHelper(paths: HelperPaths, requestBytes: Buffer): Promise<void> {
+function runNativeHelper(paths: HelperPaths, requestBytes: Buffer, args: readonly string[] = ["--protocol-version", "1"]): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams | undefined;
     let settled = false;
@@ -482,7 +518,7 @@ function runNativeHelper(paths: HelperPaths, requestBytes: Buffer): Promise<void
 
     timer = setTimeout(deadline, helperTimeoutMs);
     try {
-      child = spawn(paths.helperPath, ["--protocol-version", "1"], {
+      child = spawn(paths.helperPath, [...args], {
         cwd: paths.packageRoot,
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
@@ -542,13 +578,21 @@ function runNativeHelper(paths: HelperPaths, requestBytes: Buffer): Promise<void
       }
       rejectOnce(placementError(response.error.code, response.error.errno), false);
     });
-    child.stdin.end(requestBytes);
+    if (requestBytes.length > 0) child.stdin.end(requestBytes);
   });
+}
+
+/** @internal Read-only capability check that must precede native-placement transaction writes. */
+export async function preflightNativeSourcePlacement(libraryDir: string): Promise<void> {
+  assertSupportedNativePlatform();
+  const volumeRoot = await nearestExistingVolumeDirectory(libraryDir);
+  const paths = await loadPackagedHelper();
+  await runNativeHelper(paths, Buffer.alloc(0), ["--check-exclusive-rename", volumeRoot]);
 }
 
 export async function renameExclusiveReviewedSource(input: RenameExclusiveReviewedSourceInput): Promise<void> {
   const validated = validateInput(input);
-  if (process.platform !== "darwin" || process.arch !== "arm64") throw placementError("unsupported-platform");
+  assertSupportedNativePlatform();
   await assertLibraryAndFilesystem(validated);
   const paths = await loadPackagedHelper();
   await runNativeHelper(paths, validated.requestBytes);

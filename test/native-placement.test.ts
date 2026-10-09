@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -233,6 +233,56 @@ test("serializes exact decimal inode identities into one protocol-v1 stdin recor
   };
   await withTestEnvironment(env, () => isolated.renameExclusiveReviewedSource(fixture));
   await assertUnchanged(fixture);
+});
+
+test("read-only native preflight checks the nearest existing ancestor without creating a missing library", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-native-preflight-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const libraryDir = path.join(root, "missing", "nested", ".copi");
+  const native = await importPlacementModule(packageSourceModule);
+  const before = await lstat(root, { bigint: true });
+  await native.preflightNativeSourcePlacement(libraryDir);
+  const after = await lstat(root, { bigint: true });
+  assert.deepEqual(
+    { dev: after.dev, ino: after.ino, mode: after.mode, size: after.size, mtimeNs: after.mtimeNs, ctimeNs: after.ctimeNs },
+    { dev: before.dev, ino: before.ino, mode: before.mode, size: before.size, mtimeNs: before.mtimeNs, ctimeNs: before.ctimeNs },
+  );
+  await assert.rejects(lstat(path.join(root, "missing")), { code: "ENOENT" });
+});
+
+test("native preflight fails closed for unsupported or unknown volumes and missing helpers", async (t) => {
+  const mockBytes = await buildMockNativeHelper(t);
+  const unsupportedPackage = await createPackageFixture(t, mockBytes);
+  const unsupportedModule = await importPlacementModule(unsupportedPackage.modulePath);
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-native-preflight-failure-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const libraryDir = path.join(root, "missing", "nested", ".copi");
+  await withTestEnvironment({ COPI_NATIVE_TEST_MODE: "assert-volume-path", COPI_EXPECT_VOLUME_PATH: await realpath(root) }, () => unsupportedModule.preflightNativeSourcePlacement(libraryDir));
+  await assert.rejects(lstat(path.join(root, "missing")), { code: "ENOENT" });
+  for (const entry of [
+    { mode: "unsupported-volume", code: "unsupported-volume", errno: 45 },
+    { mode: "filesystem-error", code: "filesystem-error", errno: 5 },
+  ]) {
+    await t.test(entry.mode, async () => {
+      const before = await lstat(root, { bigint: true });
+      await rejectsWithCode(
+        withTestEnvironment({ COPI_NATIVE_TEST_MODE: entry.mode }, () => unsupportedModule.preflightNativeSourcePlacement(libraryDir)),
+        entry.code,
+        entry.errno,
+      );
+      const after = await lstat(root, { bigint: true });
+      assert.deepEqual(
+        { dev: after.dev, ino: after.ino, mode: after.mode, size: after.size, mtimeNs: after.mtimeNs, ctimeNs: after.ctimeNs },
+        { dev: before.dev, ino: before.ino, mode: before.mode, size: before.size, mtimeNs: before.mtimeNs, ctimeNs: before.ctimeNs },
+      );
+      await assert.rejects(lstat(path.join(root, "missing")), { code: "ENOENT" });
+    });
+  }
+
+  const missingPackage = await createPackageFixture(t);
+  const missingModule = await importPlacementModule(missingPackage.modulePath);
+  await rejectsWithCode(missingModule.preflightNativeSourcePlacement(libraryDir), "helper-unavailable");
+  await assert.rejects(lstat(path.join(root, "missing")), { code: "ENOENT" });
 });
 
 test("rejects non-darwin and non-arm64 writes before helper execution", async (t) => {
