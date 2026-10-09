@@ -274,4 +274,16 @@ test("README documents the resolution operation limits and approval boundaries",
   assert.match(readme, /v4 journals do not have the start inventory/);
   assert.match(readme, /not general history or a restore feature/);
   assert.match(readme, /Migration \(M\) and items deletion \(D\) each require separate approval/);
+  assert.match(readme, /items-only content and new `sources` additions are not supported/);
+  assert.match(readme, /a `ready` preview is not proof that migration can be committed/);
+  assert.match(readme, /macOS arm64.*supported filesystem/s);
+  assert.match(readme, /stops before the requested target placement/);
+  assert.match(readme, /does not use ordinary rename or copy as a fallback/);
+  assert.match(readme, /do not move, rename, or replace the library root, `sources\/`, or a saved item's management directory/);
+  assert.match(readme, /editor.*file replacement.*skill.*additions and removals/s);
+  assert.match(readme, /`copi migrate --resolve --dry-run`.*`copi migrate --resolve`/s);
+  assert.match(readme, /v4.*unknown.*incomplete.*held/s);
+  assert.match(readme, /existing `.migration-backups\/`.*blocked.*not adopted automatically/s);
+  assert.match(readme, /offline preservation check.*separate explicit approval/s);
+  assert.match(readme, /never manually remove, move, or restore.*migration backup/i);
 });
