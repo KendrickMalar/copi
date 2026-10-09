@@ -7,7 +7,7 @@ import test from "node:test";
 import { commitMigration, prepareMigration, readMigration, type PreparedMigration } from "../src/migration.ts";
 import type { ChangeApproval } from "../src/resource-mutations.ts";
 import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup } from "../src/migration-backup.ts";
-import { scanMigrationInventory } from "../src/migration-inventory.ts";
+import { listManagedMigrationRootEntries, scanMigrationInventory } from "../src/migration-inventory.ts";
 import { canonicalStorageJournalJson } from "../src/storage-journal.ts";
 import { prepareLegacyMigrationReview, storageTransactions, StorageTransactions, type LegacyMigrationReview, type StorageSession } from "../src/storage-transaction.ts";
 import {
@@ -102,7 +102,7 @@ async function legacyReviewRequest(
     catalogBytes: Buffer.from(`${JSON.stringify(nextCatalog, null, 2)}\n`),
     itemsTree: await migrationTreeCommitment(root, "items"),
     sourcesTree: await migrationTreeCommitment(root, "sources"),
-    rootEntries: (await readdir(root)).sort(),
+    rootEntries: await listManagedMigrationRootEntries(root),
     inputs,
     backupDir: `.migration-backups/${randomUUID()}`,
     backupManifestBytes: buildMigrationBackupManifest(inputs.map(({ path: originalPath, sha256, mode }) => ({ originalPath, sha256, mode }))),
@@ -116,7 +116,7 @@ function approvalFor(plan: PreparedMigration): ChangeApproval {
   return { reviewId: plan.reviewId, confirmed: true, approvedSensitivePaths: [...view.sensitivePaths] };
 }
 
-test("writes a canonical v5 journal containing the complete read-only migration-start inventory", async () => {
+test("writes a canonical v5 journal containing only the Copi-managed migration-start inventory", async () => {
   const fixture = await createLegacyLibrary();
   let rawJournal: string | undefined;
   let journal: Record<string, unknown> | undefined;
@@ -149,7 +149,7 @@ test("writes a canonical v5 journal containing the complete read-only migration-
     assert.ok(paths.includes("."));
     assert.ok(paths.includes("catalog.json"));
     assert.ok(paths.includes("items/empty-inventory-directory"));
-    assert.ok(paths.includes("root-unregistered-inventory.txt"));
+    assert.equal(paths.includes("root-unregistered-inventory.txt"), false);
     assert.ok(inventory.hash.length === 64);
   } finally {
     Reflect.deleteProperty(storageTransactions, "run");
@@ -489,8 +489,9 @@ test("recovers an adopt-only catalog hold after SIGKILL and keeps the permanent 
   }
 });
 
-test("stops and preserves the journal when an unrelated root entry changes after catalog switch", async () => {
+test("blocks on a managed source edit after catalog switch and preserves recovery artifacts", async () => {
   const fixture = await createLegacyLibrary();
+  const externalBytes = Buffer.from("external managed source edit\n");
   try {
     const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("unchanged source\n"), 0o755);
     await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
@@ -500,19 +501,16 @@ test("stops and preserves the journal when an unrelated root entry changes after
       configurable: true,
       value: <T>(root: string, create: boolean, operation: (session: import("../src/storage-transaction.ts").StorageSession | undefined) => Promise<T>) =>
         new StorageTransactions({ checkpoint: async (point) => {
-          if (point === "catalog-renamed") {
-            await writeBytes(root, "unreviewed-root-entry.bin", Buffer.from("preserve this unrelated entry\n"), 0o600);
-            throw new Error("synthetic external root edit");
-          }
+          if (point === "catalog-renamed") await writeFile(path.join(root, "sources/current/AGENTS.md"), externalBytes);
         } }).run(root, create, operation, { requiresNativePlacement: false }),
     });
     try {
-      await assert.rejects(commitMigration(plan, approvalFor(plan)), /recover|root entries|external root edit/i);
+      await assert.rejects(commitMigration(plan, approvalFor(plan)), /recover|changed|preserv/i);
     } finally {
       Reflect.deleteProperty(storageTransactions, "run");
     }
 
-    assert.deepEqual(await readFile(path.join(fixture.root, "unreviewed-root-entry.bin")), Buffer.from("preserve this unrelated entry\n"));
+    assert.deepEqual(await readFile(sourcePath), externalBytes);
     assert.ok((await readdir(path.join(fixture.root, ".copi-transaction"))).includes("journal.json"));
     assert.ok((await readdir(fixture.root)).includes(".migration-backups"));
     const catalog = JSON.parse(await readFile(path.join(fixture.root, "catalog.json"), "utf8")) as { version: number };
@@ -570,6 +568,97 @@ test("rejects source edits after preview before creating the backup", async () =
   } finally {
     await fixture.dispose();
   }
+});
+
+test("unmanaged root writes after prepare do not invalidate the migration plan", async () => {
+  const fixture = await createLegacyLibrary();
+  try {
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("reviewed source\n"), 0o640);
+    await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    const before = await lstat(fixture.root, { bigint: true });
+    const plan = await prepareMigration(fixture.root);
+    await writeBytes(fixture.root, ".pi/loops/session.log", Buffer.from("external Pi activity\n"), 0o600);
+
+    const result = await commitMigration(plan, approvalFor(plan));
+
+    assert.equal(result.catalogVersion, 2);
+    const after = await lstat(fixture.root, { bigint: true });
+    assert.equal(after.dev, before.dev);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mode, before.mode);
+    assert.deepEqual(await readFile(path.join(fixture.root, ".pi/loops/session.log")), Buffer.from("external Pi activity\n"));
+  } finally { await fixture.dispose(); }
+});
+
+for (const point of ["stage-write", "stage-sync", "journal", "before-catalog", "catalog-held", "catalog-renamed", "directory-sync", "committed"] as const) {
+  test(`unmanaged .pi writes at ${point} do not stop migration or cleanup`, async () => {
+    const fixture = await createLegacyLibrary();
+    const externalPath = ".pi/loops/session.log";
+    const externalBytes = Buffer.from(`external write at ${point}\n`);
+    let injected = false;
+    const originalRun = storageTransactions.run;
+    try {
+      const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("reviewed source\n"), 0o640);
+      await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+      await writeLegacySnapshot(fixture.root);
+      await writeBytes(fixture.root, externalPath, Buffer.from("pre-existing activity\n"), 0o600);
+      const plan = await prepareMigration(fixture.root);
+      Object.defineProperty(storageTransactions, "run", {
+        configurable: true,
+        value: <T>(root: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>) =>
+          new StorageTransactions({ checkpoint: async (current, currentRoot) => {
+            if (current === point && !injected) {
+              injected = true;
+              await writeBytes(currentRoot, externalPath, externalBytes, 0o600);
+            }
+          } }).run(root, create, operation, { requiresNativePlacement: false }),
+      });
+      const result = await commitMigration(plan, approvalFor(plan));
+      assert.equal(injected, true);
+      assert.equal(result.catalogVersion, 2);
+      assert.deepEqual(await readFile(path.join(fixture.root, externalPath)), externalBytes);
+      await assert.rejects(lstat(path.join(fixture.root, ".copi-transaction")), { code: "ENOENT" });
+      assert.ok((await readdir(fixture.root)).includes(".migration-backups"));
+    } finally {
+      Object.defineProperty(storageTransactions, "run", { configurable: true, value: originalRun });
+      Reflect.deleteProperty(storageTransactions, "run");
+      await fixture.dispose();
+    }
+  });
+}
+
+test("v5 recovery completes after an unmanaged .pi write made following SIGKILL", async () => {
+  const fixture = await createLegacyLibrary();
+  const migrationUrl = new URL("../src/migration.js", import.meta.url).href;
+  const transactionUrl = new URL("../src/storage-transaction.js", import.meta.url).href;
+  try {
+    const sourcePath = await writeBytes(fixture.root, "sources/current/AGENTS.md", Buffer.from("recovery source\n"), 0o640);
+    await writeLegacyCatalog(fixture.root, [makeLegacyItem({ sourcePath })]);
+    await writeLegacySnapshot(fixture.root);
+    await writeBytes(fixture.root, ".pi/loops/session.log", Buffer.from("before crash\n"), 0o600);
+    const child = `
+      const { StorageTransactions, storageTransactions } = await import(${JSON.stringify(transactionUrl)});
+      Object.defineProperty(storageTransactions, "run", { configurable: true, value: (root, create, operation) =>
+        new StorageTransactions({ checkpoint: (point) => { if (point === "catalog-renamed") process.kill(process.pid, "SIGKILL"); } })
+          .run(root, create, operation, { requiresNativePlacement: false }) });
+      const api = await import(${JSON.stringify(migrationUrl)});
+      const plan = await api.prepareMigration(process.argv[1]);
+      const view = api.readMigration(plan);
+      await api.commitMigration(plan, { reviewId: view.reviewId, confirmed: true, approvedSensitivePaths: [...view.sensitivePaths] });
+    `;
+    const killed = spawnSync(process.execPath, ["--input-type=module", "-e", child, fixture.root], { encoding: "utf8", timeout: 30_000 });
+    assert.equal(killed.signal, "SIGKILL", killed.stderr);
+    const externalBytes = Buffer.from("edited during recovery gap\n");
+    await writeBytes(fixture.root, ".pi/loops/session.log", externalBytes, 0o600);
+
+    await storageTransactions.run(fixture.root, false, async () => undefined, { requiresNativePlacement: false });
+
+    assert.deepEqual(await readFile(path.join(fixture.root, ".pi/loops/session.log")), externalBytes);
+    assert.equal((await readdir(fixture.root)).includes(".copi-transaction"), false);
+    const stored = JSON.parse(await readFile(path.join(fixture.root, "catalog.json"), "utf8")) as { version: number };
+    assert.equal(stored.version, 2);
+  } finally { await fixture.dispose(); }
 });
 
 test("keeps items-only migrations fail-closed and writes no backup or catalog", async () => {

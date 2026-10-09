@@ -8,7 +8,7 @@ import { createTwoFilesPatch } from "diff";
 import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { parseStoredCatalog } from "./catalog.ts";
 import { parseMigrationBackupManifest, verifyMigrationBackup } from "./migration-backup.ts";
-import { projectMigrationInventory, scanMigrationInventory } from "./migration-inventory.ts";
+import { isManagedMigrationRootName, listManagedMigrationRootEntries, projectMigrationInventory, scanMigrationInventory } from "./migration-inventory.ts";
 import { acquireRootLease, type StorageRootLease } from "./storage-root-lease.ts";
 import {
   canonicalStorageJournalJson,
@@ -449,7 +449,8 @@ function parseOwner(value: unknown, token: string): OwnerValue {
   if (value.migrationRootEntries !== undefined && (!Array.isArray(value.migrationRootEntries) || value.migrationRootEntries.some((entry) => typeof entry !== "string" ||
       !entry || entry.includes("/") || entry.includes("\\") || entry.includes("\0") || entry === "." || entry === "..") ||
       new Set(value.migrationRootEntries).size !== value.migrationRootEntries.length ||
-      value.migrationRootEntries.some((entry) => [lockName, claimName, ".migration-backups"].includes(entry)) ||
+      value.migrationRootEntries.some((entry) => !isManagedMigrationRootName(entry) ||
+        [lockName, claimName, ".migration-backups"].includes(entry)) ||
       canonicalJson([...value.migrationRootEntries].sort()) !== canonicalJson(value.migrationRootEntries))) {
     throw new Error("Malformed migration root-entry commitment.");
   }
@@ -700,7 +701,7 @@ async function readRecord(root: string): Promise<RecordFileState | undefined> {
   return { record, raw: loaded.bytes, proof: loaded.proof };
 }
 async function checkTemps(root: string, record?: RecordFileState): Promise<string | undefined> {
-  const names = (await readdir(root, { encoding: "buffer" })).map((value) => new TextDecoder("utf-8", { fatal: true }).decode(value));
+  const names = await listManagedMigrationRootEntries(root);
   const temps = names.filter(isRecordTempName);
   if (temps.length === 0) return undefined;
   if (!record || temps.length !== 1 || temps[0] !== path.basename(currentRecordTemp(root, record.record))) {
@@ -854,7 +855,7 @@ async function validateBackup(root: string, journal: LegacyMigrationStorageJourn
   }
   await verifyMigrationBackup({ libraryRoot: root, backupDir: journal.backupDir, manifestBytes: loaded.bytes,
     manifestSha256: journal.backupManifest, entries: manifest.entries.map(({ originalPath, sha256: digest, mode }) => ({ originalPath, sha256: digest, mode })) });
-  const namespace = await scanMigrationInventory(path.join(root, ".migration-backups"));
+  const namespace = await scanMigrationInventory(path.join(root, ".migration-backups"), { rootScope: "subtree" });
   const scannedParent = inventoryNode(namespace, ".");
   const currentParent = inventoryNode(currentInventory, ".migration-backups");
   if (!scannedParent || scannedParent.kind !== "directory" || !currentParent || currentParent.kind !== "directory" ||
@@ -1001,7 +1002,7 @@ async function readInitialContext(root: string, reviewId: string): Promise<Analy
   const excluded = backupPayloadExclusions(start, journal.backupDir);
   const classification = verifyAllowedPayloadChanges(root, start, currentInventory, oldCatalog, next, excluded);
   const projected = filteredInventory(currentInventory, excluded);
-  const rootNames = (await readdir(root)).sort();
+  const rootNames = await listManagedMigrationRootEntries(root);
   const currentEntries = rootNames.filter((name) => name !== lockName && name !== claimName &&
     (hasBackupParent || name !== ".migration-backups"));
   const expectedEntries = [...owner.migrationRootEntries].sort();
@@ -1405,8 +1406,7 @@ async function continueCleanup(root: string, initial: RecordFileState, assertRoo
 export async function resumeCompletedMigrationResolution(root: string, assertRootCurrent: () => Promise<void> = async () => undefined): Promise<void> {
   await assertRootCurrent();
   const record = await readRecord(root);
-  const names = await readdir(root, { encoding: "buffer" });
-  const decodedNames = names.map((name) => new TextDecoder("utf-8", { fatal: true }).decode(name));
+  const decodedNames = await listManagedMigrationRootEntries(root);
   const unknownTemps = decodedNames.filter(isRecordTempName);
   if (!record) {
     if (await statMaybe(path.join(root, claimName)) || unknownTemps.length > 0) throw new Error("Unowned migration resolution claim or temporary record exists; preserving it.");

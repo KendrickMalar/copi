@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 const digest = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
 
-test("captures every root node, inode, mode, file hash, and empty-directory commitment read-only", async () => {
+test("captures only Copi-managed root nodes while retaining inode, mode, file hashes, and empty-directory commitments", async () => {
   const { scanMigrationInventory } = await import("../src/migration-inventory.ts");
   const root = await mkdtemp(path.join(os.tmpdir(), "copi-inventory-"));
   try {
@@ -15,6 +16,16 @@ test("captures every root node, inode, mode, file hash, and empty-directory comm
     await mkdir(path.join(root, "sources"), { mode: 0o700 });
     await writeFile(path.join(root, "catalog.json"), "catalog bytes", { mode: 0o640 });
     await writeFile(path.join(root, "items", "loose.txt"), "loose bytes", { mode: 0o600 });
+    await mkdir(path.join(root, ".migration-backups"));
+    await mkdir(path.join(root, ".copi-transaction"));
+    await writeFile(path.join(root, ".copi-transaction", "owner.json"), "managed lock", { mode: 0o600 });
+    await mkdir(path.join(root, ".copi-transaction-recovery"));
+    await writeFile(path.join(root, ".copi-transaction-recovery", "owner.json"), "managed recovery", { mode: 0o600 });
+    await writeFile(path.join(root, ".copi-migration-resolution.json"), "managed record", { mode: 0o600 });
+    await writeFile(path.join(root, ".copi-migration-resolution.generation.tmp"), "managed temp", { mode: 0o600 });
+    await mkdir(path.join(root, "docs"));
+    await symlink("missing-target", path.join(root, "docs", "unrelated-link"));
+    await writeFile(path.join(root, "README.md"), "unmanaged root document");
     const before = await lstat(root, { bigint: true });
     const inventory = await scanMigrationInventory(root);
     const after = await lstat(root, { bigint: true });
@@ -22,7 +33,11 @@ test("captures every root node, inode, mode, file hash, and empty-directory comm
     assert.equal(after.ino, before.ino);
     assert.equal(after.mode, before.mode);
     const nodes = inventory.nodes;
-    assert.deepEqual(nodes.map((node) => node.path), [".", "catalog.json", "items", "items/empty", "items/loose.txt", "sources"]);
+    assert.deepEqual(nodes.map((node) => node.path), [
+      ".", ".copi-migration-resolution.generation.tmp", ".copi-migration-resolution.json",
+      ".copi-transaction", ".copi-transaction-recovery", ".copi-transaction-recovery/owner.json",
+      ".copi-transaction/owner.json", ".migration-backups", "catalog.json", "items", "items/empty", "items/loose.txt", "sources",
+    ]);
     const file = nodes.find((node) => node.path === "items/loose.txt");
     assert.equal(file?.bytesHash, digest("loose bytes"));
     assert.equal(file?.mode, 0o600);
@@ -34,6 +49,21 @@ test("captures every root node, inode, mode, file hash, and empty-directory comm
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("unmanaged root additions and timestamp changes do not alter the projected inventory", async () => {
+  const { scanMigrationInventory } = await import("../src/migration-inventory.ts");
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-inventory-unmanaged-"));
+  try {
+    await writeFile(path.join(root, "catalog.json"), "catalog bytes", { mode: 0o600 });
+    const before = await scanMigrationInventory(root);
+    await mkdir(path.join(root, ".pi", "loops"), { recursive: true });
+    await writeFile(path.join(root, ".pi", "loops", "session.log"), "external activity");
+    await writeFile(path.join(root, "notes.md"), "unmanaged root file");
+    assert.deepEqual(await scanMigrationInventory(root), before);
+    await rm(path.join(root, "notes.md"));
+    assert.deepEqual(await scanMigrationInventory(root), before);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("projects only the owned backup UUID while retaining existing siblings and their commitment", async () => {
@@ -90,11 +120,31 @@ test("can scan the projected payload without treating owned hardlinked catalog s
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("blocks inventory capture on symlinks and does not omit unsafe nodes", async () => {
+test("blocks special filesystem nodes inside managed directories", async () => {
+  const { scanMigrationInventory } = await import("../src/migration-inventory.ts");
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-inventory-special-"));
+  const socketPath = path.join(root, "items", "special.sock");
+  const server = createServer();
+  try {
+    await mkdir(path.join(root, "items"));
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+    await assert.rejects(scanMigrationInventory(root), /special filesystem node/i);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await unlink(socketPath).catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("blocks symlinks inside managed directories and does not omit unsafe nodes", async () => {
   const { scanMigrationInventory } = await import("../src/migration-inventory.ts");
   const root = await mkdtemp(path.join(os.tmpdir(), "copi-inventory-link-"));
   try {
-    await symlink("elsewhere", path.join(root, "link"));
+    await mkdir(path.join(root, "items"));
+    await symlink("elsewhere", path.join(root, "items", "link"));
     await assert.rejects(scanMigrationInventory(root), /symbolic link|symlink/i);
   } finally {
     await rm(root, { recursive: true, force: true });

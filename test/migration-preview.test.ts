@@ -441,20 +441,23 @@ test("pending transaction and recovery locks block preview without attempting re
   });
 });
 
-test("blocks a symlink in an unregistered root subtree instead of omitting it from migration inventory", async () => {
+test("unmanaged directory symlinks do not block migration preview", async () => {
   await withLibrary(async (root) => {
     await writeLegacyCatalog(root);
     await writeLegacySnapshot(root);
     const outside = path.join(path.dirname(root), `copi-unregistered-target-${path.basename(root)}`);
     await writeBytes(path.dirname(root), path.basename(outside), Buffer.from("preserve outside\n"), 0o600);
+    const linkPath = path.join(root, "docs", "unrelated-link");
     try {
-      await symlink(outside, path.join(root, "unregistered-link"));
+      await mkdir(path.dirname(linkPath));
+      await symlink(outside, linkPath);
       const view = readMigration(await prepareMigration(root));
-      assert.equal(view.status, "blocked");
-      assert.ok(view.conflicts.length > 0);
+      assert.equal(view.status, "ready", JSON.stringify(view.conflicts));
+      assert.deepEqual(view.conflicts, []);
+      assert.equal(view.preservedPaths.includes("docs"), false);
       assert.equal(await readFile(outside, "utf8"), "preserve outside\n");
     } finally {
-      await rm(path.join(root, "unregistered-link"), { force: true });
+      await rm(path.join(root, "docs"), { recursive: true, force: true });
       await rm(outside, { force: true });
     }
   });

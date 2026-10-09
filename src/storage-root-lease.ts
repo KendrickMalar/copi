@@ -7,12 +7,17 @@ const macOsExclusiveLock = 0x20;
 
 export interface StorageRootLease {
   assertCurrent(): Promise<void>;
+  updateExpectedMode(mode: number): Promise<void>;
   close(): Promise<void>;
 }
 
+function sameRootIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.isDirectory() && right.isDirectory() &&
+    !left.isSymbolicLink() && !right.isSymbolicLink();
+}
+
 function sameRoot(left: BigIntStats, right: BigIntStats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode &&
-    left.isDirectory() && right.isDirectory() && !left.isSymbolicLink() && !right.isSymbolicLink();
+  return sameRootIdentity(left, right) && left.mode === right.mode;
 }
 
 /** Holds a crash-released macOS O_EXLOCK on the library root directory descriptor. */
@@ -53,7 +58,7 @@ export async function acquireRootLease(root: string, waitMilliseconds = 0): Prom
     if (canonical !== root || !sameRoot(before, opened) || !sameRoot(opened, after)) {
       throw new Error("Copi storage root identity changed while acquiring its O_EXLOCK lease.");
     }
-    const expectedRoot = opened;
+    let expectedRoot = opened;
     let closed = false;
     return {
       async assertCurrent(): Promise<void> {
@@ -64,6 +69,19 @@ export async function acquireRootLease(root: string, waitMilliseconds = 0): Prom
         if (currentCanonical !== root || !sameRoot(expectedRoot, currentHandle) || !sameRoot(expectedRoot, currentPath)) {
           throw new Error("Copi storage root identity changed while its O_EXLOCK lease was held.");
         }
+      },
+      async updateExpectedMode(mode: number): Promise<void> {
+        if (closed || !Number.isSafeInteger(mode) || mode < 0 || mode > 0o7777) {
+          throw new Error("Copi storage root lease expected mode is invalid or closed.");
+        }
+        const [currentHandle, currentPath, currentCanonical] = await Promise.all([
+          handle!.stat({ bigint: true }), lstat(root, { bigint: true }), realpath(root),
+        ]);
+        if (currentCanonical !== root || !sameRootIdentity(expectedRoot, currentHandle) || !sameRootIdentity(expectedRoot, currentPath) ||
+            currentHandle.mode !== currentPath.mode || Number(currentHandle.mode & 0o7777n) !== mode) {
+          throw new Error("Copi storage root identity or requested mode changed before its lease baseline update.");
+        }
+        expectedRoot = currentHandle;
       },
       async close(): Promise<void> {
         if (closed) return;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rename, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -104,6 +104,26 @@ test("root lease detects replacement of the canonical root path while its descri
     await lease.close();
     await rm(root, { recursive: true, force: true });
     await rm(moved, { recursive: true, force: true });
+  }
+});
+
+test("root lease explicitly adopts the intended mode change while continuing to detect later changes", async () => {
+  const { acquireRootLease } = await import("../src/storage-root-lease.ts");
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-root-lease-mode-"));
+  await chmod(root, 0o755);
+  const lease = await acquireRootLease(root);
+  try {
+    await chmod(root, 0o700);
+    await assert.rejects(lease.assertCurrent(), /identity changed/i);
+    const updateExpectedMode = Reflect.get(lease, "updateExpectedMode") as unknown;
+    assert.equal(typeof updateExpectedMode, "function", "an intentional chmod must update the lease's mode baseline explicitly");
+    await (updateExpectedMode as (mode: number) => Promise<void>).call(lease, 0o700);
+    await lease.assertCurrent();
+    await chmod(root, 0o755);
+    await assert.rejects(lease.assertCurrent(), /identity changed/i);
+  } finally {
+    await lease.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

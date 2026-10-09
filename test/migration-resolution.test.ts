@@ -264,22 +264,53 @@ test("v4 recovery journals remain baseline-insufficient for resolution", async (
   } finally { await fixture.dispose(); }
 });
 
-test("unregistered root edits block without changing the switched catalog or preserving lock artifacts", async () => {
+test("unmanaged .pi edits do not block or prevent approved migration resolution", async () => {
   const fixture = await createFileFixture();
   try {
     killOnCatalogSwitch(fixture.root);
     const outsider = Buffer.from("outside the reviewed sources");
-    await writeBytes(fixture.root, "unregistered-root.bin", outsider, 0o600);
-    const catalog = await readFile(path.join(fixture.root, "catalog.json"));
+    await writeBytes(fixture.root, ".pi/loops/session.log", outsider, 0o600);
     const plan = await prepareMigrationResolution(fixture.root);
     const view = readMigrationResolution(plan);
-    assert.equal(view.status, "blocked");
-    await assert.rejects(commitMigrationResolution(plan, { reviewId: view.reviewId, confirmed: true, approvedSensitivePaths: [] }), /blocked/i);
-    assert.deepEqual(await readFile(path.join(fixture.root, "catalog.json")), catalog);
-    assert.deepEqual(await readFile(path.join(fixture.root, "unregistered-root.bin")), outsider);
-    assert.ok((await readdir(path.join(fixture.root, ".copi-transaction"))).includes("journal.json"));
+    assert.equal(view.status, "ready", JSON.stringify(view.conflicts));
+    await commitMigrationResolution(plan, { reviewId: view.reviewId, confirmed: true, approvedSensitivePaths: [...view.sensitivePaths] });
+    assert.deepEqual(await readFile(path.join(fixture.root, ".pi/loops/session.log")), outsider);
+    for (const internal of [".copi-transaction", ".copi-transaction-recovery", ".copi-migration-resolution.json"]) {
+      await assert.rejects(lstat(path.join(fixture.root, internal)), { code: "ENOENT" });
+    }
     assert.ok((await readdir(fixture.root)).includes(".migration-backups"));
   } finally { await fixture.dispose(); }
+});
+
+test("unmanaged .pi writes during resolution cleanup do not invalidate its approved inventory", async () => {
+  const fixture = await createFileFixture();
+  const externalPath = ".pi/loops/session.log";
+  const externalBytes = Buffer.from("write during resolution cleanup\n");
+  let injected = false;
+  try {
+    await writeBytes(fixture.root, externalPath, Buffer.from("pre-existing activity\n"), 0o600);
+    killOnCatalogSwitch(fixture.root);
+    const plan = await prepareMigrationResolution(fixture.root);
+    const view = readMigrationResolution(plan);
+    assert.equal(view.status, "ready", JSON.stringify(view.conflicts));
+    setMigrationResolutionCheckpointForTests(async (point) => {
+      if (point === "after-action-unlink" && !injected) {
+        injected = true;
+        await writeBytes(fixture.root, externalPath, externalBytes, 0o600);
+      }
+    });
+
+    await commitMigrationResolution(plan, { reviewId: view.reviewId, confirmed: true, approvedSensitivePaths: [...view.sensitivePaths] });
+
+    assert.equal(injected, true);
+    assert.deepEqual(await readFile(path.join(fixture.root, externalPath)), externalBytes);
+    for (const internal of [".copi-transaction", ".copi-transaction-recovery", ".copi-migration-resolution.json"]) {
+      await assert.rejects(lstat(path.join(fixture.root, internal)), { code: "ENOENT" });
+    }
+  } finally {
+    setMigrationResolutionCheckpointForTests(undefined);
+    await fixture.dispose();
+  }
 });
 
 test("a pending unlink after SIGKILL resumes the recorded fixed state without replaying approval", async () => {

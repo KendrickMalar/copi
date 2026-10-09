@@ -8,7 +8,7 @@ import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { buildMigrationBackupManifest, type MigrationBackupInputEntry } from "./migration-backup.ts";
 import { prepareLegacyMigrationReview, storageTransactions } from "./storage-transaction.ts";
 import { parseStoredCatalog } from "./catalog.ts";
-import { scanMigrationInventory } from "./migration-inventory.ts";
+import { listManagedMigrationRootEntries, scanMigrationInventory } from "./migration-inventory.ts";
 import type { MigrationStartInventory } from "./storage-journal.ts";
 import type { ChangeApproval } from "./resource-mutations.ts";
 import type { Catalog, LegacyCatalog, LegacySavedItem, SavedItem } from "./types.ts";
@@ -198,6 +198,10 @@ function sameDirectory(left: DirectoryState, right: DirectoryState): boolean {
   return sameDirectoryIdentity(left, right) && left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
 }
 
+function sameRootDirectoryState(left: DirectoryState, right: DirectoryState): boolean {
+  return sameDirectoryIdentity(left, right);
+}
+
 function sameFile(left: BigIntStats, right: BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.size === right.size &&
     left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
@@ -249,7 +253,7 @@ async function assertDirectoryState(expected: DirectoryState | undefined): Promi
   if (!expected) return;
   const stat = await lstat(expected.path, { bigint: true });
   if (!stat.isDirectory() || stat.isSymbolicLink() || await realpath(expected.path) !== expected.path ||
-      !sameDirectory(expected, stateOfDirectory(expected.path, stat))) {
+      !sameRootDirectoryState(expected, stateOfDirectory(expected.path, stat))) {
     throw new Error("Library root directory changed during the read-only preview.");
   }
 }
@@ -428,7 +432,7 @@ function inventoryDigest(
 ): string {
   const rows = [
     ...rootIdentities.map((identity) => `R:${JSON.stringify(identity)}`),
-    `L:${JSON.stringify(rootDirectoryState)}`,
+    `L:${JSON.stringify({ path: rootDirectoryState.path, dev: rootDirectoryState.dev, ino: rootDirectoryState.ino, mode: rootDirectoryState.mode })}`,
     `C:${catalog.path}:${catalog.sha256}:${catalog.mode}:${catalog.dev}:${catalog.ino}`,
   ];
   for (const tree of trees) {
@@ -671,7 +675,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
       }
       return makeAlreadyV2(reviewId, root, digest(Buffer.from(`absent:${root}`)), false, rootCheck.identities, []);
     }
-    const rootNamesBefore = (await readdir(root)).sort(compare);
+    const rootNamesBefore = await listManagedMigrationRootEntries(root);
     const blockers: string[] = [];
     for (const name of [".copi-transaction", ".copi-transaction-recovery", ".copi-migration-resolution.json"]) {
       const stat = await lstat(path.join(root, name)).catch((error: NodeJS.ErrnoException) => {
@@ -707,7 +711,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     if (stored.version === 2) {
       await assertDirectoryChain(rootCheck.identities);
       await assertDirectoryState(rootCheck.rootDirectoryState);
-      const rootNamesAfter = (await readdir(root)).sort(compare);
+      const rootNamesAfter = await listManagedMigrationRootEntries(root);
       if (JSON.stringify(rootNamesBefore) !== JSON.stringify(rootNamesAfter)) throw new Error("Library root entries changed during the read-only preview.");
       return makeAlreadyV2(reviewId, root, digest(Buffer.from(`${catalogFile.sha256}:${catalogFile.dev}:${catalogFile.ino}`)), true, rootCheck.identities, rootNamesBefore, rootCheck.rootDirectoryState, catalogFile);
     }
@@ -725,7 +729,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     if (existingBackups) throw new Error("An existing migration backup namespace is preserved and is not adopted automatically.");
     const itemsTree = await scanTree(root, "items");
     const sourcesTree = await scanTree(root, "sources");
-    const rootNamesAfter = (await readdir(root)).sort(compare);
+    const rootNamesAfter = await listManagedMigrationRootEntries(root);
     if (JSON.stringify(rootNamesBefore) !== JSON.stringify(rootNamesAfter)) throw new Error("Library root entries changed during the read-only preview.");
     await assertDirectoryChain(rootCheck.identities);
     await assertDirectoryState(rootCheck.rootDirectoryState);
@@ -981,7 +985,7 @@ async function recheckPreparedMigration(state: PreparedMigrationState): Promise<
       JSON.stringify(currentState.rootEntries) !== JSON.stringify(state.rootEntries) ||
       (currentState.rootDirectoryState === undefined) !== (state.rootDirectoryState === undefined) ||
       (currentState.rootDirectoryState !== undefined && state.rootDirectoryState !== undefined &&
-        !sameDirectory(currentState.rootDirectoryState, state.rootDirectoryState)) ||
+        !sameRootDirectoryState(currentState.rootDirectoryState, state.rootDirectoryState)) ||
       JSON.stringify(currentState.view.sensitivePaths) !== JSON.stringify(state.view.sensitivePaths)) {
     throw new Error("Migration inputs, canonical root, catalog, lock state, or review snapshot changed after the read-only preview.");
   }

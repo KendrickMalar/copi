@@ -8,7 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { assertModernCatalog, parseStoredCatalog } from "./catalog.ts";
 import { readSourceContent } from "./source-content.ts";
 import { canonicalStorageJournalJson, parseMigrationStartInventory, parseStorageJournal, validateLegacyMigrationJournalTargets, validateSourcesJournalTargets, type CatalogOnlyStorageJournal, type LegacyMigrationStorageJournal, type LegacyMigrationStorageJournalV5, type MigrationStartInventory, type SourcesStorageJournal } from "./storage-journal.ts";
-import { projectMigrationInventory, scanMigrationInventory } from "./migration-inventory.ts";
+import { isManagedMigrationRootName, listManagedMigrationRootEntries, projectMigrationInventory, scanMigrationInventory } from "./migration-inventory.ts";
 import { acquireRootLease } from "./storage-root-lease.ts";
 import { resumeCompletedMigrationResolution } from "./migration-resolution.ts";
 import { buildMigrationBackupManifest, parseMigrationBackupManifest, verifyMigrationBackup, type MigrationBackupInputEntry } from "./migration-backup.ts";
@@ -1324,7 +1324,7 @@ async function assertLegacyMigrationSnapshot(root: string, request: LegacyAdoptO
   }
   const expectedEntries = [...request.rootEntries.filter((entry) => !(catalogHeld && entry === "catalog.json")), lockName,
     ...(backupCreated ? [".migration-backups"] : [])].sort();
-  const currentEntries = (await readdir(root)).sort();
+  const currentEntries = await listManagedMigrationRootEntries(root);
   if (JSON.stringify(currentEntries) !== JSON.stringify(expectedEntries) || await statMaybe(path.join(root, `${lockName}-recovery`))) {
     throw new Error("Library root entries changed during legacy migration; refusing the catalog switch.");
   }
@@ -1549,7 +1549,7 @@ async function inspectLegacyMigrationJournal(root: string, lock: string, token: 
   const owner = await readOwner(lock);
   if (!owner.migrationRootEntries) throw new Error("V4 migration owner is missing its private root-entry commitment.");
   const currentCatalogPath = path.join(root, "catalog.json");
-  const currentRootNames = (await readdir(root)).sort();
+  const currentRootNames = await listManagedMigrationRootEntries(root);
   const expectedRootNames = [...owner.migrationRootEntries, lockName, ".migration-backups",
     ...(recoveryClaim ? [`${lockName}-recovery`] : [])].sort();
   const currentRootCatalog = await checkedFile(currentCatalogPath);
@@ -1670,7 +1670,8 @@ function ownerFrom(value: unknown): Owner {
     const entries = owner.migrationRootEntries;
     if (!Array.isArray(entries) || entries.some((entry) => typeof entry !== "string" || !entry || entry.includes("/") || entry.includes("\\") || entry.includes("\0") || entry === "." || entry === "..") ||
         new Set(entries).size !== entries.length || JSON.stringify([...entries].sort()) !== JSON.stringify(entries) ||
-        entries.some((entry) => entry === lockName || entry === `${lockName}-recovery` || entry === ".migration-backups")) {
+        entries.some((entry) => !isManagedMigrationRootName(entry) ||
+          entry === lockName || entry === `${lockName}-recovery` || entry === ".migration-backups")) {
       throw new Error("Copi migration lock owner root-entry commitment is malformed; inspect the lock before recovery.");
     }
   }
@@ -1762,7 +1763,10 @@ export class StorageTransactions {
     const rootLease = await acquireRootLease(root, this.options.waitMilliseconds ?? 5_000);
     try {
     await resumeCompletedMigrationResolution(root, () => rootLease.assertCurrent());
-    if (create) await chmod(root, 0o700);
+    if (create) {
+      await chmod(root, 0o700);
+      await rootLease.updateExpectedMode(0o700);
+    }
     const lock = path.join(root, lockName);
     const owner: Owner = { version: 1, pid: process.pid, host: os.hostname(), token: randomUUID() };
     const deadline = Date.now() + (this.options.waitMilliseconds ?? 5_000);
@@ -2011,7 +2015,8 @@ export class StorageSession {
     if (new Set(request.rootEntries).size !== request.rootEntries.length ||
         JSON.stringify([...request.rootEntries].sort()) !== JSON.stringify(request.rootEntries) ||
         !request.rootEntries.includes("catalog.json") ||
-        request.rootEntries.some((entry) => entry === lockName || entry === `${lockName}-recovery` || entry === ".migration-backups")) {
+        request.rootEntries.some((entry) => !isManagedMigrationRootName(entry) ||
+          entry === lockName || entry === `${lockName}-recovery` || entry === ".migration-backups")) {
       throw new Error("Adopt-only migration root entries are not a fixed canonical snapshot.");
     }
     await this.assertLease(false);
