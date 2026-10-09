@@ -59,7 +59,7 @@ test("legacy review cannot authorize omission of an ordinary source child", asyn
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [] },
     });
-  }), /before|delet|review/i);
+  }, { requiresNativePlacement: false }), /before|delet|review/i);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "remove.md")), box.removed);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), box.catalog);
   assert.equal((await lstat(path.join(box.libraryDir, "sources", itemId))).isDirectory(), true);
@@ -83,7 +83,7 @@ test("confirmed before review permits deletion only of captured ordinary childre
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [] },
     });
-  });
+  }, { requiresNativePlacement: false });
   await assert.rejects(lstat(path.join(box.itemRoot, "remove.md")), { code: "ENOENT" });
   await assert.rejects(lstat(unregisteredPath), { code: "ENOENT" });
   assert.deepEqual(await readFile(path.join(box.itemRoot, "SKILL.md")), Buffer.from("# Reviewed\n"));
@@ -104,7 +104,7 @@ test("before review refuses changed source bytes without discarding external edi
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [] },
     }), /changed|revision/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(await readFile(path.join(box.itemRoot, "remove.md")), edited);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), box.catalog);
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
@@ -123,7 +123,7 @@ test("before review refuses source mode changes without overwriting them", async
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [] },
     }), /changed|revision/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(await readFile(source), box.removed);
   assert.equal((await lstat(source)).mode & 0o777, 0o600);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), box.catalog);
@@ -143,7 +143,7 @@ test("before review rejects an atomic same-bytes replacement by identity", async
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [] },
     }), /changed|revision/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(await readFile(path.join(box.itemRoot, "remove.md")), box.removed);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), box.catalog);
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
@@ -160,7 +160,7 @@ test("forged token copies cannot authorize source deletion", async (t) => {
       review: forged,
       approval: { reviewId: forged.reviewId, confirmed: true, approvedSensitivePaths: [] },
     });
-  }), /review does not match/i);
+  }, { requiresNativePlacement: false }), /review does not match/i);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "remove.md")), box.removed);
   assert.deepEqual(JSON.parse(await readFile(path.join(box.libraryDir, "catalog.json"), "utf8")), box.catalog);
 });
@@ -172,7 +172,7 @@ test("foreign before-review token cannot authorize source deletion", async (t) =
     assert.ok(session);
     const expected = await session.capture();
     return session.prepareSourcesReview(expected, foreign.catalogBytes, foreign.replacements);
-  });
+  }, { requiresNativePlacement: false });
   await assert.rejects(new StorageTransactions().run(target.libraryDir, false, async (session) => {
     assert.ok(session);
     const expected = await session.capture();
@@ -180,7 +180,7 @@ test("foreign before-review token cannot authorize source deletion", async (t) =
       review: foreignReview,
       approval: { reviewId: foreignReview.reviewId, confirmed: true, approvedSensitivePaths: [] },
     });
-  }), /another root|expected revision/i);
+  }, { requiresNativePlacement: false }), /another root|expected revision/i);
   assert.deepEqual(await readFile(path.join(target.itemRoot, "remove.md")), target.removed);
   assert.deepEqual(JSON.parse(await readFile(path.join(target.libraryDir, "catalog.json"), "utf8")), target.catalog);
 });
@@ -198,7 +198,7 @@ test("canceling an approved omission restores the before tree and leaves no tran
       review: prepared,
       approval: { reviewId: prepared.reviewId, confirmed: true, approvedSensitivePaths: [] },
     });
-  }), /cancel before review commit/);
+  }, { requiresNativePlacement: false }), /cancel before review commit/);
   assert.ok(review);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "remove.md")), box.removed);
   assert.equal((await lstat(path.join(box.itemRoot, "remove.md"))).mode & 0o777, 0o640);
@@ -212,7 +212,7 @@ test("canceling an approved omission restores the before tree and leaves no tran
       review: replayReview,
       approval: { reviewId: replayReview.reviewId, confirmed: true, approvedSensitivePaths: [] },
     });
-  }), /already been used/);
+  }, { requiresNativePlacement: false }), /already been used/);
 });
 
 test("before review refuses independent empty directories instead of deleting them", async (t) => {
@@ -223,7 +223,7 @@ test("before review refuses independent empty directories instead of deleting th
     assert.ok(session);
     const expected = await session.capture();
     await assert.rejects(session.prepareSourcesReview(expected, box.catalogBytes, box.replacements), /empty|directory/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.equal((await lstat(path.join(box.itemRoot, "empty"))).isDirectory(), true);
   assert.deepEqual(await readFile(path.join(box.itemRoot, "remove.md")), box.removed);
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });

@@ -58,7 +58,7 @@ test("single-file source replacement preserves sibling and unregistered files in
     assert.ok(session);
     const revision = await session.capture();
     await session.commit(revision, catalogBytes(modern), replacements);
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(await readFile(target), replacement);
   assert.deepEqual(await readFile(tester), beforeTester);
   assert.deepEqual(await readFile(note), beforeNote);
@@ -87,7 +87,7 @@ for (const point of ["before-swap", "old-renamed", "before-catalog"] as const) {
       assert.ok(session);
       const revision = await session.capture();
       await session.commit(revision, catalogBytes(modern), replacements);
-    }), /changed|external|journal|recover|snapshot/i);
+    }, { requiresNativePlacement: false }), /changed|external|journal|recover|snapshot/i);
     assert.equal(reached, true);
     const retained = point === "old-renamed" ? path.join(box.libraryDir, ".copi-transaction", "old-0") : target;
     assert.deepEqual(await readFile(retained), external);
@@ -105,7 +105,7 @@ test("v2 source revisions include directory entries and inode identity", async (
     await writeFile(sibling, "changed neighbor\n");
     const after = await session.capture();
     return { before, after };
-  });
+  }, { requiresNativePlacement: false });
   assert.notEqual(revisions.before.tree, revisions.after.tree);
   assert.equal(location.kind, "file");
 });

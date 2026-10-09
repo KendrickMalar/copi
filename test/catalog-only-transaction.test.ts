@@ -37,14 +37,14 @@ async function commitCatalogOnly(libraryDir: string, next: Catalog, checkpoint?:
   await new StorageTransactions(checkpoint ? { checkpoint } : {}).run(libraryDir, true, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), catalogBytes(next));
-  });
+  }, { requiresNativePlacement: false });
 }
 
 function catalogOnlyChild(libraryDir: string, next: Catalog, checkpoint: StorageCheckpoint): ChildProcessWithoutNullStreams {
   const sourceTest = import.meta.url.endsWith(".ts");
   const module = new URL(sourceTest ? "../src/storage-transaction.ts" : "../src/storage-transaction.js", import.meta.url).href;
   const bytes = catalogBytes(next).toString("base64");
-  const code = `import {StorageTransactions} from ${JSON.stringify(module)};\nconst tx=new StorageTransactions({checkpoint:async point=>{if(point===${JSON.stringify(checkpoint)}) { console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});\nawait tx.run(${JSON.stringify(libraryDir)},true,async session=>{await session.commit(await session.capture(),Buffer.from(${JSON.stringify(bytes)},'base64'));});`;
+  const code = `import {StorageTransactions} from ${JSON.stringify(module)};\nconst tx=new StorageTransactions({checkpoint:async point=>{if(point===${JSON.stringify(checkpoint)}) { console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});\nawait tx.run(${JSON.stringify(libraryDir)},true,async session=>{await session.commit(await session.capture(),Buffer.from(${JSON.stringify(bytes)},'base64'));},{requiresNativePlacement:false});`;
   return spawn(process.execPath, [...(sourceTest ? ["--experimental-transform-types"] : []), "--input-type=module", "-e", code], { env: process.env });
 }
 
@@ -74,7 +74,7 @@ async function commitRawCatalogOnly(libraryDir: string, rawCatalog: Buffer): Pro
   await new StorageTransactions().run(libraryDir, true, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), rawCatalog);
-  });
+  }, { requiresNativePlacement: false });
 }
 
 function rawCatalogWithUnknown(value: Catalog, location: readonly (string | number)[]): Buffer {
@@ -124,7 +124,7 @@ async function rebindJournalCatalog(lock: string, field: "oldCatalog" | "newCata
 }
 
 async function recover(libraryDir: string): Promise<void> {
-  await new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {});
+  await new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {}, { requiresNativePlacement: false });
 }
 
 test("catalog-only first group commit journals v3 without creating sources", async (t) => {

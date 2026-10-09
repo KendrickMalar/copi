@@ -51,7 +51,7 @@ test("StorageTransactions.run acquires the root lease before issuing a mutation 
   let callbackCalled = false;
   try {
     await assert.rejects(
-      new StorageTransactions({ waitMilliseconds: 0 }).run(root, false, async () => { callbackCalled = true; }),
+      new StorageTransactions({ waitMilliseconds: 0 }).run(root, false, async () => { callbackCalled = true; }, { requiresNativePlacement: false }),
       /lease|leased/i,
     );
     assert.equal(callbackCalled, false);
@@ -73,11 +73,11 @@ test("StorageTransactions.run waits for a cooperating root lease and proceeds af
     const first = new StorageTransactions({ waitMilliseconds: 1_000 }).run(root, false, async () => {
       enteredFirst();
       await firstGate;
-    });
+    }, { requiresNativePlacement: false });
     await firstEntered;
     const second = new StorageTransactions({ waitMilliseconds: 1_000 }).run(root, false, async () => {
       secondCalled = true;
-    }).then(() => true, () => false);
+    }, { requiresNativePlacement: false }).then(() => true, () => false);
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(secondCalled, false, "a competing writer must not enter while the first root lease is held");
     releaseFirst();

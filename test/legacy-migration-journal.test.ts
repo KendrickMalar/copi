@@ -393,7 +393,7 @@ test("stops safely on a v4 recovery journal until the dedicated kernel is implem
 
   try {
     await assert.rejects(
-      new StorageTransactions({ waitMilliseconds: 100 }).run(library, false, async () => assert.fail("v4 recovery must stop before issuing a session")),
+      new StorageTransactions({ waitMilliseconds: 100 }).run(library, false, async () => assert.fail("v4 recovery must stop before issuing a session"), { requiresNativePlacement: false }),
       /Legacy migration v4 recovery is not implemented/,
     );
     assert.deepEqual(await readFile(path.join(lock, "owner.json")), ownerBytes);

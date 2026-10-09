@@ -63,7 +63,7 @@ test("v2 revision binds catalog and current sources bytes, listing, and inode id
     const beforeCatalogChange = await session.capture();
     await writeFile(catalogPath, Buffer.from(`${JSON.stringify({ version: 2, items: [], groups: [{ id: "changed", name: "Changed", itemIds: [] }] }, null, 2)}\n`), { mode: 0o600 });
     await assert.rejects(session.assertRevision(beforeCatalogChange), /changed|revision/i);
-  });
+  }, { requiresNativePlacement: false });
 });
 
 test("v1 revision stays bound to its legacy items tree and ordinary commit refuses v1", async (t) => {
@@ -95,7 +95,7 @@ test("v1 revision stays bound to its legacy items tree and ordinary commit refus
     const beforeCommit = await readFile(path.join(box.libraryDir, "catalog.json"));
     await assert.rejects(session.commit(await session.capture(), legacyCatalog), /v2|migrat/i);
     assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), beforeCommit);
-  });
+  }, { requiresNativePlacement: false });
 });
 
 test("ordinary v2 commit cannot create a new v1 catalog", async (t) => {
@@ -107,7 +107,7 @@ test("ordinary v2 commit cannot create a new v1 catalog", async (t) => {
   await new StorageTransactions().run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await assert.rejects(session.commit(await session.capture(), legacy), /v2|migrat/i);
-  });
+  }, { requiresNativePlacement: false });
 
   assert.deepEqual(await readFile(catalogPath), before);
 });
@@ -118,5 +118,5 @@ test("v2 storage capture succeeds when the legacy items directory is absent", as
     assert.ok(session);
     const revision = await session.capture();
     await session.assertRevision(revision);
-  });
+  }, { requiresNativePlacement: false });
 });

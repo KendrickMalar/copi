@@ -135,7 +135,7 @@ test("writes a canonical v5 journal containing the complete read-only migration-
             rawJournal = await readFile(path.join(root, ".copi-transaction", "journal.json"), "utf8");
             journal = JSON.parse(rawJournal) as Record<string, unknown>;
           }
-        } }).run(root, create, operation),
+        } }).run(root, create, operation, { requiresNativePlacement: false }),
     });
     try {
       await commitMigration(plan, approvalFor(plan));
@@ -261,9 +261,9 @@ test("does not authorize a raw review that redirects an items-only plan to unrel
         confirmed: true,
         approvedSensitivePaths: [],
       });
-    }), /issued|invalid|review/i);
+    }, { requiresNativePlacement: false }), /issued|invalid|review/i);
     let expiredSession: StorageSession | undefined;
-    await storageTransactions.run(fixture.root, false, async (session) => { expiredSession = session; });
+    await storageTransactions.run(fixture.root, false, async (session) => { expiredSession = session; }, { requiresNativePlacement: false });
     assert.ok(expiredSession);
     await assert.rejects(expiredSession.commitLegacyMigration(copiedReview, {
       reviewId: plan.reviewId,
@@ -376,7 +376,7 @@ test("rolls back a catalog-switch failure while retaining the permanent verified
       value: <T>(root: string, create: boolean, operation: (session: import("../src/storage-transaction.ts").StorageSession | undefined) => Promise<T>) =>
         new StorageTransactions({ checkpoint: (point) => {
           if (point === "catalog-renamed") throw new Error("synthetic catalog switch fault");
-        } }).run(root, create, operation),
+        } }).run(root, create, operation, { requiresNativePlacement: false }),
     });
     try {
       await assert.rejects(commitMigration(plan, approvalFor(plan)), /synthetic catalog switch fault/i);
@@ -450,7 +450,7 @@ test("recovers an adopt-only catalog hold after SIGKILL and keeps the permanent 
       const { StorageTransactions, storageTransactions } = await import(${JSON.stringify(transactionUrl)});
       Object.defineProperty(storageTransactions, "run", { configurable: true, value: (root, create, operation) =>
         new StorageTransactions({ checkpoint: (point) => { if (point === "catalog-held") process.kill(process.pid, "SIGKILL"); } })
-          .run(root, create, operation) });
+          .run(root, create, operation, { requiresNativePlacement: false }) });
       const { prepareMigration, readMigration, commitMigration } = await import(${JSON.stringify(migrationUrl)});
       const plan = await prepareMigration(process.argv[1]);
       const view = readMigration(plan);
@@ -472,7 +472,7 @@ test("recovers an adopt-only catalog hold after SIGKILL and keeps the permanent 
     await writeFile(journalPath, journalBytes);
     await writeFile(path.join(fixture.root, ".copi-transaction", "journal.digest"), Buffer.from(digest(journalBytes)));
 
-    await assert.rejects(new StorageTransactions({ waitMilliseconds: 100 }).run(fixture.root, false, async () => undefined), /unknown|canonical|stored fields/i);
+    await assert.rejects(new StorageTransactions({ waitMilliseconds: 100 }).run(fixture.root, false, async () => undefined, { requiresNativePlacement: false }), /unknown|canonical|stored fields/i);
     assert.equal(await lstat(path.join(fixture.root, "catalog.json")).catch((error: NodeJS.ErrnoException) => error.code), "ENOENT");
     assert.deepEqual(await readFile(stagePath), alteredNextBytes);
     assert.ok((await readdir(path.join(fixture.root, ".copi-transaction"))).includes("journal.json"));
@@ -504,7 +504,7 @@ test("stops and preserves the journal when an unrelated root entry changes after
             await writeBytes(root, "unreviewed-root-entry.bin", Buffer.from("preserve this unrelated entry\n"), 0o600);
             throw new Error("synthetic external root edit");
           }
-        } }).run(root, create, operation),
+        } }).run(root, create, operation, { requiresNativePlacement: false }),
     });
     try {
       await assert.rejects(commitMigration(plan, approvalFor(plan)), /recover|root entries|external root edit/i);
@@ -537,7 +537,7 @@ test("preserves and blocks a new backup sibling outside the journal-owned UUID",
       value: <T>(root: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>) =>
         new StorageTransactions({ checkpoint: async (point) => {
           if (point === "catalog-renamed") await writeBytes(root, siblingPath, siblingBytes, 0o600);
-        } }).run(root, create, operation),
+        } }).run(root, create, operation, { requiresNativePlacement: false }),
     });
     try {
       await assert.rejects(commitMigration(plan, approvalFor(plan)), /outside|changed|preserv|recovery/i);

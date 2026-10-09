@@ -174,7 +174,7 @@ test("S5 direct kernel secret replacement requires exact review approval", async
   const review = prepareStorageReview(p.bytes, p.replacements);
   const approve = { confirmed: true, reviewId: review.reviewId, approvedSensitivePaths: readStorageReview(review).sensitivePaths };
   for (const bad of [ { ...approve, confirmed: "yes" as unknown as boolean }, { ...approve, reviewId: "other" }, { ...approve, approvedSensitivePaths: [] }, { ...approve, approvedSensitivePaths: [...approve.approvedSensitivePaths, ...approve.approvedSensitivePaths] } ]) {
-    await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), p.bytes, p.replacements, { review, approval: bad })), /approval|review/i);
+    await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), p.bytes, p.replacements, { review, approval: bad }), { requiresNativePlacement: false }), /approval|review/i);
   }
   assert.deepEqual(await rawTree(b.library), before);
   await evidence(b, "kernel-secret-rejections");
@@ -202,7 +202,7 @@ test("S5 catalog save requires inspection; metadata-only descriptor registration
   assert.deepEqual(await readFile(newPath), Buffer.from(secret));
   assert.deepEqual((await loadCatalog(b.library)).items[0]!.files, descriptorBefore);
 
-  await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(changed))), /A catalog-only transaction may change only item names and legal destinations; source metadata, descriptors, and content are fixed\./);
+  await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(changed)), { requiresNativePlacement: false }), /A catalog-only transaction may change only item names and legal destinations; source metadata, descriptors, and content are fixed\./);
   assert.deepEqual(await rawTree(b.library), before);
   assert.deepEqual(await readFile(newPath), Buffer.from(secret));
   await evidence(b, "catalog-only-secret-descriptor-rejected");
@@ -229,7 +229,7 @@ for (const mutation of ["body", "raw catalog", "group", "other item", "mode", "u
 test("S3 stale original/clone/name before-catalog/cross-library revisions rejected", async () => {
   const b = await box(); const other = await box();
   const stale = await loadCatalog(b.library);
-  const revision = await new StorageTransactions().run(b.library, false, async (s) => s!.capture());
+  const revision = await new StorageTransactions().run(b.library, false, async (s) => s!.capture(), { requiresNativePlacement: false });
   const current = await loadCatalog(b.library); current.groups[0]!.name = "Winner"; await saveCatalog(b.library, current);
   const before = await rawTree(b.library);
   stale.groups[0]!.name = "Stale";
@@ -242,7 +242,7 @@ test("S3 stale original/clone/name before-catalog/cross-library revisions reject
   await cp(path.join(b.library, ...currentItem.content.path.split("/")), otherContent, { recursive: true });
   const otherBefore = await rawTree(other.library);
   await assert.rejects(saveCatalog(other.library, current), /Copi library changed after preparation/);
-  await assert.rejects(new StorageTransactions().run(other.library, false, async (s) => s!.assertRevision(revision!)), /Copi library changed after preparation/);
+  await assert.rejects(new StorageTransactions().run(other.library, false, async (s) => s!.assertRevision(revision!), { requiresNativePlacement: false }), /Copi library changed after preparation/);
   assert.deepEqual(await rawTree(b.library), before);
   assert.deepEqual(await rawTree(other.library), otherBefore);
 });
@@ -255,7 +255,7 @@ for (const unsafe of ["", "/absolute", "..", "a/../b", "a\\b", "a\0b", "a//b", "
     await assert.rejects(importResource(b.library, { ...b.candidate, name: "Different", destination }, { confirmed: true, groupIds: [] }), /destination/i);
     const c = await loadCatalog(b.library); c.items[0]!.destination = destination;
     await assert.rejects(saveCatalog(b.library, c), /destination|catalog/i);
-    await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), Buffer.from(JSON.stringify(c)))), /destination|catalog/i);
+    await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), Buffer.from(JSON.stringify(c))), { requiresNativePlacement: false }), /destination|catalog/i);
     assert.deepEqual(await rawTree(b.library), before);
   });
 }
@@ -271,7 +271,7 @@ test("S4 destination independent of all item metadata/body/groups; reference-onl
   await assert.rejects(changeSavedDestination(b.library, b.item.id, destination), /reference|global-only/i);
   const c = await loadCatalog(b.library); c.items[0]!.destination = destination;
   await assert.rejects(saveCatalog(b.library, c), /reference|global-only/i);
-  await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(c))), /reference|global-only/i);
+  await assert.rejects(new StorageTransactions().run(b.library, false, async (s) => s!.commit(await s!.capture(), catalogBytes(c)), { requiresNativePlacement: false }), /reference|global-only/i);
   assert.deepEqual(await rawTree(b.library), held);
 });
 
@@ -503,7 +503,7 @@ for (const owner of ["malformed", "active", "foreign host"] as const) {
     const b = await box(); const lock = path.join(b.library, ".copi-transaction"); await mkdir(lock, { mode: 0o700 });
     await writeFile(path.join(lock, "owner.json"), JSON.stringify(owner === "malformed" ? {} : { version: 1, pid: process.pid, host: owner === "active" ? os.hostname() : "not-this-host", token: randomUUID() }), { mode: 0o600 });
     const before = await evidence(b, "unknown-lock-before", { owner });
-    await assert.rejects(new StorageTransactions({ waitMilliseconds: 40 }).run(b.library, false, async () => {}), /owner|active|host|lock/i);
+    await assert.rejects(new StorageTransactions({ waitMilliseconds: 40 }).run(b.library, false, async () => {}, { requiresNativePlacement: false }), /owner|active|host|lock/i);
     assert.deepEqual(await rawTree(b.library), before);
   });
 }
@@ -706,7 +706,7 @@ test("S4 v1 reader preserves legacy metadata and bytes; ordinary apply requires 
 test("S2 expired session commit must reject BEFORE mutation and leave normal reader usable", async () => {
   const b = await box(); const p = await proposal(b); const before = await rawTree(b.library);
   let revision!: StorageRevision;
-  const escaped = await new StorageTransactions().run(b.library, false, async (s) => { assert.ok(s); revision = await s.capture(); return s; });
+  const escaped = await new StorageTransactions().run(b.library, false, async (s) => { assert.ok(s); revision = await s.capture(); return s; }, { requiresNativePlacement: false });
   const outcome = await escaped.commit(revision, p.bytes, p.replacements).then(() => "succeeded", (e: Error) => `rejected:${e.message}`);
   const after = await rawTree(b.library);
   const reader = await loadCatalog(b.library).then(() => "usable", (e: Error) => `rejected:${e.message}`);
@@ -734,7 +734,7 @@ for (const kind of ["changed nonce", "lost lock"] as const) {
         owner.token = randomUUID(); await writeFile(path.join(lock, "owner.json"), JSON.stringify(owner));
       } else await rename(lock, path.join(b.root, "displaced-lock"));
       commitOutcome = await s.commit(revision, p.bytes, p.replacements).then(() => "succeeded", (e: Error) => `rejected:${e.message}`);
-    }).catch((e: Error) => { console.log(`owner cleanup refused: ${e.message}`); });
+    }, { requiresNativePlacement: false }).catch((e: Error) => { console.log(`owner cleanup refused: ${e.message}`); });
     await evidence(b, "lease-owner-boundary", { kind, commitOutcome, live, oldCatalog: oldCatalog.toString("base64"), oldFile: oldFile.toString("base64") });
     assert.match(commitOutcome, /^rejected:/); assert.equal(live, false);
     assert.deepEqual(await readFile(path.join(b.library, "catalog.json")), oldCatalog); assert.deepEqual(await readFile(b.file), oldFile);
@@ -748,7 +748,7 @@ test("S2 forged StorageSession token cannot borrow another active lease", async 
     assert.ok(s);
     const forged = new StorageSession(s.root, path.join(s.root, ".copi-transaction"), randomUUID(), (point) => { if (point === "old-renamed") live = true; });
     outcome = await forged.commit(await s.capture(), p.bytes, p.replacements).then(() => "succeeded", (e: Error) => `rejected:${e.message}`);
-  });
+  }, { requiresNativePlacement: false });
   await evidence(b, "forged-session", { outcome, live, before });
   assert.match(outcome, /^rejected:/); assert.equal(live, false); assert.deepEqual(await rawTree(b.library), before);
 });
@@ -773,7 +773,7 @@ test("S5 kernel binds fixed approved bytes despite caller view/Buffer changes du
   (readStorageReview(review).sensitivePaths as string[]).length = 0;
   await new StorageTransactions({ checkpoint: (point) => {
     if (point === "stage-write") { p.bytes.fill(0); p.replacements[0]!.files[0]!.bytes.fill(0); approve.approvedSensitivePaths.length = 0; }
-  } }).run(b.library, false, async (s) => s!.commit(await s!.capture(), p.bytes, p.replacements, { review, approval: approve }));
+  } }).run(b.library, false, async (s) => s!.commit(await s!.capture(), p.bytes, p.replacements, { review, approval: approve }), { requiresNativePlacement: false });
   assert.deepEqual(await readFile(b.file), fixed);
   assert.equal((await readSnapshotFiles(b.library, b.item))[0]!.sha256, digest(fixed));
   await evidence(b, "kernel-fixed-bytes");

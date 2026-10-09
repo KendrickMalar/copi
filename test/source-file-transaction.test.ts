@@ -67,7 +67,7 @@ async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root
   return kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements);
-  });
+  }, { requiresNativePlacement: false });
 }
 
 function child(box: Fixture, checkpoint: string, orphanName?: string): ChildProcessWithoutNullStreams {
@@ -79,7 +79,7 @@ function child(box: Fixture, checkpoint: string, orphanName?: string): ChildProc
     : "";
   const code = `import {writeFile} from 'node:fs/promises'; import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}) { ${orphanWrite} console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});
-await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]));`;
+await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]),{requiresNativePlacement:false});`;
   return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { env: process.env });
 }
 
@@ -114,7 +114,7 @@ async function crashedFixture(t: test.TestContext, checkpoint: string, orphanNam
 }
 
 async function recover(box: Fixture): Promise<void> {
-  await new StorageTransactions({ waitMilliseconds: 100 }).run(box.libraryDir, false, async () => {});
+  await new StorageTransactions({ waitMilliseconds: 100 }).run(box.libraryDir, false, async () => {}, { requiresNativePlacement: false });
 }
 
 test("registered v2 file replacement swaps only its sources file and preserves neighbor/unregistered inode identities", async (t) => {
@@ -169,7 +169,7 @@ test("SIGKILL during source-file rollback recovery can be recovered again", asyn
   const catalogBytes = Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`).toString("base64");
   const code = `import {StorageTransactions} from ${JSON.stringify(moduleUrl)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point==='before-catalog')throw new Error('start rollback');if(point==='rollback-restored'){console.log('ROLLBACK_PAUSED');setInterval(()=>{},1000);await new Promise(()=>{});}}});
-await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]));`;
+await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes)},'base64'),[{itemId:${JSON.stringify(coderId)},files:[{path:'coder.md',mode:420,bytes:Buffer.from('edited coder\\n')}]}]),{requiresNativePlacement:false});`;
   const writer = spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { env: process.env });
   await stopAt(writer, "ROLLBACK_PAUSED");
   await recover(box);
@@ -206,7 +206,7 @@ test("v2 commit keeps direct pre-capture edits as the old source revision and in
   await kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), Buffer.from(`${JSON.stringify(before, null, 2)}\n`), replacements);
-  });
+  }, { requiresNativePlacement: false });
   assert.equal(await readFile(box.coderPath, "utf8"), "approved after manual edit\n");
 });
 
@@ -223,7 +223,7 @@ test("v2 commit rejects stale same-inode and atomic edits made after capture", a
         if (edit === "same-inode") await writeFile(box.coderPath, external);
         else externalIdentity = await atomicReplace(box.coderPath, external);
         await assert.rejects(session.commit(revision, Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements), /changed|revision/i);
-      });
+      }, { requiresNativePlacement: false });
       assert.deepEqual(await readFile(box.coderPath), external);
       if (externalIdentity) {
         const stat = await lstat(box.coderPath);
@@ -491,7 +491,7 @@ test("v1 legacy journal recovery still restores its original snapshot and catalo
   await writeFile(path.join(lock, "journal.json"), journalBytes, { mode: 0o600 });
   await writeFile(path.join(lock, "journal.digest"), digest(journalBytes), { mode: 0o600 });
 
-  await new StorageTransactions({ waitMilliseconds: 100 }).run(canonicalLibrary, false, async () => {});
+  await new StorageTransactions({ waitMilliseconds: 100 }).run(canonicalLibrary, false, async () => {}, { requiresNativePlacement: false });
 
   assert.deepEqual(await readFile(path.join(itemDirectory, "files", "coder.md")), oldBytes);
   assert.deepEqual(await readFile(path.join(canonicalLibrary, "catalog.json")), oldCatalogBytes);
@@ -515,11 +515,11 @@ test("v2 staged file is private and secret approval remains opaque and per-file"
   await assert.rejects(kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), bytes, replacements);
-  }), /approval|inspection/i);
+  }, { requiresNativePlacement: false }), /approval|inspection/i);
   await kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), bytes, replacements, { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths } });
-  });
+  }, { requiresNativePlacement: false });
   assert.equal(mode, 0o600);
   assert.equal(await readFile(box.coderPath, "utf8"), secret.toString());
 });
@@ -530,7 +530,7 @@ test("v2 transaction rejects replacement paths that do not name the registered c
   await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), bad);
-  }), /target|content|file|path/i);
+  }, { requiresNativePlacement: false }), /target|content|file|path/i);
   assert.equal(await readFile(box.coderPath, "utf8"), "old coder\n");
   assert.equal(await readFile(box.testerPath, "utf8"), "neighbor tester\n");
 });

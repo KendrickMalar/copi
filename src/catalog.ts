@@ -330,7 +330,7 @@ export async function loadCatalog(libraryDir: string): Promise<StoredCatalog> {
     await session.assertRevision(revision);
     catalogRevisions.set(catalog, revision);
     return catalog;
-  });
+  }, { requiresNativePlacement: false });
 }
 
 export interface SavedLibraryState {
@@ -352,7 +352,7 @@ export async function withSavedLibrary<T>(libraryDir: string, operation: (state:
     for (const item of catalog.items) files.set(item.id, await readSnapshotFilesUnlocked(session.root, catalog, item));
     await session.assertRevision(revision);
     return operation({ catalog, revision, files, session });
-  });
+  }, { requiresNativePlacement: false });
 }
 
 export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
@@ -388,7 +388,7 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
     }
     await session.commit(revision, catalogBytes(validated));
     catalogRevisions.set(catalog, await session.capture());
-  });
+  }, { requiresNativePlacement: false });
 }
 
 async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[], approvedSensitivePaths: readonly string[]): Promise<SavedItem> {
@@ -516,7 +516,7 @@ export async function readSnapshotFiles(libraryDir: string, item: SavedItem | Le
     const result = await readSnapshotFilesUnlocked(session.root, catalog, item);
     await session.assertRevision(revision);
     return result;
-  });
+  }, { requiresNativePlacement: false });
 }
 
 /** Persist staged, explicit name-only changes together, so cancellation never partially resolves names. */

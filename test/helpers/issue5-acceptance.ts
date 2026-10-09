@@ -104,7 +104,7 @@ export async function kernel(b: Box, p: Awaited<ReturnType<typeof proposal>>, op
   return new StorageTransactions(options).run(b.library, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), p.bytes, p.replacements);
-  });
+  }, { requiresNativePlacement: false });
 }
 export async function child(b: Box, code: string) {
   const root = await mkdtemp(path.join(b.root, "process-"));
@@ -147,5 +147,5 @@ const tx=new StorageTransactions({checkpoint:async(point)=>{
 if(${rollback} && point==='catalog-renamed') throw new Error('independent rollback trigger');
 if(point===${JSON.stringify(boundary)}) {console.log('BOUNDARY');setInterval(()=>{},1000);await new Promise(()=>{});}
 }});
-await tx.run(${JSON.stringify(b.library)},false,async(s)=>s.commit(await s.capture(),Buffer.from(${JSON.stringify(p.bytes.toString("base64"))},'base64'),${JSON.stringify(p.replacements)}.map(r=>({...r,files:r.files.map(f=>({...f,bytes:Buffer.from(f.bytes.data)}))}))));`;
+await tx.run(${JSON.stringify(b.library)},false,async(s)=>s.commit(await s.capture(),Buffer.from(${JSON.stringify(p.bytes.toString("base64"))},'base64'),${JSON.stringify(p.replacements)}.map(r=>({...r,files:r.files.map(f=>({...f,bytes:Buffer.from(f.bytes.data)}))}))),{requiresNativePlacement:false});`;
 }

@@ -99,7 +99,7 @@ async function kernelCommit(box: ModernFixture, checkpoint?: (point: StorageChec
   await kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }]);
-  });
+  }, { requiresNativePlacement: false });
 }
 
 // Losing this guard would overwrite another process's group changes.
@@ -236,7 +236,7 @@ for (const corruption of ["unknown owner", "missing journal", "altered journal",
     const file = await readFile(box.file);
     const catalog = await readFile(path.join(box.libraryDir, "catalog.json"));
     const kernel = new StorageTransactions({ waitMilliseconds: 60 });
-    await assert.rejects(kernel.run(box.libraryDir, false, async () => {}), /lock|journal|recovery|rollback|altered/i);
+    await assert.rejects(kernel.run(box.libraryDir, false, async () => {}, { requiresNativePlacement: false }), /lock|journal|recovery|rollback|altered/i);
     assert.deepEqual(await readFile(box.file), file);
     assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalog);
     assert.ok(await lstat(lock));
@@ -251,8 +251,8 @@ test("S3 revisions are library-bound and readers do not create absent libraries"
   const other = path.join(box.root, "other");
   await saveCatalog(other, { version: 2, items: [], groups: [] });
   const kernel = new StorageTransactions();
-  const revision = await kernel.run(box.libraryDir, false, async (session) => session!.capture());
-  await assert.rejects(kernel.run(other, false, async (session) => session!.assertRevision(revision)), /changed|revision/i);
+  const revision = await kernel.run(box.libraryDir, false, async (session) => session!.capture(), { requiresNativePlacement: false });
+  await assert.rejects(kernel.run(other, false, async (session) => session!.assertRevision(revision), { requiresNativePlacement: false }), /changed|revision/i);
 });
 
 test("S3 stale initially absent catalog cannot erase a subsequently created library", async (t) => {
@@ -348,7 +348,7 @@ test("S1/S6 catalog-only transaction cannot rewrite file descriptors after a dir
   const kernel = new StorageTransactions();
   const wrong = structuredClone(box.catalog);
   wrong.items[0]!.files[0]!.sha256 = "f".repeat(64);
-  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong)))), /catalog-only|descriptor|source/i);
+  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong))), { requiresNativePlacement: false }), /catalog-only|descriptor|source/i);
 
   const manual = Buffer.from("manual direct source edit\n");
   await writeFile(box.file, manual);
@@ -357,7 +357,7 @@ test("S1/S6 catalog-only transaction cannot rewrite file descriptors after a dir
   assert.equal(current.sha256, createHash("sha256").update(manual).digest("hex"));
   assert.equal(box.catalog.items[0]!.files[0]!.sha256, createHash("sha256").update("old snapshot\n").digest("hex"));
   wrong.items[0]!.files[0]!.sha256 = current.sha256;
-  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong)))), /catalog-only|descriptor|source/i);
+  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong))), { requiresNativePlacement: false }), /catalog-only|descriptor|source/i);
   assert.deepEqual(await readFile(box.file), manual);
 });
 
@@ -373,15 +373,15 @@ test("S5 generalized kernel accepts only an authentic byte-bound review with mat
   assert.deepEqual(readStorageReview(review).sensitivePaths, approvedSensitivePaths);
   const approval = { confirmed: true, reviewId: review.reviewId, approvedSensitivePaths };
   for (const invalid of [{ ...approval, confirmed: false }, { ...approval, reviewId: "another-review" }, { ...approval, approvedSensitivePaths: [] }]) {
-    await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval: invalid })), /approval|review/i);
+    await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval: invalid }), { requiresNativePlacement: false }), /approval|review/i);
   }
-  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review: {reviewId:review.reviewId} as StorageReview, approval })), /review/i);
+  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review: {reviewId:review.reviewId} as StorageReview, approval }), { requiresNativePlacement: false }), /review/i);
   const wrongBytes = [{ itemId: box.item.id, files: [{ ...box.files[0]!, bytes: Buffer.from("apiKey=sk_live_unreviewed123456\n") }] }];
-  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, wrongBytes, { review, approval })), /review|bytes/i);
+  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, wrongBytes, { review, approval }), { requiresNativePlacement: false }), /review|bytes/i);
   (readStorageReview(review).sensitivePaths as string[]).length = 0;
   const expected = Buffer.from(secret);
   const kernel = new StorageTransactions({ checkpoint: (point) => { if (point === "stage-write") { secret.fill(0); bytes.fill(0); } } });
-  await kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval }));
+  await kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval }), { requiresNativePlacement: false });
   assert.deepEqual(await readFile(box.file), expected);
   assert.deepEqual((await readSnapshotFiles(box.libraryDir, box.item))[0]!.bytes, expected);
 });
@@ -499,7 +499,7 @@ for (const ownerKind of ["active", "unknown host"] as const) {
     await mkdir(lock, { mode: 0o700 });
     const { hostname } = await import("node:os");
     await writeFile(path.join(lock, "owner.json"), JSON.stringify({version:1,pid:process.pid,host:ownerKind === "active" ? hostname() : "unknown-machine",token:randomUUID()}), {mode:0o600});
-    await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(box.libraryDir, false, async () => {}), /active process|unknown host|unsafe/i);
+    await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(box.libraryDir, false, async () => {}, { requiresNativePlacement: false }), /active process|unknown host|unsafe/i);
     assert.ok(await lstat(lock));
     assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
   });
@@ -513,7 +513,7 @@ test("S3 a valid dead transaction copied into a different library is not replaye
   const lock = path.join(b.libraryDir, ".copi-transaction");
   await cp(path.join(a.libraryDir, ".copi-transaction"), lock, { recursive: true });
   const before = await readFile(path.join(b.libraryDir, "catalog.json"));
-  await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(b.libraryDir, false, async () => {}), /journal|recovery/i);
+  await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(b.libraryDir, false, async () => {}, { requiresNativePlacement: false }), /journal|recovery/i);
   assert.deepEqual(await readFile(path.join(b.libraryDir, "catalog.json")), before);
   assert.equal(await readFile(b.file, "utf8"), "old snapshot\n");
   assert.ok(await lstat(lock));
@@ -625,7 +625,7 @@ test("S2 a forged session with the real nonce still has no issued lease", async 
     const { StorageSession } = await import("../src/storage-transaction.ts");
     const forged = new StorageSession(session.root, lock, owner.token);
     await assert.rejects(forged.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }]), /invalid|session|lease/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
   assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
 });
@@ -673,7 +673,7 @@ test("S2 an externally recreated lock with identical owner fields is not the iss
 
 test("S2 callback expiry also revokes capture and recovery entry points", async (t) => {
   const box = await transactionFixture(t);
-  const session = await new StorageTransactions().run(box.libraryDir, false, async (issued) => { assert.ok(issued); return issued; });
+  const session = await new StorageTransactions().run(box.libraryDir, false, async (issued) => { assert.ok(issued); return issued; }, { requiresNativePlacement: false });
   await assert.rejects(session.capture(), /expired|session|lease/i);
   await assert.rejects(session.recover(true), /expired|session|lease/i);
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
@@ -696,7 +696,7 @@ test("S2 F5 callback closes while commit waits after old rename: no half-update 
     pending = session.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }])
       .then(() => ({ success: true }), (error: Error) => ({ success: false, error: error.message }));
     await reached;
-  });
+  }, { requiresNativePlacement: false });
   // Same ordering as the independent F5: only resume after run has returned.
   resume();
   assert.ok(pending);
@@ -721,6 +721,6 @@ test("S5 raw storage approval requires boolean true as well as the authenticated
   box.next.items[0]!.files[0]!.sha256 = createHash("sha256").update(box.files[0]!.bytes).digest("hex");
   const bytes = catalogBytes(box.next); const replacements = [{itemId:box.item.id,files:box.files}];
   const review = prepareStorageReview(bytes, replacements);
-  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, {review,approval:{confirmed:"false" as unknown as boolean,reviewId:review.reviewId,approvedSensitivePaths:readStorageReview(review).sensitivePaths}})), /approval|confirm/i);
+  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, {review,approval:{confirmed:"false" as unknown as boolean,reviewId:review.reviewId,approvedSensitivePaths:readStorageReview(review).sensitivePaths}}), { requiresNativePlacement: false }), /approval|confirm/i);
   assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
 });

@@ -46,7 +46,7 @@ export async function kernelCommit(box: TransactionFixture, checkpoint?: (point:
   return kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }]);
-  });
+  }, { requiresNativePlacement: false });
 }
 export function child(box: TransactionFixture, code: string): ChildProcessWithoutNullStreams {
   return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), { cwd: box.projectDir, env: { ...process.env, HOME: box.homeDir, PI_CODING_AGENT_DIR: box.agentDir, TMPDIR: process.env.TMPDIR!, NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE!, NPM_CONFIG_USERCONFIG: "/dev/null" } });
@@ -76,5 +76,5 @@ export function interruptedCode(box: TransactionFixture, checkpoint: StorageChec
   const module = fixtureModuleUrl(import.meta.url, "../../src/storage-transaction");
   return `import {StorageTransactions} from ${JSON.stringify(module)};
 const kernel=new StorageTransactions({checkpoint:async(point)=>{if(point===${JSON.stringify(checkpoint)}) { console.log('PAUSED'); setInterval(()=>{},1000); await new Promise(()=>{}); }}});
-await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>{await session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes(box.next).toString("base64"))},'base64'),[{itemId:${JSON.stringify(box.item.id)},files:[{path:'source.md',mode:${box.files[0]!.mode},bytes:Buffer.from('new snapshot\\n')}]}]);});`;
+await kernel.run(${JSON.stringify(box.libraryDir)},false,async(session)=>{await session.commit(await session.capture(),Buffer.from(${JSON.stringify(catalogBytes(box.next).toString("base64"))},'base64'),[{itemId:${JSON.stringify(box.item.id)},files:[{path:'source.md',mode:${box.files[0]!.mode},bytes:Buffer.from('new snapshot\\n')}]}]);},{requiresNativePlacement:false});`;
 }

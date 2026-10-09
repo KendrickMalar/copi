@@ -1108,7 +1108,7 @@ export async function commitMigration(plan: PreparedMigration, approval: ChangeA
   await storageTransactions.run(state.root, false, async (session) => {
     if (!session || session.root !== state.root) throw new Error("Issued storage lease does not match the reviewed canonical migration root.");
     await session.commitLegacyMigration(storageReview, approval);
-  });
+  }, { requiresNativePlacement: false });
   return {
     catalogVersion: 2,
     backupDir,

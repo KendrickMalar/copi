@@ -99,7 +99,7 @@ async function commitWithoutReview(box: Fixture, checkpoint?: (point: StorageChe
   return kernel.run(box.libraryDir, false, async (session) => {
     assert.ok(session);
     await session.commit(await session.capture(), Buffer.from(`${JSON.stringify(box.next, null, 2)}\n`), box.replacements);
-  });
+  }, { requiresNativePlacement: false });
 }
 
 async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>) {
@@ -114,7 +114,7 @@ async function commit(box: Fixture, checkpoint?: (point: StorageCheckpoint, root
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths },
     });
-  });
+  }, { requiresNativePlacement: false });
 }
 
 function crashWriter(box: Fixture, checkpoint: StorageCheckpoint): ChildProcessWithoutNullStreams {
@@ -129,7 +129,7 @@ const catalog=Buffer.from(${JSON.stringify(catalogBytes)},'base64');
 const replacements=[{itemId:${JSON.stringify(skillId)},files:[{path:'SKILL.md',mode:493,bytes:Buffer.from(${JSON.stringify(box.skillBytes.toString())})},{path:'docs/added.md',mode:416,bytes:Buffer.from(${JSON.stringify(box.addedBytes.toString())})}]}];
 const review=await session.prepareSourcesReview(revision,catalog,replacements);
 await session.commit(revision,catalog,replacements,{review,approval:{reviewId:review.reviewId,confirmed:true,approvedSensitivePaths:[]}});
-});`;
+},{requiresNativePlacement:false});`;
   const options = sourceRun ? ["--experimental-transform-types", "--input-type=module", "-e", code] : ["--input-type=module", "-e", code];
   return spawn(process.execPath, options, { cwd: box.root, env: process.env });
 }
@@ -153,7 +153,7 @@ async function crashAt(child: ChildProcessWithoutNullStreams): Promise<void> {
 }
 
 async function recover(box: Fixture): Promise<void> {
-  await new StorageTransactions({ waitMilliseconds: 100 }).run(box.libraryDir, false, async () => {});
+  await new StorageTransactions({ waitMilliseconds: 100 }).run(box.libraryDir, false, async () => {}, { requiresNativePlacement: false });
 }
 
 test("registered tree replacement stages fixed included files and swaps only that item root", async (t) => {
@@ -228,7 +228,7 @@ test("confirmed opaque before review permits deleting captured ordinary tree chi
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: view.sensitivePaths },
     });
-  });
+  }, { requiresNativePlacement: false });
   await assert.rejects(lstat(path.join(box.skillRoot, "docs", "removed.md")), { code: "ENOENT" });
   await assert.rejects(lstat(unregisteredPath), { code: "ENOENT" });
   assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), box.skillBytes);
@@ -262,7 +262,7 @@ test("tree edits after capture are rejected before any transaction is written", 
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths },
     }), /changed|unreviewed|tree/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.equal(await readFile(path.join(box.skillRoot, "after-capture.md"), "utf8"), "external after capture\\n");
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
 });
@@ -388,7 +388,7 @@ test("tree replacement requires opaque per-file approval for sensitive staged co
       review,
       approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths },
     });
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(privateModes, [0o700, 0o600]);
   assert.deepEqual(await readFile(path.join(box.skillRoot, "SKILL.md")), secret);
 });

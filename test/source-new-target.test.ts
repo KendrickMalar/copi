@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { importResource } from "../src/catalog.ts";
-import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageFile } from "../src/storage-transaction.ts";
+import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageFile, type StorageSession } from "../src/storage-transaction.ts";
 import { fixtureModuleUrl, fixtureNodeArgs } from "./helpers/storage-transaction.ts";
 import { readSourceContent } from "../src/source-content.ts";
 import type { Catalog, ResourceCandidate, SavedItem } from "../src/types.ts";
@@ -56,10 +56,11 @@ async function commitNewItem(
   groupIds: readonly string[] = [],
   checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>,
   approveSensitive = false,
+  runOption: "native-required" | "native-unneeded" | "omitted" = "native-required",
 ): Promise<void> {
   const kernel = new StorageTransactions(checkpoint === undefined ? {} : { checkpoint });
   const replacements = [{ itemId: item.id, files }];
-  await kernel.run(libraryDir, true, async (session) => {
+  const operation = async (session: StorageSession | undefined): Promise<void> => {
     assert.ok(session);
     const revision = await session.capture();
     const previous = revision.catalog === null
@@ -79,7 +80,17 @@ async function commitNewItem(
       ? { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: sensitive } }
       : undefined;
     await session.commit(revision, bytes, replacements, authorization);
-  }, { requiresNativePlacement: true });
+  };
+  if (runOption === "omitted") {
+    const runWithoutOptions = kernel.run as unknown as (
+      libraryDir: string,
+      create: boolean,
+      operation: (session: StorageSession | undefined) => Promise<void>,
+    ) => Promise<void>;
+    await runWithoutOptions.call(kernel, libraryDir, true, operation);
+  } else {
+    await kernel.run(libraryDir, true, operation, { requiresNativePlacement: runOption === "native-required" });
+  }
 }
 
 function newFile(name = "Draft", bytes = Buffer.from("reviewed new file\n")) {
@@ -128,7 +139,7 @@ async function stopAt(child: ChildProcessWithoutNullStreams): Promise<void> {
 }
 
 async function recover(libraryDir: string): Promise<void> {
-  await new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {});
+  await new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {}, { requiresNativePlacement: false });
 }
 
 function errorContainsCode(error: unknown, code: string): boolean {
@@ -167,6 +178,13 @@ async function fullInventory(root: string): Promise<string> {
     throw error;
   }
   return JSON.stringify(entries);
+}
+
+async function inventoryIgnoringTemporaryLockTimestamps(root: string): Promise<string> {
+  const entries = JSON.parse(await fullInventory(root)) as Array<Record<string, string | number | null>>;
+  return JSON.stringify(entries.map((entry) => entry.path === ".copi" && entry.kind === "directory"
+    ? { ...entry, mtimeNs: "temporary-lock", ctimeNs: "temporary-lock" }
+    : entry));
 }
 
 test("first v2 file item stores only reviewed bytes under a private UUID parent and preserves descriptor mode", async (t) => {
@@ -422,6 +440,32 @@ test("unsupported architecture stops every native-required new-source path befor
       assert.equal(homeAfter, homeBefore, "the complete synthetic HOME inventory must be byte/stat-identical");
       assert.equal(libraryAfter, libraryBefore, "the complete library inventory must be byte/stat-identical");
       await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+    });
+  }
+});
+
+test("false or omitted run declarations fail closed before new-item staging", async (t) => {
+  for (const runOption of ["native-unneeded", "omitted"] as const) {
+    await t.test(runOption, async (subtest) => {
+      const box = await fixture(subtest, { version: 2, items: [], groups: [] }, true);
+      const { item, files } = newFile(`Undeclared-${runOption}`);
+      const before = await inventoryIgnoringTemporaryLockTimestamps(box.root);
+      const checkpoints: StorageCheckpoint[] = [];
+      const originalArch = Object.getOwnPropertyDescriptor(process, "arch");
+      Object.defineProperty(process, "arch", { configurable: true, value: "x64" });
+      try {
+        await assert.rejects(
+          commitNewItem(box.libraryDir, item, files, [], (point) => { checkpoints.push(point); }, false, runOption),
+          (error: unknown) => errorContainsCode(error, "unsupported-platform"),
+        );
+      } finally {
+        if (originalArch === undefined) Reflect.deleteProperty(process, "arch");
+        else Object.defineProperty(process, "arch", originalArch);
+      }
+      assert.deepEqual(checkpoints, [], "preflight must reject before any payload, stage, or journal checkpoint");
+      assert.equal(await inventoryIgnoringTemporaryLockTimestamps(box.root), before, "temporary lock/root-lease effects must be cleaned up without changing payload, stage, or journal inventory");
+      await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
+      await assert.rejects(lstat(path.join(box.libraryDir, ...item.content.path.split("/"))), { code: "ENOENT" });
     });
   }
 });

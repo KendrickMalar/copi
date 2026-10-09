@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, lstat, readFile, readdir, rm, stat, symlink, writeFile 
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { copyFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import test from "node:test";
 
 function projectRootForTestEntry(entryPath: string): string {
@@ -45,23 +46,38 @@ type NativeRequest = {
 };
 
 let buildResult: SpawnSyncReturns<string> | undefined;
+let testBuildRoot: string | undefined;
 let testHelperDirectory: string | undefined;
 
+function testBuiltArtifactPath(name: string): string {
+  if (testBuildRoot === undefined) throw new Error("Isolated native test build has not run.");
+  return path.join(testBuildRoot, "dist", "native", name);
+}
+
 function buildNative(): SpawnSyncReturns<string> {
-  buildResult ??= spawnSync(process.execPath, ["scripts/build-native.mjs"], {
-    cwd: projectRoot,
-    encoding: "utf8",
-    shell: false,
-    timeout: 120_000,
-    maxBuffer: outputLimit,
-  });
+  if (buildResult === undefined) {
+    testBuildRoot = mkdtempSync(path.join(os.tmpdir(), "copi-native-package-build-"));
+    const testNativeSource = path.join(testBuildRoot, "native", "rename-exclusive.c");
+    const testBuildScript = path.join(testBuildRoot, "scripts", "build-native.mjs");
+    mkdirSync(path.dirname(testNativeSource), { recursive: true });
+    mkdirSync(path.dirname(testBuildScript), { recursive: true });
+    copyFileSync(path.join(projectRoot, "native", "rename-exclusive.c"), testNativeSource);
+    copyFileSync(path.join(projectRoot, "scripts", "build-native.mjs"), testBuildScript);
+    buildResult = spawnSync(process.execPath, [testBuildScript], {
+      cwd: testBuildRoot,
+      encoding: "utf8",
+      shell: false,
+      timeout: 120_000,
+      maxBuffer: outputLimit,
+    });
+  }
   return buildResult;
 }
 
 async function assertBuildSucceeded(): Promise<BuildManifest> {
   const result = buildNative();
   assert.equal(result.status, 0, `native build failed: ${result.stderr || result.stdout}`);
-  return JSON.parse(await readFile(manifestPath, "utf8")) as BuildManifest;
+  return JSON.parse(await readFile(testBuiltArtifactPath("rename-exclusive-arm64.manifest.json"), "utf8")) as BuildManifest;
 }
 
 function requestFor(
@@ -162,14 +178,20 @@ async function compileTestHelper(manifest: BuildManifest): Promise<string> {
 }
 
 test("release builder emits a hashed arm64 helper and npm pack includes both artifacts", async () => {
+  const packagedHelperBefore = await lstat(releaseHelper, { bigint: true });
+  const packagedManifestBefore = await lstat(manifestPath, { bigint: true });
   const manifest = await assertBuildSucceeded();
-  const helperInfo = await lstat(releaseHelper);
+  const packagedHelperAfter = await lstat(releaseHelper, { bigint: true });
+  const packagedManifestAfter = await lstat(manifestPath, { bigint: true });
+  assert.deepEqual([packagedHelperAfter.dev, packagedHelperAfter.ino], [packagedHelperBefore.dev, packagedHelperBefore.ino], "test helper rebuild must not replace the packaged helper while other tests preflight it");
+  assert.deepEqual([packagedManifestAfter.dev, packagedManifestAfter.ino], [packagedManifestBefore.dev, packagedManifestBefore.ino], "test helper rebuild must not replace the packaged manifest while other tests preflight it");
+  const helperInfo = await lstat(testBuiltArtifactPath("rename-exclusive-arm64"));
   assert.ok(helperInfo.isFile());
   assert.equal(helperInfo.isSymbolicLink(), false);
   assert.notEqual(Number(helperInfo.mode & 0o111), 0, "release helper must be executable");
   assert.deepEqual(manifest, {
     artifact: "rename-exclusive-arm64",
-    sha256: createHash("sha256").update(await readFile(releaseHelper)).digest("hex"),
+    sha256: createHash("sha256").update(await readFile(testBuiltArtifactPath("rename-exclusive-arm64"))).digest("hex"),
     architecture: "arm64",
     platform: "darwin",
     protocolVersion: 1,
@@ -181,6 +203,11 @@ test("release builder emits a hashed arm64 helper and npm pack includes both art
   });
   assert.match(manifest.compilerVersion, /^Apple clang version /);
   assert.ok(path.isAbsolute(manifest.sdkPath));
+  const packagedManifest = JSON.parse(await readFile(manifestPath, "utf8")) as BuildManifest;
+  assert.deepEqual(packagedManifest, {
+    ...manifest,
+    sha256: createHash("sha256").update(await readFile(releaseHelper)).digest("hex"),
+  });
   const architecture = spawnSync("/usr/bin/lipo", ["-archs", releaseHelper], {
     encoding: "utf8",
     shell: false,
@@ -370,4 +397,5 @@ test("unsafe root escape and symlinked parent are refused before native placemen
 
 test.after(async () => {
   if (testHelperDirectory !== undefined) await rm(testHelperDirectory, { recursive: true, force: true });
+  if (testBuildRoot !== undefined) await rm(testBuildRoot, { recursive: true, force: true });
 });

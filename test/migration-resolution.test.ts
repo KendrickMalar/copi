@@ -49,7 +49,7 @@ function killOnCatalogSwitch(root: string): void {
     const { StorageTransactions, storageTransactions } = await import(${JSON.stringify(transactionUrl)});
     Object.defineProperty(storageTransactions, "run", { configurable: true, value: (root, create, operation) =>
       new StorageTransactions({ checkpoint: (point) => { if (point === "catalog-renamed") process.kill(process.pid, "SIGKILL"); } })
-        .run(root, create, operation) });
+        .run(root, create, operation, { requiresNativePlacement: false }) });
     const { prepareMigration, readMigration, commitMigration } = await import(${JSON.stringify(migrationUrl)});
     const plan = await prepareMigration(process.argv[1]);
     const view = readMigration(plan);

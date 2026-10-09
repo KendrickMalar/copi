@@ -73,7 +73,7 @@ test("finalized cleanup refuses a changed catalog and preserves its transaction 
   await writeFile(path.join(lock, "finalized.json"), finalized, { mode: 0o600 });
   await writeFile(path.join(lock, "finalized.digest"), sha256(finalized), { mode: 0o600 });
 
-  await assert.rejects(new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {}), /Finalized transaction state was changed externally/);
+  await assert.rejects(new StorageTransactions({ waitMilliseconds: 100 }).run(libraryDir, false, async () => {}, { requiresNativePlacement: false }), /Finalized transaction state was changed externally/);
   assert.deepEqual(await readFile(path.join(libraryDir, "catalog.json")), changedCatalog);
   assert.deepEqual(await readFile(path.join(lock, "finalized.json")), finalized);
   assert.deepEqual(await readFile(path.join(lock, "finalized.digest"), "utf8"), sha256(finalized));
@@ -95,7 +95,7 @@ test("foreign owner nonce prevents cleanup and remains the reported secondary er
     foreignOwnerBytes = Buffer.from(JSON.stringify({ ...original, token: randomUUID() }));
     await writeFile(ownerPath, foreignOwnerBytes, { mode: 0o600 });
     throw primary;
-  });
+  }, { requiresNativePlacement: false });
   await assert.rejects(operation, (error) => {
     assert.ok(error instanceof AggregateError);
     assert.equal(error.errors[0], primary);
@@ -122,7 +122,7 @@ test("primary operation failure stays first when unknown unjournaled lock data b
     ownerBytes = await readFile(path.join(lock, "owner.json"));
     await writeFile(unknownPath, unknownBytes, { mode: 0o600 });
     throw primary;
-  });
+  }, { requiresNativePlacement: false });
   await assert.rejects(operation, (error) => {
     assert.ok(error instanceof AggregateError);
     assert.equal(error.errors[0], primary);

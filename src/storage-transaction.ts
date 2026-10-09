@@ -100,7 +100,7 @@ interface TreeEntry { path: string; kind: "directory" | "file" | "link"; value: 
 export interface StorageRevision { readonly root: string; readonly catalog: string | null; readonly catalogIdentity: string | null; readonly format: "v1" | "v2"; readonly tree: string }
 export type StorageCheckpoint = "stage-write" | "stage-sync" | "journal" | "before-swap" | "old-renamed" | "new-renamed" | "before-catalog" | "catalog-held" | "catalog-renamed" | "directory-sync" | "committed" | "rollback-started" | "rollback-displaced" | "rollback-restored" | "rollback-catalog-held" | "finalized" | "rollback-finalized";
 export interface StorageOptions { checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>; waitMilliseconds?: number }
-interface StorageRunOptions { requiresNativePlacement?: boolean }
+interface StorageRunOptions { requiresNativePlacement: boolean }
 interface Owner { version: 1; pid: number; host: string; token: string; blocked?: boolean; migrationRootEntries?: string[] }
 interface DirectoryIdentity { dev: number; ino: number }
 interface InFlightControl { signal: AbortSignal; recovering: boolean }
@@ -1754,9 +1754,9 @@ async function inFlightCheckpoint(callback: StorageOptions["checkpoint"], contro
 /** @internal Generalized fixed-byte persistence adapter. Inspection/approval are enforced here too; instance-bound faults cannot disable checks. */
 export class StorageTransactions {
   constructor(private readonly options: StorageOptions = {}) {}
-  async run<T>(libraryDir: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>, runOptions: StorageRunOptions = {}): Promise<T> {
-    // Run this before canonicalRoot can create the library or the transaction lock.
-    if (runOptions.requiresNativePlacement) await preflightNativeSourcePlacement(libraryDir);
+  async run<T>(libraryDir: string, create: boolean, operation: (session: StorageSession | undefined) => Promise<T>, runOptions: StorageRunOptions): Promise<T> {
+    // Product callers declare this before root/lock creation. #commitNewItems repeats the check to protect runtime callers that omit or misstate the option.
+    if (runOptions?.requiresNativePlacement === true) await preflightNativeSourcePlacement(libraryDir);
     const root = await canonicalRoot(libraryDir, create);
     if (!root) return operation(undefined);
     const rootLease = await acquireRootLease(root, this.options.waitMilliseconds ?? 5_000);
@@ -2334,6 +2334,8 @@ export class StorageSession {
   }
 
   async #commitNewItems(expected: StorageRevision, previous: Catalog, next: Catalog, catalog: Buffer, replacements: readonly StorageReplacement[], operations: SourcesOperation[]): Promise<void> {
+    // Defense in depth for direct adapter calls: an omitted/false JS option may already have created a temporary lock/root lease, but this check rejects before payload, stage, or journal writes; run() cleans the lock and releases the lease.
+    await preflightNativeSourcePlacement(this.root);
     if (operations.length === 0 || operations.some((operation) => operation.oldTree !== null) || next.items.length <= previous.items.length) {
       throw new Error("New-item storage requires a complete set of additions-only source operations.");
     }
