@@ -1,10 +1,26 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
+import { loadCatalog } from "../src/catalog.ts";
+import { projectMigrationInventory, scanMigrationInventory } from "../src/migration-inventory.ts";
 import { commitMigrationResolution, prepareMigrationResolution, readMigrationResolution } from "../src/migration.ts";
 import { makeLegacyItem, createLegacyLibrary, writeBytes, writeLegacyCatalog, writeLegacySnapshot } from "./helpers/legacy-library.ts";
+
+const controlNames = [".copi-transaction", ".copi-transaction-recovery", ".copi-migration-resolution.json"] as const;
+const compareUtf8 = (left: string, right: string): number => Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    const keys = Object.keys(object).sort(compareUtf8);
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new Error("fixture value is not canonical JSON");
+  return encoded;
+}
 
 async function fixture() {
   const box = await createLegacyLibrary();
@@ -75,5 +91,31 @@ test("approvedInventory separates the protocol-owned backup UUID tree into backu
     const approvedInventory = record.approvedInventory as { nodes: Array<{ path: string }> };
     const backupPayloadNodes = approvedInventory.nodes.map((node) => node.path).filter((nodePath) => nodePath === backupDir || nodePath.startsWith(`${backupDir}/`));
     assert.deepEqual(backupPayloadNodes, [], "the generated backup tree has its own backupInventory custody proof, not an approved payload proof");
+  } finally { await box.dispose(); }
+});
+
+test("ordinary reader rejects post-record source edits even if the record approval inventory is rewritten", async () => {
+  const box = await fixture();
+  try {
+    const record = await leaveInstalledResolutionRecord(box.root);
+    const edited = Buffer.from("unreviewed editor change after durable resolution record\n");
+    await writeFile(box.sourcePath, edited);
+
+    const tempName = (await readdir(box.root)).find((name) => name.startsWith(".copi-migration-resolution.") && name.endsWith(".tmp"));
+    assert.ok(tempName, "record-install crash must leave its known completed temp alias");
+    const excluded = [...controlNames, tempName];
+    const actual = await scanMigrationInventory(box.root, { excludedPrefixes: excluded });
+    record.approvedInventory = projectMigrationInventory(actual, excluded);
+    // Leave privateRevisionHash unchanged: the strict record codec must detect that this reviewed commitment was altered.
+    await writeFile(path.join(box.root, ".copi-migration-resolution.json"), canonicalJson(record));
+
+    let readerResult: Awaited<ReturnType<typeof loadCatalog>> | undefined;
+    let readerError: unknown;
+    try { readerResult = await loadCatalog(box.root); } catch (error) { readerError = error; }
+    assert.ok(readerError, `ordinary reader must reject tampered record commitments; it returned catalogVersion=${readerResult?.version}, source=${(await readFile(box.sourcePath)).toString()}, recordExists=${(await readdir(box.root)).includes(".copi-migration-resolution.json")}`);
+    assert.match(readerError instanceof Error ? readerError.message : String(readerError), /record|commitment|approval|review|changed/i);
+    assert.deepEqual(await readFile(box.sourcePath), edited);
+    assert.ok((await readdir(box.root)).includes(".copi-migration-resolution.json"));
+    assert.ok((await readdir(path.join(box.root, ".copi-transaction"))).includes("journal.json"));
   } finally { await box.dispose(); }
 });

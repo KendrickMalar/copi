@@ -659,6 +659,15 @@ function makeAlreadyV2(
   return makePrepared(state);
 }
 
+export type MigrationPreviewCheckpoint = "after-tree-scan";
+let previewCheckpoint: ((point: MigrationPreviewCheckpoint, root: string) => void | Promise<void>) | undefined;
+/** @internal A deterministic seam for tests that change the filesystem while a preview is open. */
+export function setMigrationPreviewCheckpointForTests(
+  callback: ((point: MigrationPreviewCheckpoint, root: string) => void | Promise<void>) | undefined,
+): void {
+  previewCheckpoint = callback;
+}
+
 export async function prepareMigration(libraryDir: string): Promise<PreparedMigration> {
   if (typeof libraryDir !== "string" || libraryDir.length === 0) throw new Error("Migration libraryDir must be a nonempty path string.");
   const root = path.resolve(libraryDir);
@@ -729,6 +738,7 @@ export async function prepareMigration(libraryDir: string): Promise<PreparedMigr
     if (existingBackups) throw new Error("An existing migration backup namespace is preserved and is not adopted automatically.");
     const itemsTree = await scanTree(root, "items");
     const sourcesTree = await scanTree(root, "sources");
+    await previewCheckpoint?.("after-tree-scan", root);
     const rootNamesAfter = await listManagedMigrationRootEntries(root);
     if (JSON.stringify(rootNamesBefore) !== JSON.stringify(rootNamesAfter)) throw new Error("Library root entries changed during the read-only preview.");
     await assertDirectoryChain(rootCheck.identities);
