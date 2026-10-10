@@ -192,3 +192,35 @@ test("writes nothing when the context file changes or appears after planning", a
   await assert.rejects(executeApply(box.libraryDir, created, { addReference: true }), /Destination changed/);
   assert.equal(await readFile(agents, "utf8"), "# Appeared\n");
 });
+
+test("treats a differently-cased root context destination as a planned context file", async (t) => {
+  const box = await sandbox(t);
+  await writeFile(path.join(box.projectDir, "AGENTS.md"), "# A\n");
+  await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+  await addInstruction(box, "lower", "agents.md", "# no reference\n");
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  assert.equal(plan.referenceProposal, undefined);
+  const warning = plan.warnings.find((w) => w.code === "instruction-not-loaded" && w.path === "RULES.md");
+  assert.ok(warning?.message.includes(referenceLine("RULES.md")));
+});
+
+for (const [label, make] of [
+  ["not valid UTF-8", async (p: string) => writeFile(p, Buffer.from([0xff, 0xfe, 0x00]))],
+  ["larger than 1 MB", async (p: string) => writeFile(p, "a".repeat(1_000_001))],
+  ["a directory", async (p: string) => mkdir(p)],
+] as const) {
+  test(`gives only a manual warning when root AGENTS.md is ${label}`, async (t) => {
+    const box = await sandbox(t);
+    await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+    const agents = path.join(box.projectDir, "AGENTS.md");
+    await make(agents);
+    const before = (await stat(agents)).isDirectory() ? undefined : await readFile(agents);
+    const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+    assert.equal(plan.referenceProposal, undefined);
+    const warning = plan.warnings.find((w) => w.code === "instruction-not-loaded" && w.path === "RULES.md");
+    assert.ok(warning?.message.includes(referenceLine("RULES.md")));
+    const after = await stat(agents);
+    if (before === undefined) assert.ok(after.isDirectory());
+    else assert.deepEqual(await readFile(agents), before);
+  });
+}

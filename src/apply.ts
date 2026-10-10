@@ -297,17 +297,18 @@ async function planInstructionReference(
   const targets = instructionPaths.filter((value) => !isAutoLoadedInstruction(value));
   if (targets.length === 0) return undefined;
   const current = await readRootContextFiles(root);
-  const planned = contextFileNames.filter((name) => candidates.has(name));
+  const lowerNames = new Set(contextFileNames.map((name) => name.toLowerCase()));
+  const planned = [...candidates.keys()].filter((key) => !key.includes("/") && lowerNames.has(key.toLowerCase()));
+  const plannedLower = new Set(planned.map((key) => key.toLowerCase()));
   const texts: string[] = [];
-  for (const name of contextFileNames) {
-    const options = candidates.get(name);
-    if (options) {
-      for (const option of options) {
-        const text = textFrom(option.bytes);
-        if (text !== undefined) texts.push(text);
-      }
-      continue;
+  for (const key of planned) {
+    for (const option of candidates.get(key)!) {
+      const text = textFrom(option.bytes);
+      if (text !== undefined) texts.push(text);
     }
+  }
+  for (const name of contextFileNames) {
+    if (plannedLower.has(name.toLowerCase())) continue;
     const file = current.get(name);
     if (file && file !== "unusable") texts.push(textFrom(file.bytes)!);
   }
