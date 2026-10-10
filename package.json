@@ -9,6 +9,7 @@
   },
   "files": [
     "dist/src",
+    "dist/native",
     "README.md",
     "LICENSE",
     "LICENSE.unicode"
@@ -20,7 +21,7 @@
     "darwin"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/build-native.mjs",
     "test": "npm run build && node --test dist/test/*.test.js",
     "check": "npm run build && npm test && npm pack --dry-run"
   },

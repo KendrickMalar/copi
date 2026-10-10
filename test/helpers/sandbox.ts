@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { TestContext } from "node:test";
-import { importResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
+import { assertModernCatalog, importResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
 import { inspectPreparedResource } from "../../src/inspect.ts";
 
 export async function sandbox(t: TestContext) {
@@ -40,6 +40,7 @@ export async function duplicateFixture(box: Sandbox) {
   const first = await addItem(box, "Straße");
   const second = await addItem(box, "Other");
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.groups = [
     { id: "daily", name: "Daily", itemIds: [first.id, second.id] },
     { id: "review", name: "Review", itemIds: [first.id] },

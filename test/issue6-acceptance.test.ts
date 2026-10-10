@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { loadCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
-import { prepareSavedChange, prepareSavedEdit } from "../src/resource-mutations.ts";
-import { add, box, cli, custody, down, editor, editRoute, finish, fixture, hash, manage, noIds, plain, pty, restored, runCli, tree, type Step } from "./helpers/issue6-acceptance.ts";
+import { readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import { prepareSavedChange, prepareSavedEdit, readSavedChange } from "../src/resource-mutations.ts";
+import { add, box, catalogModule, cli, custody, down, editor, editRoute, finish, fixture, hash, loadCatalog, manage, noIds, plain, pty, restored, runCli, sourceNodeFlags, storedContentPath, terminalEditorModule, tree, type Step } from "./helpers/issue6-acceptance.ts";
 
 const choose = (wait: string, index = 0): Step => ({ wait: `◆  ${wait}`, text: `${down.repeat(index)}\r` });
 const reviewNo: Step = { wait: "Approve this masked diff", text: "n\r" };
@@ -34,7 +34,7 @@ for (const operation of ["rename", "destination", "group"] as const) test(`U1/U2
 });
 
 test("U1 legacy Unicode duplicates allow masked view/explicit resolution only; cancel never repairs", async () => {
-  const b = await fixture("apiKey: sk_live_tripSecret000012345\n"), second = await add(b, { "ROUTE.md": "second body\n" }, "Other");
+  const b = await fixture("apiKey: sk_live_tripSecret000012345\n"), second = await add(b, { "SKILL.md": "second body\n" }, "Other");
   const catalog = await loadCatalog(b.library); catalog.items[1]!.name = "旅程 NOTES";
   await writeFile(path.join(b.library, "catalog.json"), JSON.stringify(catalog)); const before = await custody(b);
   const run = await manage(b, [choose("Manage saved resources"), choose("Select saved resource", 1), choose("Resource action"), choose("Select saved file"), choose("Manage saved resources", 1), choose("Select a conflicting name", 1), { wait: "New name", text: "\x03" }, finish]);
@@ -46,21 +46,21 @@ test("U1 legacy Unicode duplicates allow masked view/explicit resolution only; c
 });
 
 test("U2 actual group membership then target apply keeps originals and saved bytes, without UUID input", async () => {
-  const b = await fixture(), second = await add(b, { "ROUTE.md": "backup route\n" }, "Spare itinerary", ".pi/skills/spare");
+  const b = await fixture(), second = await add(b, { "SKILL.md": "backup route\n" }, "Spare itinerary", ".pi/skills/spare");
   const before = await custody(b), target = path.join(b.cwd, "chosen-target"); await mkdir(target);
   const run = await manage(b, [choose("Manage saved resources", 1), choose("Manage saved groups", 2), choose("Select group"), { wait: "Select resources in", text: `${down} \r` }, choose("Manage saved groups", 3), { wait: "Save these group changes", text: "y\r" },
     choose("Manage saved resources", 2), choose("Select group to apply"), { wait: "Apply target directory", text: `\x01\x0b${target}\r` }, { wait: "Apply the selected snapshots", text: "y\r" }, finish]);
   success(run); noIds(run.output, [b.item.id, second.item.id, b.group.id]);
   assert.deepEqual((await loadCatalog(b.library)).groups[0]!.itemIds, [b.item.id, second.item.id]);
-  assert.deepEqual(await readFile(path.join(target, ".pi/skills/spare/ROUTE.md")), Buffer.from("backup route\n"));
-  assert.deepEqual(await readFile(path.join(target, ".pi/skills/itinerary/ROUTE.md")), Buffer.from("north\nsouth\n"));
+  assert.deepEqual(await readFile(path.join(target, ".pi/skills/spare/SKILL.md")), Buffer.from("backup route\n"));
+  assert.deepEqual(await readFile(path.join(target, ".pi/skills/itinerary/SKILL.md")), Buffer.from("north\nsouth\n"));
   assert.deepEqual(await tree(b.source), before.source); assert.deepEqual(await readSnapshotFiles(b.library, b.item), [{ ...b.item.files[0]!, bytes: Buffer.from("north\nsouth\n") }]);
 });
 
 test("U2 real colliding saved candidates/existing target/secret No are guarded; affirmative apply writes selected bytes only", async () => {
-  const b = await fixture("public option\n"), second = await add(b, { "ROUTE.md": "apiKey: sk_live_privateTrip12345678\n" }, "Private option");
+  const b = await fixture("public option\n"), second = await add(b, { "SKILL.md": "apiKey: sk_live_privateTrip12345678\n" }, "Private option");
   const catalog = await loadCatalog(b.library); catalog.groups[0]!.itemIds.push(second.item.id); await saveCatalog(b.library, catalog);
-  const target = path.join(b.cwd, ".pi/skills/itinerary/ROUTE.md"); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, "existing target\n");
+  const target = path.join(b.cwd, ".pi/skills/itinerary/SKILL.md"); await mkdir(path.dirname(target), { recursive: true }); await writeFile(target, "existing target\n");
   const before = await custody(b);
   const route: Step[] = [choose("Manage saved resources", 2), choose("Select group to apply"), { wait: "Apply target directory", text: "\r" }, choose("Choose one resource for colliding", 1), choose("Existing file", 2)];
   // Existing-file prompt starts at Abort: 2 down wraps to Replace.
@@ -153,39 +153,69 @@ test("U4 exactly 1MB accepted but edited 1_000_001 bytes refused before any revi
 test("U4 missing original source is not required; saved UTF8 remains editable", async () => {
   const b = await fixture(); await rename(b.sourcePath, `${b.sourcePath}-offline`); const before = await custody(b);
   const run = await manage(b, [...editRoute(), submit(), reviewYes, { wait: "Save edited copy", text: "y\r" }, finish]); success(run);
-  assert.deepEqual(await readFile(b.saved("ROUTE.md")), Buffer.from("north\nsouth\nwest\n\n東🙂\n")); assert.deepEqual(await tree(b.source), before.source);
+  assert.deepEqual(await readFile(b.saved("SKILL.md")), Buffer.from("north\nsouth\nwest\n\n東🙂\n")); assert.deepEqual(await tree(b.source), before.source);
 });
-for (const corrupt of ["missing", "symlink", "unregistered"] as const) test(`U4 ${corrupt} saved layout is rejected with reason, not repaired`, async () => {
+for (const corrupt of ["missing", "symlink"] as const) test(`U4 ${corrupt} saved layout is rejected with reason, not repaired`, async () => {
   const b = await fixture();
-  if (corrupt === "missing") await rename(b.saved("ROUTE.md"), path.join(b.root, "retained-missing.bin"));
-  if (corrupt === "symlink") { await rename(b.saved("ROUTE.md"), path.join(b.root, "retained-original.bin")); await symlink(path.join(b.sourcePath, "ROUTE.md"), b.saved("ROUTE.md")); }
-  if (corrupt === "unregistered") await writeFile(b.saved("extra.txt"), "unregistered\n");
+  if (corrupt === "missing") await rename(b.saved("SKILL.md"), path.join(b.root, "retained-missing.bin"));
+  if (corrupt === "symlink") { await rename(b.saved("SKILL.md"), path.join(b.root, "retained-original.bin")); await symlink(path.join(b.sourcePath, "SKILL.md"), b.saved("SKILL.md")); }
   const before = await custody(b), run = await manage(b, editRoute()); assert.equal(run.code, 1, run.output); restored(run);
-  assert.match(run.output, corrupt === "missing" ? /ENOENT|missing/i : corrupt === "symlink" ? /symbolic|symlink/i : /unregistered/i);
+  assert.match(run.output, corrupt === "missing" ? /ENOENT|missing/i : /symbolic|symlink/i);
   assert.ok(!run.output.includes("\x1b[?1049h")); noIds(run.output, [b.item.id]); assert.deepEqual(await custody(b), before);
+});
+test("U4 ordinary saved children join the captured masked edit review and survive cancellation or approved save", async () => {
+  const b = await fixture(), extraPath = b.saved("extra.txt");
+  const secret = Buffer.from("apiKey: sk_live_reviewedOrdinaryChild123456789\n");
+  await writeFile(extraPath, secret); await chmod(extraPath, 0o600);
+  const originalStat = await lstat(extraPath), before = await custody(b);
+
+  const prepared = await prepareSavedEdit(b.library, b.item.id, "SKILL.md");
+  const change = await prepareSavedChange(prepared, Buffer.from("north\nsouth\nreviewed\n"));
+  const review = readSavedChange(change);
+  assert.deepEqual(review.diffs.map((diff) => diff.path), ["SKILL.md", "extra.txt"]);
+  assert.equal(review.diffs.find((diff) => diff.path === "extra.txt")?.bytesChanged, false);
+  assert.deepEqual(review.sensitivePaths, ["extra.txt"]);
+  assert.ok(!JSON.stringify(review).includes(secret.toString()));
+
+  const canceled = await manage(b, [...editRoute(), submit("north\nsouth\ncanceled\n"), reviewNo, finish]); success(canceled);
+  assert.ok(!canceled.output.includes(secret.toString()));
+  assert.deepEqual(await custody(b), before);
+  const afterCancel = await lstat(extraPath); assert.equal(afterCancel.dev, originalStat.dev); assert.equal(afterCancel.ino, originalStat.ino);
+
+  const approved = await manage(b, [...editRoute(), submit("north\nsouth\napproved\n"), reviewYes,
+    { wait: "Save suspected sensitive file extra.txt", text: "y\r" }, { wait: "Save edited copy", text: "y\r" }, finish]); success(approved);
+  assert.ok(approved.output.includes("Save suspected sensitive file extra.txt"));
+  assert.ok(!approved.output.includes(secret.toString()));
+  const catalog = await loadCatalog(b.library), item = catalog.items.find((saved) => saved.id === b.item.id)!;
+  const extra = item.files.find((file) => file.path === "extra.txt"); assert.ok(extra);
+  assert.equal(extra.mode, 0o600); assert.equal(extra.sha256, hash(secret));
+  assert.deepEqual(await readFile(extraPath), secret);
+  assert.deepEqual(await readSnapshotFiles(b.library, item).then((files) => files.find((file) => file.path === "extra.txt")), { ...extra, bytes: secret });
+  assert.deepEqual(await tree(b.source), before.source);
 });
 test("U4 backend forbidden/unknown paths retain raw catalog/snapshot modes/bytes", async () => {
   const b = await fixture(), before = await custody(b);
   for (const relative of ["new.txt", "../outside", "/absolute", "a\\b", ".env", "auth/token.txt", "cache/x"]) await assert.rejects(prepareSavedEdit(b.library, b.item.id, relative), /registered|Unsafe|excluded/i);
-  const prepared = await prepareSavedEdit(b.library, b.item.id, "ROUTE.md"); await assert.rejects(prepareSavedChange(prepared, Buffer.alloc(1_000_001)), /1_000_000|1 MB/); assert.deepEqual(await custody(b), before);
+  const prepared = await prepareSavedEdit(b.library, b.item.id, "SKILL.md"); await assert.rejects(prepareSavedChange(prepared, Buffer.alloc(1_000_001)), /1_000_000|1 MB/); assert.deepEqual(await custody(b), before);
 });
 
 test("U5 real masked view safely renders OSC/ESC, secrets in label/path/header/body, without sanitizing saved bytes", async () => {
-  const b = await box(), secret = "sk_live_controlSecret12345678", filename = `token-${secret}\x1b]52;c;PATH_ATTACK\x07.txt`;
-  const a = await add(b, { [filename]: `apiKey: ${secret}\n\x1b]52;c;BODY_ATTACK\x07\n` }, `name ${secret}\x1b]0;TITLE_ATTACK\x07`), before = await custody(b);
+  const b = await box(), secret = "sk_live_controlSecret12345678", filename = `!token-${secret}\x1b]52;c;PATH_ATTACK\x07.txt`;
+  const a = await add(b, { "SKILL.md": "# Safe root skill\n", [filename]: `apiKey: ${secret}\n\x1b]52;c;BODY_ATTACK\x07\n` }, `name ${secret}\x1b]0;TITLE_ATTACK\x07`), before = await custody(b);
   const run = await manage(b, [choose("Manage saved resources"), choose("Select saved resource"), choose("Resource action"), choose("Select saved file"), finish]); success(run);
   assert.ok(!run.output.includes(secret)); assert.ok(!run.output.includes("\x1b]")); assert.match(run.output, /REDACTED/); assert.match(run.output, /\\u001b/); noIds(run.output, [a.item.id]); assert.deepEqual(await custody(b), before);
 });
 for (const reply of ["n\r", "\x1b", "\x03", "\x04"]) test(`U5 raw consent denial/cancel ${Buffer.from(reply).toString("hex")} never exposes secret/editor`, async () => {
   const b = await fixture("apiKey: sk_live_rawExposure12345678\n"), before = await custody(b);
-  const run = await manage(b, [...editRoute(), { wait: "Expose raw text of ROUTE.md", text: reply }, ...(reply === "n\r" ? [finish] : [])]); success(run);
+  const run = await manage(b, [...editRoute(), { wait: "Expose raw text of SKILL.md", text: reply }, ...(reply === "n\r" ? [finish] : [])]); success(run);
   assert.ok(!run.output.includes("sk_live_rawExposure12345678")); assert.ok(!run.output.includes("\x1b[?1049h")); assert.match(run.output, /screen, scrollback|terminal recordings/); assert.deepEqual(await custody(b), before);
 });
 
 test("U5/U6 multi-file reinspection requires separate path approvals after raw consent/diff; second No writes nothing", async () => {
-  const b = await fixture("apiKey: sk_live_firstSecret12345678\n", { "secondary.txt": "apiKey: sk_live_secondSecret12345678\n" }), before = await custody(b);
-  const run = await manage(b, [...editRoute(), { wait: "Expose raw text", text: "y\r" }, submit("apiKey: sk_live_thirdSecret12345678\n"), reviewYes,
-    { wait: "Save suspected sensitive file ROUTE.md", text: "y\r" }, { wait: "Save suspected sensitive file secondary.txt", text: "n\r" }, finish]); success(run);
+  const b = await fixture("apiKey: sk_live_firstSecret12345678\n", { "z-secondary.txt": "apiKey: sk_live_secondSecret12345678\n" }), before = await custody(b);
+  const selectedRootFile = [...editRoute().slice(0, -1), choose("Select saved file")];
+  const run = await manage(b, [...selectedRootFile, { wait: "Expose raw text", text: "y\r" }, submit("apiKey: sk_live_thirdSecret12345678\n"), reviewYes,
+    { wait: "Save suspected sensitive file SKILL.md", text: "y\r" }, { wait: "Save suspected sensitive file z-secondary.txt", text: "n\r" }, finish]); success(run);
   assert.deepEqual(await custody(b), before); assert.ok(!run.output.slice(run.output.indexOf("\x1b[?1049l")).includes("sk_live_"));
   assert.ok(run.output.indexOf("new approval") > run.output.indexOf("Approve this masked diff")); assert.ok(!run.output.includes("Save edited copy"));
 });
@@ -211,19 +241,18 @@ for (const mutation of ["catalog", "body", "rename-metadata", "group-metadata"] 
   const b = await fixture(), before = await custody(b), catalogPath = path.join(b.library, "catalog.json"); let changed: string;
   if (mutation === "body") changed = "external editor owns these bytes\n";
   else { const catalog = await loadCatalog(b.library); if (mutation === "rename-metadata") catalog.items[0]!.name = "Externally renamed"; if (mutation === "group-metadata") catalog.groups[0]!.name = "External group"; changed = ` ${JSON.stringify(catalog)}`; }
-  const changedPath = mutation === "body" ? b.saved("ROUTE.md") : catalogPath;
-  const catalogModule = new URL("../src/catalog.js", import.meta.url).href;
-  const probe = [process.execPath, "--input-type=module", "-e", `import {loadCatalog} from ${JSON.stringify(catalogModule)}; const c=await loadCatalog(${JSON.stringify(b.library)}); console.log(c.items[0].name);`];
+  const changedPath = mutation === "body" ? b.saved("SKILL.md") : catalogPath;
+  const probe = [process.execPath, ...sourceNodeFlags, "--input-type=module", "-e", `import {loadCatalog} from ${JSON.stringify(catalogModule)}; const c=await loadCatalog(${JSON.stringify(b.library)}); console.log(c.items[0].name);`];
   const run = await manage(b, [...editRoute(), submit(), { ...reviewYes, probe, replace: { path: changedPath, text: changed } }, { wait: "Save edited copy", text: "y\r" }]);
   assert.equal(run.probes[0]!.code, 0, JSON.stringify(run.probes)); assert.match(run.probes[0]!.stdout!, /旅程 notes/);
   assert.equal(run.code, 1, run.output); restored(run); assert.match(run.output, /changed|checksum|revision/i); noIds(run.output, [b.item.id, b.group.id]);
   assert.deepEqual(await readFile(changedPath), Buffer.from(changed)); assert.deepEqual(await tree(b.source), before.source);
-  if (mutation !== "body") assert.deepEqual(await readFile(b.saved("ROUTE.md")), Buffer.from("north\nsouth\n"));
+  if (mutation !== "body") assert.deepEqual(await readFile(b.saved("SKILL.md")), Buffer.from("north\nsouth\n"));
 });
 
 for (const operation of ["rename", "placement", "group"] as const) test(`U1/U2/U6 external ${operation} metadata at confirmation is not silently overwritten`, async () => {
   const b = await fixture(), before = await custody(b), external = await loadCatalog(b.library), catalogPath = path.join(b.library, "catalog.json");
-  const snapshotBefore = await tree(path.join(b.library, "items"));
+  const snapshotBefore = await tree(storedContentPath(b.library, b.item.content.path));
   if (operation === "rename") external.items[0]!.name = "External user rename";
   if (operation === "placement") external.items[0]!.destination = { kind: "project", path: ".pi/skills/external-placement" };
   if (operation === "group") external.groups[0]!.name = "External user group";
@@ -235,7 +264,7 @@ for (const operation of ["rename", "placement", "group"] as const) test(`U1/U2/U
   // Finish is cleanup if the buggy path returns to manage; correct stale rejection exits before it.
   assert.equal(run.timeout, false); assert.equal(run.exact, true, JSON.stringify(run));
   assert.deepEqual(await readFile(catalogPath), Buffer.from(externalBytes), `stale ${operation} approval must preserve external raw catalog; evidence ${run.log}`);
-  assert.deepEqual(await tree(b.source), before.source); assert.deepEqual(await tree(path.join(b.library, "items")), snapshotBefore);
+  assert.deepEqual(await tree(b.source), before.source); assert.deepEqual(await tree(storedContentPath(b.library, b.item.content.path)), snapshotBefore);
   assert.equal(run.code, 1, "stale metadata should stop with a reason"); assert.match(run.output, /changed|revision|reload/i);
 });
 
@@ -249,14 +278,14 @@ test("U3/U6 manage bracketed control paste must reach review rather than being i
 test("U5/U6 real new-secret save and same-mask secret replacement need fresh save consent and keep IDs/source/modes", async () => {
   const b = await fixture(), before = await custody(b), original = await loadCatalog(b.library);
   const secret = "sk_live_freshConsent12345678", added = `apiKey: ${secret}\n`;
-  const run = await manage(b, [...editRoute(), submit(added), reviewYes, { wait: "Save suspected sensitive file ROUTE.md", text: "y\r" }, { wait: "Save edited copy", text: "y\r" }, finish]); success(run);
+  const run = await manage(b, [...editRoute(), submit(added), reviewYes, { wait: "Save suspected sensitive file SKILL.md", text: "y\r" }, { wait: "Save edited copy", text: "y\r" }, finish]); success(run);
   const expected = Buffer.from(`north\nsouth\n${added}`), next = await loadCatalog(b.library);
-  assert.deepEqual(await readFile(b.saved("ROUTE.md")), expected); assert.equal(next.items[0]!.files[0]!.sha256, hash(expected));
+  assert.deepEqual(await readFile(b.saved("SKILL.md")), expected); assert.equal(next.items[0]!.files[0]!.sha256, hash(expected));
   assert.deepEqual(next.items, [{ ...original.items[0]!, files: [{ ...original.items[0]!.files[0]!, sha256: hash(expected) }] }]); assert.deepEqual(next.groups, original.groups);
   assert.deepEqual(await tree(b.source), before.source); assert.ok(!run.output.includes("Expose raw text"));
   const newSecret = "sk_live_otherConsent12345678", rawBody = expected.toString();
-  const sameMask = await manage(b, [...editRoute(), { wait: "Expose raw text", text: "y\r" }, { wait: "Ctrl-S", text: `\x1b[1;5H${"\x1b[3~".repeat(rawBody.length)}\x1b[200~${rawBody.replace(secret, newSecret)}\x1b[201~\x13` }, reviewYes, { wait: "Save suspected sensitive file ROUTE.md", text: "n\r" }, finish]); success(sameMask);
-  assert.deepEqual(await readFile(b.saved("ROUTE.md")), expected); assert.match(sameMask.output, /Bytes changed/);
+  const sameMask = await manage(b, [...editRoute(), { wait: "Expose raw text", text: "y\r" }, { wait: "Ctrl-S", text: `\x1b[1;5H${"\x1b[3~".repeat(rawBody.length)}\x1b[200~${rawBody.replace(secret, newSecret)}\x1b[201~\x13` }, reviewYes, { wait: "Save suspected sensitive file SKILL.md", text: "n\r" }, finish]); success(sameMask);
+  assert.deepEqual(await readFile(b.saved("SKILL.md")), expected); assert.match(sameMask.output, /Bytes changed/);
   const maskedDiff = sameMask.output.slice(sameMask.output.indexOf("Full masked saved diff")); assert.ok(!maskedDiff.includes(secret)); assert.ok(!maskedDiff.includes(newSecret));
 });
 
@@ -268,7 +297,7 @@ test("U6 manage BOM/CRLF/NFD/blank no-op writes no raw catalog/file or mode", as
 
 for (const mode of ["stdin-pipe", "stdout-pipe", "both-pipe"]) test(`U7 independent ${mode} guard precedes catalog reading and search/editor`, async () => {
   const b = await box(); await mkdir(b.library); await writeFile(path.join(b.library, "catalog.json"), "malformed sentinel"); const before = await custody(b);
-  const run = await pty(b, [process.execPath, cli, "manage"], [], mode); assert.equal(run.code, 1, run.output); restored(run);
+  const run = await pty(b, [process.execPath, ...sourceNodeFlags, cli, "manage"], [], mode); assert.equal(run.code, 1, run.output); restored(run);
   assert.match(run.output, /stdin\/stdout TTY/); assert.ok(!run.output.includes("Invalid copi catalog")); assert.ok(!run.output.includes("Manage saved resources")); assert.deepEqual(await custody(b), before);
 });
 test("U7 old CLI help/invalid args/symlink/list/groups/setup/apply remain guarded or readonly", async () => {
@@ -280,15 +309,15 @@ test("U7 old CLI help/invalid args/symlink/list/groups/setup/apply remain guarde
 
 test("U3 recognized partial paste CSI with finite 180ms continuation must not act as a standalone Esc cancellation", async () => {
   const b = await box(), initial = "ANCHOR", pasted = "finite-delay\n\n旅程\n", expected = { kind: "submitted", text: pasted + initial };
-  const resultFile = path.join(b.root, "finite-csi-result.json"), module = new URL("../src/terminal-editor.js", import.meta.url).href;
-  const code = `import {writeFile} from 'node:fs/promises'; import {editTerminalText} from ${JSON.stringify(module)};
+  const resultFile = path.join(b.root, "finite-csi-result.json");
+  const code = `import {writeFile} from 'node:fs/promises'; import {editTerminalText} from ${JSON.stringify(terminalEditorModule)};
 const result=await editTerminalText(${JSON.stringify(initial)});
 await writeFile(${JSON.stringify(resultFile)},JSON.stringify({result,expected:${JSON.stringify(expected)},expectedHex:${JSON.stringify(Buffer.from(expected.text).toString("hex"))}}));
 process.stdout.write('FINITE_CSI_RESULT_READY'); await new Promise(resolve=>setTimeout(resolve,1000));`;
   // Valid opening CSI is already recognized (ESC[2); this is not an isolated Esc key.
   // Hold the child alive only to record the completed ordered input even on premature cancellation.
   const steps: Step[] = [{ wait: "Ctrl-S", hex: "1b5b32" }, { delayMs: 180, text: `00~${pasted}\x1b[201~\x13` }];
-  const run = await pty(b, [process.execPath, "--input-type=module", "-e", code], steps);
+  const run = await pty(b, [process.execPath, ...sourceNodeFlags, "--input-type=module", "-e", code], steps);
   const saved = JSON.parse(await readFile(resultFile, "utf8")) as { result: { kind: string; text?: string }; expectedHex: string };
   console.log(`finite CSI result=${JSON.stringify(saved)} timeline=${JSON.stringify(run.timeline)} resultFile=${resultFile}`);
   assert.equal(run.code, 0, run.output); assert.equal(run.timeout, false); assert.equal(run.actions, 2);

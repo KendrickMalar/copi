@@ -1,14 +1,14 @@
 import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, text as clackText } from "@clack/prompts";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
-import { importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
+import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
-import type { Catalog, Group, ResourceCandidate, SavedItem } from "./types.ts";
+import type { Catalog, Group, LegacySavedItem, ResourceCandidate, SavedItem, StoredCatalog } from "./types.ts";
 
 /** Mask display metadata too, and render controls literally rather than executing VT sequences. */
 export function safeDisplay(value: string): string {
@@ -152,7 +152,7 @@ function showWarnings(warnings: readonly { code: string; path?: string; message:
   note(warnings.map((warning) => `${warning.path ? `${warning.path}: ` : ""}${warning.message}`).join("\n"), title);
 }
 
-function savedItemHint(catalog: Catalog, item: SavedItem): string {
+function savedItemHint(catalog: StoredCatalog, item: LegacySavedItem | SavedItem): string {
   const groups = catalog.groups.filter((group) => group.itemIds.includes(item.id)).map((group) => group.name).join(", ") || "no groups";
   return `${groups} · ${item.source} · ${item.destination.kind === "project" ? item.destination.path : "saved only"}`;
 }
@@ -184,6 +184,7 @@ async function viewSavedEntry(libraryDir: string): Promise<void> {
 /** Resolve all staged conflicts in one name-only catalog save; cancellation writes nothing. */
 export async function resolveNameConflicts(libraryDir: string): Promise<void> {
   const before = await loadCatalog(libraryDir);
+  assertModernCatalog(before);
   const catalog = structuredClone(before);
   if (findNameConflicts(catalog).length === 0) {
     outro("No name conflicts.");
@@ -253,21 +254,22 @@ async function handleNameConflicts(libraryDir: string): Promise<boolean> {
     const catalog = await loadCatalog(libraryDir);
     const conflicts = findNameConflicts(catalog);
     if (conflicts.length === 0) return true;
+    const modern = catalog.version === 2;
     note(conflicts.map((conflict) => {
       const entries = conflict.namespace === "item" ? catalog.items : catalog.groups;
       return `[${conflict.namespace}] ${conflict.ids.map((id) => entries.find((entry) => entry.id === id)!.name).join(" / ")}`;
-    }).join("\n"), "Duplicate names: only listing, masked viewing, and resolution are allowed");
+    }).join("\n"), modern ? "Duplicate names: only listing, masked viewing, and resolution are allowed" : "Legacy catalog v1 is read-only; duplicate names are not changed here");
     const action = await select({
       message: "Unresolved names",
       options: [
         { value: "view", label: "View saved resources or groups (masked)" },
-        { value: "resolve", label: "Resolve name conflicts" },
+        ...(modern ? [{ value: "resolve", label: "Resolve name conflicts" }] : []),
         { value: "done", label: "Finish without changes" },
       ],
     });
     if (isCancel(action) || action === "done") return true;
     if (action === "view") await viewSavedEntry(libraryDir);
-    else await resolveNameConflicts(libraryDir);
+    else if (modern) await resolveNameConflicts(libraryDir);
   }
 }
 
@@ -288,7 +290,9 @@ async function askForGroupName(message: string): Promise<string | undefined> {
 
 export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<void> {
   if (await handleNameConflicts(libraryDir)) return;
-  assertNoNameConflicts(await loadCatalog(libraryDir));
+  const initial = await loadCatalog(libraryDir);
+  assertModernCatalog(initial);
+  assertNoNameConflicts(initial);
   intro("copi setup");
   const scopeOptions: Array<{ value: "home" | "project"; label: string; hint: string }> = [];
   if (roots.homeDir) {
@@ -361,6 +365,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
 
   const catalog = await loadCatalog(libraryDir);
+  assertModernCatalog(catalog);
   if (catalog.groups.length === 0) {
     const name = await askForGroupName("Create the first resource group");
     if (name === undefined) {
@@ -446,10 +451,13 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   // Validate the whole batch before saving groups or any snapshot.
   const pending = structuredClone(catalog);
   assertNoNameConflicts(pending);
+  const pendingItemNames = new Set(pending.items.map((item) => nameKey(item.name)));
   for (const { review } of approvedCandidates) {
     const candidate = readPreparedResource(review.prepared).candidate;
     assertNameAvailable(pending, "item", candidate.name);
-    pending.items.push({ ...candidate, name: candidate.name.trim(), savedAt: new Date().toISOString(), files: [] });
+    const candidateName = nameKey(candidate.name);
+    if (pendingItemNames.has(candidateName)) throw new Error("Duplicate item name; choose a unique display name.");
+    pendingItemNames.add(candidateName);
   }
   await saveCatalog(libraryDir, catalog);
   for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
@@ -461,6 +469,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
 export async function runGroupManager(libraryDir: string): Promise<void> {
   if (await handleNameConflicts(libraryDir)) return;
   const catalog = await loadCatalog(libraryDir);
+  assertModernCatalog(catalog);
   if (catalog.groups.length === 0) {
     note("No groups are saved yet.", "Groups");
   } else {
@@ -484,6 +493,7 @@ export async function runGroupManager(libraryDir: string): Promise<void> {
       return;
     }
     if (action === "done") break;
+    assertModernCatalog(catalog);
     if (action === "create") {
       const name = await askForGroupName("New group name");
       if (name === undefined) {
@@ -536,11 +546,12 @@ export async function runGroupManager(libraryDir: string): Promise<void> {
     outro("Group changes were not saved.");
     return;
   }
+  assertModernCatalog(catalog);
   await saveCatalog(libraryDir, catalog);
   outro("Group changes saved.");
 }
 
-export function printGroups(catalog: Catalog): void {
+export function printGroups(catalog: StoredCatalog): void {
   if (catalog.groups.length === 0) {
     process.stdout.write("No saved groups.\n");
     return;
@@ -548,7 +559,7 @@ export function printGroups(catalog: Catalog): void {
   for (const group of catalog.groups) process.stdout.write(`${safeDisplay(group.name)} — ${group.itemIds.length} resource(s)\n`);
 }
 
-export function printItems(items: SavedItem[]): void {
+export function printItems(items: Array<LegacySavedItem | SavedItem>): void {
   if (items.length === 0) {
     process.stdout.write("No saved snapshots.\n");
     return;
@@ -589,6 +600,7 @@ export function formatApplyOptionPreview(filePath: string, resourceName: string,
 
 export async function runApplyDryRun(libraryDir: string, groupValue: string, projectDir: string): Promise<void> {
   const catalog = await loadCatalog(libraryDir);
+  assertModernCatalog(catalog);
   const group = resolveGroup(catalog, groupValue);
   const plan = await planApply(libraryDir, group.id, projectDir);
   note(formatPlan(plan, catalog), `Dry run: ${group.name} → ${projectDir}`);
@@ -596,6 +608,7 @@ export async function runApplyDryRun(libraryDir: string, groupValue: string, pro
 
 export async function runApplyWizard(libraryDir: string, groupValue: string, projectDir: string): Promise<void> {
   const catalog = await loadCatalog(libraryDir);
+  assertModernCatalog(catalog);
   const group = resolveGroup(catalog, groupValue);
   const plan = await planApply(libraryDir, group.id, projectDir);
   if (plan.files.length === 0) {

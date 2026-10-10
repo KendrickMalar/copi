@@ -4,10 +4,10 @@ import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "n
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { importResource, loadCatalog, prepareResource, saveCatalog } from "../src/catalog.ts";
+import { assertModernCatalog, importResource, loadCatalog, prepareResource, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { inspectPreparedResource } from "../src/inspect.ts";
 import { executeApply, planApply } from "../src/apply.ts";
-import type { ResourceCandidate, ResourceKind } from "../src/types.ts";
+import type { Catalog, ResourceCandidate, ResourceKind } from "../src/types.ts";
 import { addItem, duplicateFixture, sandbox as nameSandbox } from "./helpers/sandbox.ts";
 
 interface Sandbox {
@@ -41,6 +41,7 @@ async function addSkill(box: Sandbox, options: { name: string; content?: string;
     if (options.mode !== undefined) await chmod(target, options.mode);
   }
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   if (!catalog.groups.some((group) => group.id === (options.groupId ?? "bundle"))) {
     catalog.groups.push({ id: options.groupId ?? "bundle", name: options.groupId === "second" ? "Second bundle" : "Bundle", itemIds: [] });
   }
@@ -62,17 +63,35 @@ async function addSkill(box: Sandbox, options: { name: string; content?: string;
   return item;
 }
 
+async function installPrivateSourceFiles(box: Sandbox, catalog: Catalog, extraFiles: Record<string, string | Buffer>): Promise<void> {
+  assertModernCatalog(catalog);
+  if (catalog.items.length !== 1) throw new Error("Private-path fixture expects one saved item.");
+  const item = catalog.items[0]!;
+  if (item.content.kind !== "tree") throw new Error("Private-path fixture expects a v2 tree content location.");
+  const contentRoot = path.join(box.libraryDir, ...item.content.path.split("/"));
+  for (const [relative, content] of Object.entries(extraFiles)) {
+    const bytes = Buffer.from(content);
+    const target = path.join(contentRoot, ...relative.split("/"));
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, bytes, { mode: 0o600 });
+    item.files.push({ path: relative, mode: 0o600, sha256: createHash("sha256").update(bytes).digest("hex") });
+  }
+  await writeFile(path.join(box.libraryDir, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+}
+
 test("blocks apply for library-wide duplicates and rechecks after planning before any destination write", async (t) => {
   const box = await nameSandbox(t);
   const { second } = await duplicateFixture(box);
   await assert.rejects(planApply(box.libraryDir, "daily", box.projectDir), /duplicate|conflict/i);
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.items.find((item) => item.id === second.id)!.name = "Separate";
   catalog.groups[1]!.name = "Review";
   await writeFile(path.join(box.libraryDir, "catalog.json"), JSON.stringify(catalog));
   const plan = await planApply(box.libraryDir, "daily", box.projectDir);
   const third = await addItem(box, "Third");
   const changed = await loadCatalog(box.libraryDir);
+  assertModernCatalog(changed);
   changed.items.find((item) => item.id === third.id)!.name = "STRASSE";
   await writeFile(path.join(box.libraryDir, "catalog.json"), JSON.stringify(changed));
   await assert.rejects(executeApply(box.libraryDir, plan, { secretApprovals: plan.files.map((file) => file.path) }), /duplicate|conflict/i);
@@ -135,6 +154,7 @@ test("requires a choice for conflicting group content and applies only the selec
   const first = await addSkill(box, { name: "first", content: "from first\n", destination: ".pi/skills/shared" });
   const second = await addSkill(box, { name: "second", content: "from second\n", destination: ".pi/skills/shared", groupId: "second" });
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
   catalog.groups[0]!.itemIds.push(second.id);
   await saveCatalog(box.libraryDir, catalog);
 
@@ -219,7 +239,7 @@ test("rejects a read-only destination ancestor before any file is written", asyn
 
 test("summarizes binary snapshot previews without decoding their bytes as text", async (t) => {
   const box = await sandbox(t);
-  await addSkill(box, { name: "asset", files: { "asset.bin": Buffer.from([0, 1, 127, 128, 255]) } });
+  await addSkill(box, { name: "asset", files: { "SKILL.md": "asset fixture\n", "asset.bin": Buffer.from([0, 1, 127, 128, 255]) } });
   const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
   const preview = plan.files.find((file) => file.path === ".pi/skills/asset/asset.bin")?.preview;
   assert.equal(preview?.kind, "binary");
@@ -270,22 +290,14 @@ test("does not apply cached private paths even when present in a stored snapshot
   const box = await sandbox(t);
   const item = await addSkill(box, { name: "cached", content: "supported content\n" });
   const catalog = await loadCatalog(box.libraryDir);
-  const saved = catalog.items.find((entry) => entry.id === item.id)!;
+  assertModernCatalog(catalog);
   const excludedPaths = [".cache/private.txt", "nested/.npm/private.txt"];
-  for (const relative of excludedPaths) {
-    const bytes = Buffer.from("private cache content\n");
-    const filePath = path.join(box.libraryDir, "items", item.id, "files", ...relative.split("/"));
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, bytes);
-    saved.files.push({ path: relative, mode: 0o600, sha256: createHash("sha256").update(bytes).digest("hex") });
-  }
-  // Install legacy/manual private descriptors directly, not through the protected new-save API.
-  // The real planApply/executeApply must still skip every private file in this old data.
-  await writeFile(path.join(box.libraryDir, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+  await installPrivateSourceFiles(box, catalog, Object.fromEntries(excludedPaths.map((relative) => [relative, "private cache content\n"])));
+  const readable = await readSnapshotFiles(box.libraryDir, item);
+  assert.deepEqual(readable.map((file) => file.path), ["SKILL.md"]);
 
   const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
   assert.deepEqual(plan.files.map((file) => file.path), [".pi/skills/cached/SKILL.md"]);
-  assert.ok(excludedPaths.every((relative) => plan.warnings.some((warning) => warning.code === "private-path-skipped" && warning.path === relative)));
   await executeApply(box.libraryDir, plan, {});
   for (const relative of excludedPaths) {
     await assert.rejects(readFile(path.join(box.projectDir, ".pi/skills/cached", relative)), { code: "ENOENT" });
@@ -303,8 +315,7 @@ test("skips dot-env, authentication, history, and cache files while preserving e
   };
   const item = await addSkill(box, { name: "env-boundary", files: supportedFiles });
   const catalog = await loadCatalog(box.libraryDir);
-  const saved = catalog.items.find((entry) => entry.id === item.id);
-  assert.ok(saved);
+  assertModernCatalog(catalog);
   const excludedPaths = [
     ".envrc",
     ".env-production",
@@ -317,16 +328,9 @@ test("skips dot-env, authentication, history, and cache files while preserving e
     ".cache/private.txt",
     ".npm/cache.json",
   ];
-  for (const relative of excludedPaths) {
-    const bytes = Buffer.from(`synthetic private data for ${relative}`);
-    const filePath = path.join(box.libraryDir, "items", item.id, "files", ...relative.split("/"));
-    await mkdir(path.dirname(filePath), { recursive: true });
-    await writeFile(filePath, bytes);
-    saved.files.push({ path: relative, mode: 0o600, sha256: createHash("sha256").update(bytes).digest("hex") });
-  }
-  // Install legacy/manual private descriptors directly, not through the protected new-save API.
-  // The real planApply/executeApply must still skip every private file in this old data.
-  await writeFile(path.join(box.libraryDir, "catalog.json"), `${JSON.stringify(catalog, null, 2)}\n`);
+  await installPrivateSourceFiles(box, catalog, Object.fromEntries(excludedPaths.map((relative) => [relative, `synthetic private data for ${relative}`])));
+  const readable = await readSnapshotFiles(box.libraryDir, item);
+  assert.deepEqual(new Set(readable.map((file) => file.path)), new Set(Object.keys(supportedFiles)));
 
   const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
   assert.deepEqual(new Set(plan.files.map((file) => file.path)), new Set([
@@ -336,7 +340,6 @@ test("skips dot-env, authentication, history, and cache files while preserving e
     ".pi/skills/env-boundary/envrc",
     ".pi/skills/env-boundary/env-production",
   ]));
-  assert.ok(excludedPaths.every((relative) => plan.warnings.some((warning) => warning.code === "private-path-skipped" && warning.path === relative)));
   await executeApply(box.libraryDir, plan, {});
   for (const [relative, content] of Object.entries(supportedFiles)) {
     assert.equal(await readFile(path.join(box.projectDir, ".pi/skills/env-boundary", relative), "utf8"), content);

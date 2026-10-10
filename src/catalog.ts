@@ -4,10 +4,11 @@ import path from "node:path";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import { assertPreparedInspection, inspectFixedResource, inspectPreparedResource } from "./inspect.ts";
 import { absentStorageRevision, prepareStorageReview, storageTransactions, type StorageRevision, type StorageSession } from "./storage-transaction.ts";
+import { readSourceContent, validateContentLocations, validateRuntimeContentLocations } from "./source-content.ts";
 
-import type { Catalog, Group, InspectionResult, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents } from "./types.ts";
+import type { Catalog, Group, InspectionResult, LegacySavedItem, ResourceCandidate, ResourceDestination, ResourceKind, ResourceScope, SavedItem, SnapshotFile, SnapshotFileContents, StoredCatalog } from "./types.ts";
 
-const catalogRevisions = new WeakMap<Catalog, StorageRevision>();
+const catalogRevisions = new WeakMap<StoredCatalog, StorageRevision>();
 
 export interface ImportOptions {
   confirmed: boolean;
@@ -67,7 +68,7 @@ const itemIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const groupIdPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 export function newCatalog(): Catalog {
-  return { version: 1, items: [], groups: [] };
+  return { version: 2, items: [], groups: [] };
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -100,7 +101,7 @@ function parseSnapshotFile(value: unknown): SnapshotFile | undefined {
   return { path: file.path, mode: file.mode, sha256: file.sha256 };
 }
 
-function parseSavedItem(value: unknown): SavedItem | undefined {
+function parseLegacySavedItem(value: unknown): LegacySavedItem | undefined {
   const item = record(value);
   if (!item || typeof item.id !== "string" || !itemIdPattern.test(item.id) || typeof item.kind !== "string" || !kinds.has(item.kind as ResourceKind) || typeof item.source !== "string" || typeof item.scope !== "string" || !scopes.has(item.scope as ResourceScope) || typeof item.sourcePath !== "string" || !path.isAbsolute(item.sourcePath) || typeof item.name !== "string" || item.name.length === 0 || typeof item.savedAt !== "string" || !Number.isFinite(Date.parse(item.savedAt)) || !Array.isArray(item.files)) return undefined;
   const destination = parseDestination(item.destination);
@@ -119,6 +120,14 @@ function parseSavedItem(value: unknown): SavedItem | undefined {
   };
 }
 
+function parseSavedItem(value: unknown): SavedItem | undefined {
+  const item = record(value);
+  const legacy = parseLegacySavedItem(value);
+  const content = record(item?.content);
+  if (!legacy || !content || (content.kind !== "file" && content.kind !== "tree") || typeof content.path !== "string") return undefined;
+  return { ...legacy, content: { kind: content.kind, path: content.path } };
+}
+
 function parseGroup(value: unknown): Group | undefined {
   const group = record(value);
   if (!group || typeof group.id !== "string" || !groupIdPattern.test(group.id) || typeof group.name !== "string" || group.name.trim().length === 0 || !Array.isArray(group.itemIds) || group.itemIds.some((id) => typeof id !== "string" || !itemIdPattern.test(id))) return undefined;
@@ -126,10 +135,12 @@ function parseGroup(value: unknown): Group | undefined {
   return { id: group.id, name: group.name, itemIds: [...group.itemIds] as string[] };
 }
 
-function parseCatalog(value: unknown): Catalog {
+export function parseStoredCatalog(value: unknown): StoredCatalog {
   const catalog = record(value);
-  if (!catalog || catalog.version !== 1 || !Array.isArray(catalog.items) || !Array.isArray(catalog.groups)) throw new Error("Invalid copi catalog: expected version 1 with item and group arrays.");
-  const items = catalog.items.map(parseSavedItem);
+  if (!catalog || (catalog.version !== 1 && catalog.version !== 2) || !Array.isArray(catalog.items) || !Array.isArray(catalog.groups)) {
+    throw new Error("Invalid copi catalog: expected version 1 or 2 with item and group arrays.");
+  }
+  const items = catalog.items.map(catalog.version === 1 ? parseLegacySavedItem : parseSavedItem);
   const groups = catalog.groups.map(parseGroup);
   if (items.some((item) => item === undefined) || groups.some((group) => group === undefined)) throw new Error("Invalid copi catalog: an item or group has malformed fields.");
   const itemIds = items.map((item) => item?.id);
@@ -137,11 +148,15 @@ function parseCatalog(value: unknown): Catalog {
   if (new Set(itemIds).size !== itemIds.length || new Set(groupIds).size !== groupIds.length) throw new Error("Invalid copi catalog: duplicate item or group identifiers.");
   const knownItems = new Set(itemIds);
   if (groups.some((group) => group?.itemIds.some((id) => !knownItems.has(id)))) throw new Error("Invalid copi catalog: a group references an unknown item.");
-  return { version: 1, items: items as SavedItem[], groups: groups as Group[] };
+  if (catalog.version === 1) return { version: 1, items: items as LegacySavedItem[], groups: groups as Group[] };
+  const modern: Catalog = { version: 2, items: items as SavedItem[], groups: groups as Group[] };
+  validateContentLocations(modern.items);
+  return modern;
 }
 
-/** @internal Shared validation for the persistence kernel, not a saving API. */
-export { parseCatalog as parseStoredCatalog };
+export function assertModernCatalog(catalog: StoredCatalog): asserts catalog is Catalog {
+  if (catalog.version !== 2) throw new Error("This operation requires catalog v2; explicitly migrate the v1 library first.");
+}
 
 async function existingPrivateSubdirectory(root: string, relativePath: string): Promise<string> {
   if (!safeRelativePath(relativePath)) throw new Error("Unsafe relative path inside copi storage.");
@@ -276,7 +291,7 @@ function validateCandidate(candidate: ResourceCandidate): void {
   if (!destination || (destination.kind !== "global-only" && !(destination.kind === "project" && safeRelativePath(destination.path) && !excludedRelative(destination.path)))) throw new Error("Invalid or private/excluded resource destination.");
 }
 
-async function loadCatalogUnlocked(libraryDir: string): Promise<Catalog> {
+async function loadCatalogUnlocked(libraryDir: string): Promise<StoredCatalog> {
   const root = await existingStoreRoot(libraryDir);
   if (!root) return newCatalog();
   const filePath = path.join(root, "catalog.json");
@@ -292,14 +307,18 @@ async function loadCatalogUnlocked(libraryDir: string): Promise<Catalog> {
   } catch (error) {
     throw new Error("Invalid copi catalog JSON.", { cause: error });
   }
-  return parseCatalog(value);
+  const catalog = parseStoredCatalog(value);
+  if (catalog.version === 2) await validateRuntimeContentLocations(root, catalog.items);
+  return catalog;
 }
 
 export function catalogBytes(catalog: Catalog): Buffer {
-  return Buffer.from(`${JSON.stringify(parseCatalog(catalog), null, 2)}\n`, "utf8");
+  const validated = parseStoredCatalog(catalog);
+  assertModernCatalog(validated);
+  return Buffer.from(`${JSON.stringify(validated, null, 2)}\n`, "utf8");
 }
 
-export async function loadCatalog(libraryDir: string): Promise<Catalog> {
+export async function loadCatalog(libraryDir: string): Promise<StoredCatalog> {
   return storageTransactions.run(libraryDir, false, async (session) => {
     if (!session) {
       const catalog = newCatalog();
@@ -311,7 +330,7 @@ export async function loadCatalog(libraryDir: string): Promise<Catalog> {
     await session.assertRevision(revision);
     catalogRevisions.set(catalog, revision);
     return catalog;
-  });
+  }, { requiresNativePlacement: false });
 }
 
 export interface SavedLibraryState {
@@ -326,21 +345,26 @@ export async function withSavedLibrary<T>(libraryDir: string, operation: (state:
   return storageTransactions.run(libraryDir, false, async (session) => {
     if (!session) throw new Error("Snapshot catalog does not exist.");
     const revision = await session.capture();
-    const catalog = await loadCatalogUnlocked(session.root);
+    const loaded = await loadCatalogUnlocked(session.root);
+    assertModernCatalog(loaded);
+    const catalog = loaded;
     const files = new Map<string, SnapshotFileContents[]>();
     for (const item of catalog.items) files.set(item.id, await readSnapshotFilesUnlocked(session.root, catalog, item));
     await session.assertRevision(revision);
     return operation({ catalog, revision, files, session });
-  });
+  }, { requiresNativePlacement: false });
 }
 
 export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise<void> {
-  const validated = parseCatalog(catalog);
+  const parsed = parseStoredCatalog(catalog);
+  assertModernCatalog(parsed);
+  const validated = parsed;
   assertNoNameConflicts(validated);
   const binding = catalogRevisions.get(catalog);
   // Invalid new names are rejected without creating a library.
   const preflight = await loadCatalog(libraryDir);
   assertNoNameConflicts(preflight);
+  await validateRuntimeContentLocations(libraryDir, validated.items);
   await storageTransactions.run(libraryDir, true, async (session) => {
     if (!session) throw new Error("Missing storage session.");
     const revision = await session.capture();
@@ -364,28 +388,42 @@ export async function saveCatalog(libraryDir: string, catalog: Catalog): Promise
     }
     await session.commit(revision, catalogBytes(validated));
     catalogRevisions.set(catalog, await session.capture());
-  });
+  }, { requiresNativePlacement: false });
 }
 
 async function storePreparedResource(libraryDir: string, candidate: ResourceCandidate, sourceFiles: SourceFile[], requestedGroupIds: string[], approvedSensitivePaths: readonly string[]): Promise<SavedItem> {
-  const preflight = await loadCatalog(libraryDir);
-  assertNoNameConflicts(preflight);
-  assertNameAvailable(preflight, "item", candidate.name);
+  const catalogPreflight = await loadCatalogUnlocked(libraryDir);
+  assertModernCatalog(catalogPreflight);
+  assertNoNameConflicts(catalogPreflight);
+  assertNameAvailable(catalogPreflight, "item", candidate.name);
   const groupIds = [...new Set(requestedGroupIds)];
-  if (groupIds.some((id) => !preflight.groups.some((group) => group.id === id))) throw new Error("Cannot import a resource into an unknown group.");
+  if (groupIds.some((id) => !catalogPreflight.groups.some((group) => group.id === id))) throw new Error("Cannot import a resource into an unknown group.");
   return storageTransactions.run(libraryDir, true, async (session) => {
     if (!session) throw new Error("Missing storage session.");
     const revision = await session.capture();
     const catalog = await loadCatalogUnlocked(session.root);
+    assertModernCatalog(catalog);
     assertNoNameConflicts(catalog);
     assertNameAvailable(catalog, "item", candidate.name);
     for (const saved of catalog.items) await readSnapshotFilesUnlocked(session.root, catalog, saved);
     const groups = new Map(catalog.groups.map((group) => [group.id, group]));
     if (groupIds.some((id) => !groups.has(id))) throw new Error("Cannot import a resource into an unknown group.");
+    const id = randomUUID();
+    let content: SavedItem["content"];
+    if (candidate.kind === "skill") {
+      content = { kind: "tree", path: `sources/${id}` };
+    } else {
+      const sourceFile = sourceFiles[0];
+      if (sourceFiles.length !== 1 || !sourceFile || sourceFile.path !== path.posix.basename(sourceFile.path)) {
+        throw new Error("Non-skill resources must be imported from one regular source file.");
+      }
+      content = { kind: "file", path: `sources/${id}/${sourceFile.path}` };
+    }
     const item: SavedItem = {
-      id: randomUUID(), kind: candidate.kind, source: candidate.source, scope: candidate.scope,
+      id, kind: candidate.kind, source: candidate.source, scope: candidate.scope,
       sourcePath: candidate.sourcePath, destination: { ...candidate.destination }, name: candidate.name.trim(), savedAt: new Date().toISOString(),
       files: sourceFiles.map((file) => ({ path: file.path, mode: file.mode, sha256: createHash("sha256").update(file.bytes).digest("hex") })),
+      content,
     };
     catalog.items.push(item);
     for (const groupId of groupIds) groups.get(groupId)?.itemIds.push(item.id);
@@ -394,7 +432,7 @@ async function storePreparedResource(libraryDir: string, candidate: ResourceCand
     const review = prepareStorageReview(bytes, replacements);
     await session.commit(revision, bytes, replacements, { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: approvedSensitivePaths.map((filePath) => `${item.id}/${filePath}`) } });
     return structuredClone(item);
-  });
+  }, { requiresNativePlacement: true });
 }
 
 export async function importPreparedResource(libraryDir: string, prepared: PreparedResource, options: PreparedImportOptions): Promise<SavedItem | null> {
@@ -438,12 +476,17 @@ export async function importResource(libraryDir: string, candidate: ResourceCand
   return importPreparedResource(libraryDir, prepared, { confirmed: true, groupIds, inspection: suppliedInspection ?? inspection, approvedSensitivePaths });
 }
 
-async function readSnapshotFilesUnlocked(libraryDir: string, catalog: Catalog, item: SavedItem): Promise<SnapshotFileContents[]> {
+async function readSnapshotFilesUnlocked(libraryDir: string, catalog: StoredCatalog, item: SavedItem | LegacySavedItem): Promise<SnapshotFileContents[]> {
   if (!itemIdPattern.test(item.id)) throw new Error("Invalid snapshot identifier.");
   const root = await existingStoreRoot(libraryDir);
   if (!root) throw new Error("Snapshot catalog does not exist.");
   const storedItem = catalog.items.find((entry) => entry.id === item.id);
   if (!storedItem) throw new Error("Snapshot is not present in the catalog.");
+  if (catalog.version === 2) {
+    const modernItem = catalog.items.find((entry) => entry.id === item.id);
+    if (!modernItem) throw new Error("Snapshot is not present in the v2 catalog.");
+    return readSourceContent(root, modernItem);
+  }
   const canonicalFilesRoot = await existingPrivateSubdirectory(root, path.posix.join("items", storedItem.id, "files"));
   const results: SnapshotFileContents[] = [];
   for (const file of storedItem.files) {
@@ -465,7 +508,7 @@ async function readSnapshotFilesUnlocked(libraryDir: string, catalog: Catalog, i
   return results;
 }
 
-export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Promise<SnapshotFileContents[]> {
+export async function readSnapshotFiles(libraryDir: string, item: SavedItem | LegacySavedItem): Promise<SnapshotFileContents[]> {
   return storageTransactions.run(libraryDir, false, async (session) => {
     if (!session) throw new Error("Snapshot catalog does not exist.");
     const revision = await session.capture();
@@ -473,7 +516,7 @@ export async function readSnapshotFiles(libraryDir: string, item: SavedItem): Pr
     const result = await readSnapshotFilesUnlocked(session.root, catalog, item);
     await session.assertRevision(revision);
     return result;
-  });
+  }, { requiresNativePlacement: false });
 }
 
 /** Persist staged, explicit name-only changes together, so cancellation never partially resolves names. */
@@ -484,7 +527,9 @@ export async function saveNameChanges(libraryDir: string, before: Catalog, after
 }
 
 async function saveNameChangesLocked(before: Catalog, after: Catalog, current: Catalog, revision: StorageRevision, session: StorageSession): Promise<void> {
-  const validated = parseCatalog(after);
+  const parsed = parseStoredCatalog(after);
+  assertModernCatalog(parsed);
+  const validated = parsed;
   if (JSON.stringify(current) !== JSON.stringify(before)) throw new Error("Catalog changed while renaming; reload before trying again.");
   const restored = structuredClone(validated);
   const conflicts = findNameConflicts(before);
@@ -517,6 +562,7 @@ async function saveNameChangesLocked(before: Catalog, after: Catalog, current: C
 
 export async function renameSavedItem(libraryDir: string, itemId: string, name: string): Promise<SavedItem> {
   const before = await loadCatalog(libraryDir);
+  assertModernCatalog(before);
   const after = structuredClone(before);
   const item = after.items.find((entry) => entry.id === itemId);
   if (!item) throw new Error("Unknown saved item.");
@@ -526,7 +572,7 @@ export async function renameSavedItem(libraryDir: string, itemId: string, name: 
   return item;
 }
 
-export async function listSnapshots(libraryDir: string): Promise<SavedItem[]> {
+export async function listSnapshots(libraryDir: string): Promise<Array<LegacySavedItem | SavedItem>> {
   const catalog = await loadCatalog(libraryDir);
   return [...catalog.items].sort((left, right) => right.savedAt.localeCompare(left.savedAt) || left.id.localeCompare(right.id));
 }

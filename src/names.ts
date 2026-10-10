@@ -1,4 +1,4 @@
-import type { Catalog } from "./types.ts";
+import type { StoredCatalog } from "./types.ts";
 import { foldCaseUnicode17 } from "./unicode-case-folding.ts";
 
 export interface NameConflict {
@@ -13,7 +13,7 @@ export function nameKey(name: string): string {
   return key;
 }
 
-export function findNameConflicts(catalog: Catalog): NameConflict[] {
+export function findNameConflicts(catalog: StoredCatalog): NameConflict[] {
   const conflicts: NameConflict[] = [];
   for (const namespace of ["item", "group"] as const) {
     const keys = new Map<string, string[]>();
@@ -28,14 +28,14 @@ export function findNameConflicts(catalog: Catalog): NameConflict[] {
   return conflicts;
 }
 
-export function assertNoNameConflicts(catalog: Catalog): void {
+export function assertNoNameConflicts(catalog: StoredCatalog): void {
   if (findNameConflicts(catalog).length > 0) {
     throw new Error("Duplicate names in the copi library. Only listing, masked viewing, and name conflict resolution are allowed; resolve the names interactively with copi groups.");
   }
 }
 
 /** A rename during resolution may touch a conflict member only, and must use a free name. */
-export function assertNameAvailable(catalog: Catalog, namespace: "item" | "group", name: string, id?: string): void {
+export function assertNameAvailable(catalog: StoredCatalog, namespace: "item" | "group", name: string, id?: string): void {
   const key = nameKey(name);
   const conflicts = findNameConflicts(catalog);
   if (conflicts.length > 0 && !conflicts.some((conflict) => conflict.namespace === namespace && conflict.ids.includes(id ?? ""))) {

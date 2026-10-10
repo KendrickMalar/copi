@@ -14,7 +14,8 @@ test("keeps group edits in memory and lets the same saved item belong to multipl
     destination: { kind: "project", path: ".pi/skills/review" },
     name: "review",
     savedAt: "2026-09-30T00:00:00.000Z",
-    files: [],
+    files: [{ path: "SKILL.md", mode: 0o644, sha256: "0".repeat(64) }],
+    content: { kind: "tree", path: "sources/00000000-0000-4000-8000-000000000001" },
   });
 
   const daily = createGroup(catalog, "Daily");

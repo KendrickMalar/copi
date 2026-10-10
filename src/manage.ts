@@ -1,13 +1,13 @@
 import { confirm, intro, isCancel, note, outro, select, text } from "@clack/prompts";
 import path from "node:path";
 import { lstat } from "node:fs/promises";
-import { loadCatalog, readSnapshotFiles, saveCatalog, saveNameChanges } from "./catalog.ts";
+import { assertModernCatalog, loadCatalog, readSnapshotFiles, saveCatalog, saveNameChanges } from "./catalog.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts } from "./names.ts";
 import { commitSavedChange, prepareSavedChange, prepareSavedEdit, readSavedChange, readSavedEdit } from "./resource-mutations.ts";
 import { editTerminalText } from "./terminal-editor.ts";
 import { commitRefresh, discoverRefreshOrigin, prepareRefresh, readRefresh, resolveRefreshPath } from "./refresh.ts";
 import { resolveNameConflicts, runApplyWizard, runGroupManager, runSetup, safeDisplay, withEditorInput, withWizardLifecycle, type SearchRoots } from "./wizard.ts";
-import type { Catalog, ResourceCandidate, ResourceDestination, ResourceScope, SavedItem } from "./types.ts";
+import type { Catalog, LegacySavedItem, ResourceCandidate, ResourceDestination, ResourceScope, SavedItem, StoredCatalog } from "./types.ts";
 
 class Cancelled extends Error {}
 function checked<T>(value: T, signal: AbortSignal): Exclude<T, symbol> {
@@ -21,15 +21,15 @@ async function yes(message: string, signal: AbortSignal): Promise<boolean> {
   return checked(await confirm({message:safeDisplay(message),initialValue:false,signal}),signal) === true;
 }
 function show(body: string, title: string): void { note(safeDisplay(body),safeDisplay(title)); }
-function hint(catalog: Catalog, item: SavedItem, order: number): string {
+function hint(catalog: StoredCatalog, item: LegacySavedItem | SavedItem, order: number): string {
   const groups = catalog.groups.filter(group=>group.itemIds.includes(item.id)).map(group=>group.name).join(", ") || "no groups";
   return `${groups} · ${item.destination.kind === "project" ? item.destination.path : "saved only"} · ${item.source} · saved ${item.savedAt} · entry ${order + 1}`;
 }
-async function savedFile(item: SavedItem, signal: AbortSignal): Promise<string | undefined> {
+async function savedFile(item: LegacySavedItem | SavedItem, signal: AbortSignal): Promise<string | undefined> {
   if (item.files.length === 0) {show("No registered saved files.",item.name);return undefined;}
   return choose("Select saved file",item.files.map(file=>({value:file.path,label:file.path})),signal);
 }
-async function view(libraryDir: string, item: SavedItem, signal: AbortSignal): Promise<void> {
+async function view(libraryDir: string, item: LegacySavedItem | SavedItem, signal: AbortSignal): Promise<void> {
   const filePath = await savedFile(item,signal);
   if (filePath === undefined) return;
   const file = (await readSnapshotFiles(libraryDir,item)).find(file=>file.path===filePath);
@@ -163,8 +163,15 @@ async function refresh(libraryDir: string, catalog: Catalog, item: SavedItem, ro
   await commitRefresh(prepared,{reviewId:prepared.reviewId,confirmed:true,approvedSensitivePaths});
   outro("Refreshed saved copy committed with matching checksums; originals unchanged.");
 }
-async function resource(libraryDir: string, catalog: Catalog, conflict: boolean, roots: SearchRoots, signal: AbortSignal): Promise<void> {
+async function resource(libraryDir: string, catalog: StoredCatalog, conflict: boolean, roots: SearchRoots, signal: AbortSignal): Promise<void> {
   const id = await choose("Select saved resource",catalog.items.map((item,index)=>({value:item.id,label:`[${item.kind}] ${item.name}`,hint:hint(catalog,item,index)})),signal);
+  if(catalog.version===1) {
+    const item = catalog.items.find(item=>item.id===id);
+    if(!item) throw new Error("Selected resource is unavailable; reload the library.");
+    const action = await choose("Resource action",[{value:"view",label:"View saved file (masked)"},{value:"back",label:"Back"}],signal);
+    if(action==="view") await view(libraryDir,item,signal);
+    return;
+  }
   const item = catalog.items.find(item=>item.id===id);
   if(!item) throw new Error("Selected resource is unavailable; reload the library.");
   const action = await choose("Resource action",[
@@ -176,7 +183,9 @@ async function resource(libraryDir: string, catalog: Catalog, conflict: boolean,
   ],signal);
   if(action==="view") {await view(libraryDir,item,signal);return;}
   if(action==="back") return;
-  assertNoNameConflicts(await loadCatalog(libraryDir));
+  const current = await loadCatalog(libraryDir);
+  assertModernCatalog(current);
+  assertNoNameConflicts(current);
   if(action==="edit") await edit(libraryDir,item,signal);
   else if(action==="rename") await rename(libraryDir,catalog,item,signal);
   else if(action==="refresh") await refresh(libraryDir,catalog,item,roots,signal);
@@ -190,20 +199,25 @@ export async function runManage(libraryDir: string, roots: SearchRoots): Promise
     try {
       while(!signal.aborted) {
         const catalog = await loadCatalog(libraryDir);
+        const modern = catalog.version === 2;
         const conflict = findNameConflicts(catalog).length > 0;
-        if(conflict) show("Duplicate names: only listing, masked viewing, and explicit name conflict resolution are allowed.","Duplicate names");
+        if(conflict) show(modern ? "Duplicate names: only listing, masked viewing, and explicit name conflict resolution are allowed." : "Legacy catalog v1 is read-only; duplicate names are not changed here. Only listing and masked viewing are available.","Duplicate names");
+        else if(!modern) show("Legacy catalog v1 is read-only until explicit migration.","Read-only library");
         else if(catalog.items.length===0) show("No saved resources. Setup searches only explicitly selected and approved locations.","Private library");
         const action = await choose("Manage saved resources",[
           ...(catalog.items.length?[{value:"resource",label:"Select resource by name"}]:[]),
-          ...(conflict?[{value:"resolve",label:"Resolve name conflicts"}]:[
+          ...(modern ? (conflict ? [{value:"resolve",label:"Resolve name conflicts"}] : [
             {value:"groups",label:"Manage groups"},{value:"apply",label:"Apply group"},{value:"setup",label:"Setup copied resources"},
-          ]),{value:"done",label:"Finish"},
+          ]) : []),{value:"done",label:"Finish"},
         ],signal);
         if(action==="done") break;
         if(action==="resource") await resource(libraryDir,catalog,conflict,roots,signal);
         else if(action==="resolve") await resolveNameConflicts(libraryDir);
         else {
-          assertNoNameConflicts(await loadCatalog(libraryDir));
+          assertModernCatalog(catalog);
+          const current = await loadCatalog(libraryDir);
+          assertModernCatalog(current);
+          assertNoNameConflicts(current);
           if(action==="groups") await runGroupManager(libraryDir);
           else if(action==="setup") await runSetup(libraryDir,roots);
           else {

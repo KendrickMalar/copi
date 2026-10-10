@@ -1,19 +1,115 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { cp, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import test from "node:test";
-import { catalogBytes, importResource, loadCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
+import test, { type TestContext } from "node:test";
+import { assertModernCatalog, catalogBytes, importResource, loadCatalog, readSnapshotFiles, saveCatalog } from "../src/catalog.ts";
 import { prepareStorageReview, readStorageReview, StorageTransactions, type StorageCheckpoint, type StorageReview } from "../src/storage-transaction.ts";
-import { child, childExit, interruptedCode, kernelCommit, transactionFixture, waitForLine } from "./helpers/storage-transaction.ts";
+import { childExit, fixtureModuleUrl, fixtureNodeArgs, interruptedCode, transactionFixture as makeTransactionFixture, waitForLine, type TransactionFixture } from "./helpers/storage-transaction.ts";
 import { sandbox } from "./helpers/sandbox.ts";
+import type { Catalog, ResourceCandidate } from "../src/types.ts";
+
+type ModernSingleFileFixture = Omit<TransactionFixture, "catalog" | "next" | "file"> & {
+  catalog: Catalog;
+  next: Catalog;
+  file: string;
+};
+type ModernTreeFixture = Omit<ModernSingleFileFixture, "candidate"> & { candidate: ResourceCandidate };
+type ModernFixture = ModernSingleFileFixture | ModernTreeFixture;
+
+async function transactionFixture(t: TestContext): Promise<ModernSingleFileFixture> {
+  const fixture = await makeTransactionFixture(t);
+  assertModernCatalog(fixture.catalog);
+  assertModernCatalog(fixture.next);
+  if (fixture.item.content.kind !== "file") throw new Error("Expected a v2 single-file transaction fixture.");
+  return {
+    ...fixture,
+    catalog: fixture.catalog,
+    next: fixture.next,
+    file: path.join(fixture.libraryDir, ...fixture.item.content.path.split("/")),
+  };
+}
+
+async function treeTransactionFixture(t: TestContext): Promise<ModernTreeFixture> {
+  const box = await sandbox(t);
+  const sourcePath = path.join(box.sourceRoot, "skill");
+  await mkdir(sourcePath);
+  const sourceFile = path.join(sourcePath, "SKILL.md");
+  await writeFile(sourceFile, "old snapshot\n");
+  const candidate = {
+    id: "tree-transaction-fixture",
+    kind: "skill" as const,
+    source: "test",
+    scope: "project" as const,
+    sourceRoot: box.sourceRoot,
+    sourcePath,
+    name: "Snapshot",
+    destination: { kind: "project" as const, path: ".pi/skills/snapshot" },
+  };
+  const item = await importResource(box.libraryDir, candidate, { confirmed: true, groupIds: [] });
+  assert.ok(item);
+  if (item.content.kind !== "tree") throw new Error("Expected v2 skill tree content.");
+  const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
+  const next = structuredClone(catalog);
+  const nextItem = next.items.find((entry) => entry.id === item.id);
+  const registeredSkill = item.files.find((entry) => entry.path === "SKILL.md");
+  assert.ok(nextItem && registeredSkill);
+  const bytes = Buffer.from("new snapshot\n");
+  nextItem.files.find((entry) => entry.path === "SKILL.md")!.sha256 = createHash("sha256").update(bytes).digest("hex");
+  return {
+    ...box,
+    candidate,
+    item,
+    catalog,
+    next,
+    bytes,
+    files: [{ path: "SKILL.md", mode: registeredSkill.mode, bytes }],
+    file: path.join(box.libraryDir, ...item.content.path.split("/"), "SKILL.md"),
+  };
+}
+
+function containsErrnoCode(error: unknown, expected: string): boolean {
+  if (!(error instanceof Error)) return false;
+  if ("code" in error && error.code === expected) return true;
+  if (error instanceof AggregateError) {
+    const nestedErrors: Iterable<unknown> = error.errors;
+    for (const nested of nestedErrors) if (containsErrnoCode(nested, expected)) return true;
+  }
+  return error.cause !== undefined && containsErrnoCode(error.cause, expected);
+}
+
+function child(box: ModernSingleFileFixture, code: string): ChildProcessWithoutNullStreams {
+  return spawn(process.execPath, fixtureNodeArgs(import.meta.url, code), {
+    cwd: box.projectDir,
+    env: {
+      ...process.env,
+      HOME: box.homeDir,
+      PI_CODING_AGENT_DIR: box.agentDir,
+      TMPDIR: process.env.TMPDIR!,
+      NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE!,
+      NPM_CONFIG_USERCONFIG: "/dev/null",
+    },
+  });
+}
+
+async function kernelCommit(box: ModernFixture, checkpoint?: (point: StorageCheckpoint, root: string) => void | Promise<void>): Promise<void> {
+  const kernel = new StorageTransactions(checkpoint ? { checkpoint } : {});
+  await kernel.run(box.libraryDir, false, async (session) => {
+    assert.ok(session);
+    await session.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }]);
+  }, { requiresNativePlacement: false });
+}
 
 // Losing this guard would overwrite another process's group changes.
 test("S3 saveCatalog rejects a stale loaded catalog even when names are unique", async (t) => {
   const box = await sandbox(t);
-  await saveCatalog(box.libraryDir, { version: 1, items: [], groups: [] });
+  await saveCatalog(box.libraryDir, { version: 2, items: [], groups: [] });
   const stale = await loadCatalog(box.libraryDir);
   const other = await loadCatalog(box.libraryDir);
+  assertModernCatalog(stale);
+  assertModernCatalog(other);
   other.groups.push({ id: "other", name: "Other", itemIds: [] });
   await saveCatalog(box.libraryDir, other);
   const before = await readFile(path.join(box.libraryDir, "catalog.json"));
@@ -22,21 +118,30 @@ test("S3 saveCatalog rejects a stale loaded catalog even when names are unique",
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
 });
 
-test("S6 generic catalog save cannot repair a manually changed checksum", async (t) => {
+test("S6 catalog-only save cannot rewrite file descriptors after a direct sources edit", async (t) => {
   const box = await sandbox(t);
   const file = path.join(box.sourceRoot, "safe.md");
   await writeFile(file, "safe");
   const item = await importResource(box.libraryDir, { id: "safe", kind: "instruction", source: "test", scope: "project", sourceRoot: box.sourceRoot, sourcePath: file, name: "safe", destination: { kind: "project", path: "AGENTS.md" } }, { confirmed: true, groupIds: [] });
   assert.ok(item);
+  if (item.content.kind !== "file") throw new Error("Expected imported single-file content.");
   const catalog = await loadCatalog(box.libraryDir);
-  await writeFile(path.join(box.libraryDir, "items", item.id, "files", "safe.md"), "changed manually");
+  assertModernCatalog(catalog);
+  const savedFile = path.join(box.libraryDir, ...item.content.path.split("/"));
+  const manual = Buffer.from("changed manually");
+  await writeFile(savedFile, manual);
+  const current = (await readSnapshotFiles(box.libraryDir, item))[0]!;
+  assert.deepEqual(current.bytes, manual);
+  assert.equal(current.sha256, createHash("sha256").update(manual).digest("hex"));
+  assert.equal(catalog.items[0]!.files[0]!.sha256, createHash("sha256").update("safe").digest("hex"));
   catalog.items[0]!.files[0]!.sha256 = "f".repeat(64);
-  await assert.rejects(saveCatalog(box.libraryDir, catalog), /checksum|changed|revision/i);
+  await assert.rejects(saveCatalog(box.libraryDir, catalog), /changed|revision|checksum|catalog-only|descriptor|source/i);
+  assert.deepEqual(await readFile(savedFile), manual);
 });
 
 test("S2 library transaction kernel is available for explicit instance-scoped failure injection", async () => {
-  const module = await import("../src/" + "storage-transaction.js").catch(() => undefined) as Record<string, unknown> | undefined;
-  assert.equal(typeof module?.StorageTransactions, "function", "transaction kernel is missing");
+  const module = await import("../src/storage-transaction.ts");
+  assert.equal(typeof module.StorageTransactions, "function", "transaction kernel is missing");
 });
 
 const boundaries: StorageCheckpoint[] = ["stage-write", "stage-sync", "journal", "before-swap", "old-renamed", "new-renamed", "before-catalog", "catalog-renamed", "directory-sync", "committed"];
@@ -50,7 +155,7 @@ for (const boundary of boundaries) {
     assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
     assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
     assert.equal((await readSnapshotFiles(box.libraryDir, box.item))[0]!.bytes.toString(), "old snapshot\n");
-    assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "items"]);
+    assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "sources"]);
     console.log(`S2 fault ${boundary}: reached=${reached}, old file+catalog restored, journal absent`);
   });
 }
@@ -91,7 +196,7 @@ test("S3 a reader cannot observe mixed state while a writer holds the multi-rena
 
 test("S3 distinct cooperating processes serialize imports without losing either item", async (t) => {
   const box = await transactionFixture(t);
-  const module = new URL("../src/catalog.js", import.meta.url).href;
+  const module = fixtureModuleUrl(import.meta.url, "../src/catalog");
   const code = (name: string) => `import {importResource} from ${JSON.stringify(module)}; await importResource(${JSON.stringify(box.libraryDir)},${JSON.stringify({ ...box.candidate, name })},{confirmed:true,groupIds:[]}); console.log('saved');`;
   const results = await Promise.all([childExit(child(box, code("Process A"))), childExit(child(box, code("Process B")))]);
   for (const result of results) assert.equal(result.code, 0, result.output);
@@ -126,12 +231,12 @@ for (const corruption of ["unknown owner", "missing journal", "altered journal",
       if (corruption === "missing journal") await rm(path.join(lock, "journal.json"));
       else if (corruption === "altered journal") await writeFile(path.join(lock, "journal.json"), '{}');
       else if (corruption === "missing rollback") await rm(path.join(lock, "old-0"), { recursive: true });
-      else await writeFile(path.join(lock, "old-0", "files", "source.md"), "altered backup");
+      else await writeFile(path.join(lock, "old-0"), "altered backup");
     }
     const file = await readFile(box.file);
     const catalog = await readFile(path.join(box.libraryDir, "catalog.json"));
     const kernel = new StorageTransactions({ waitMilliseconds: 60 });
-    await assert.rejects(kernel.run(box.libraryDir, false, async () => {}), /lock|journal|recovery|rollback|altered/i);
+    await assert.rejects(kernel.run(box.libraryDir, false, async () => {}, { requiresNativePlacement: false }), /lock|journal|recovery|rollback|altered/i);
     assert.deepEqual(await readFile(box.file), file);
     assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), catalog);
     assert.ok(await lstat(lock));
@@ -141,19 +246,21 @@ for (const corruption of ["unknown owner", "missing journal", "altered journal",
 test("S3 revisions are library-bound and readers do not create absent libraries", async (t) => {
   const box = await transactionFixture(t);
   const absent = path.join(box.root, "absent");
-  assert.deepEqual(await loadCatalog(absent), { version: 1, items: [], groups: [] });
+  assert.deepEqual(await loadCatalog(absent), { version: 2, items: [], groups: [] });
   await assert.rejects(lstat(absent), { code: "ENOENT" });
   const other = path.join(box.root, "other");
-  await saveCatalog(other, { version: 1, items: [], groups: [] });
+  await saveCatalog(other, { version: 2, items: [], groups: [] });
   const kernel = new StorageTransactions();
-  const revision = await kernel.run(box.libraryDir, false, async (session) => session!.capture());
-  await assert.rejects(kernel.run(other, false, async (session) => session!.assertRevision(revision)), /changed|revision/i);
+  const revision = await kernel.run(box.libraryDir, false, async (session) => session!.capture(), { requiresNativePlacement: false });
+  await assert.rejects(kernel.run(other, false, async (session) => session!.assertRevision(revision), { requiresNativePlacement: false }), /changed|revision/i);
 });
 
 test("S3 stale initially absent catalog cannot erase a subsequently created library", async (t) => {
   const box = await sandbox(t);
   const stale = await loadCatalog(box.libraryDir);
   const other = await loadCatalog(box.libraryDir);
+  assertModernCatalog(stale);
+  assertModernCatalog(other);
   other.groups.push({ id: "other", name: "Other", itemIds: [] });
   await saveCatalog(box.libraryDir, other);
   const before = await readFile(path.join(box.libraryDir, "catalog.json"));
@@ -167,7 +274,8 @@ test("S3 manual unrelated bytes changed DURING swap are detected, preserved, and
   const other = await importResource(box.libraryDir, { ...box.candidate, name: "Other" }, { confirmed: true, groupIds: [] });
   assert.ok(other);
   box.next.items.push(other);
-  const file = path.join(box.libraryDir, "items", other.id, "files", "source.md");
+  if (other.content.kind !== "file") throw new Error("Expected an imported single-file resource.");
+  const file = path.join(box.libraryDir, ...other.content.path.split("/"));
   await assert.rejects(kernelCommit(box, async (point) => { if (point === "new-renamed") await writeFile(file, "manual unrelated bytes\n"); }), /changed|external/i);
   assert.equal(await readFile(file, "utf8"), "manual unrelated bytes\n");
   assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
@@ -190,34 +298,39 @@ for (const point of ["rollback-displaced", "rollback-restored"] as const) {
 
 test("S3 detached stale catalog objects cannot bypass revision provenance and overwrite new group changes", async (t) => {
   const box = await transactionFixture(t);
-  const stale = structuredClone(await loadCatalog(box.libraryDir));
+  const stale = await loadCatalog(box.libraryDir);
   const current = await loadCatalog(box.libraryDir);
+  assertModernCatalog(stale);
+  assertModernCatalog(current);
+  const staleCopy = structuredClone(stale);
   current.groups.push({ id: "new", name: "New", itemIds: [] });
   await saveCatalog(box.libraryDir, current);
   const bytes = await readFile(path.join(box.libraryDir, "catalog.json"));
-  stale.groups.push({ id: "stale", name: "Stale", itemIds: [] });
-  await assert.rejects(saveCatalog(box.libraryDir, stale), /loaded|revision|changed/i);
+  staleCopy.groups.push({ id: "stale", name: "Stale", itemIds: [] });
+  await assert.rejects(saveCatalog(box.libraryDir, staleCopy), /loaded|revision|changed/i);
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), bytes);
 });
 
-test("S4 snapshot swap refuses an ancestor replaced with a symlink during commit; outside bytes never touched", async (t) => {
+test("S4 snapshot swap refuses a sources-root symlink substitution; outside bytes never touched", async (t) => {
   const box = await transactionFixture(t);
-  const outside = path.join(box.root, "outside-items");
-  await mkdir(path.join(outside, box.item.id, "files"), { recursive: true, mode: 0o700 });
-  const outsideFile = path.join(outside, box.item.id, "files", "source.md");
+  const outside = path.join(box.root, "outside-sources");
+  const sourceRelative = box.item.content.path.split("/").slice(1);
+  const outsideFile = path.join(outside, ...sourceRelative);
+  await mkdir(path.dirname(outsideFile), { recursive: true, mode: 0o700 });
   await writeFile(outsideFile, "old snapshot\n", { mode: 0o600 });
+  const originalSources = path.join(box.root, "original-sources");
   let crossed = false;
   await assert.rejects(kernelCommit(box, async (point) => {
     if (point === "old-renamed") crossed = true;
     if (point === "before-swap") {
       const {rename} = await import("node:fs/promises");
-      await rename(path.join(box.libraryDir, "items"), path.join(box.root, "original-items"));
-      await symlink(outside, path.join(box.libraryDir, "items"));
+      await rename(path.join(box.libraryDir, "sources"), originalSources);
+      await symlink(outside, path.join(box.libraryDir, "sources"));
     }
   }), /symbolic|unsafe|recover|changed/i);
-  assert.equal(crossed, false, "must stop before renaming any item through an outside symlink");
+  assert.equal(crossed, false, "must stop before renaming content through an outside sources-root symlink");
   assert.equal(await readFile(outsideFile, "utf8"), "old snapshot\n");
-  assert.equal(await readFile(path.join(box.root, "original-items", box.item.id, "files", "source.md"), "utf8"), "old snapshot\n");
+  assert.equal(await readFile(path.join(originalSources, ...sourceRelative), "utf8"), "old snapshot\n");
 });
 
 test("S5 low-level transaction entry cannot bypass inspection/individual secret approval", async (t) => {
@@ -230,16 +343,22 @@ test("S5 low-level transaction entry cannot bypass inspection/individual secret 
   assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
 });
 
-test("S1/S6 raw transaction metadata cannot introduce wrong checksums or silently repair corruption", async (t) => {
+test("S1/S6 catalog-only transaction cannot rewrite file descriptors after a direct sources edit", async (t) => {
   const box = await transactionFixture(t);
   const kernel = new StorageTransactions();
   const wrong = structuredClone(box.catalog);
   wrong.items[0]!.files[0]!.sha256 = "f".repeat(64);
-  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong)))), /checksum|bytes|snapshot/i);
-  await writeFile(box.file, "manual corrupted\n");
-  wrong.items[0]!.files[0]!.sha256 = createHash("sha256").update("manual corrupted\n").digest("hex");
-  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong)))), /checksum|bytes|snapshot/i);
-  assert.equal(await readFile(box.file, "utf8"), "manual corrupted\n");
+  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong))), { requiresNativePlacement: false }), /catalog-only|descriptor|source/i);
+
+  const manual = Buffer.from("manual direct source edit\n");
+  await writeFile(box.file, manual);
+  const current = (await readSnapshotFiles(box.libraryDir, box.item))[0]!;
+  assert.deepEqual(current.bytes, manual);
+  assert.equal(current.sha256, createHash("sha256").update(manual).digest("hex"));
+  assert.equal(box.catalog.items[0]!.files[0]!.sha256, createHash("sha256").update("old snapshot\n").digest("hex"));
+  wrong.items[0]!.files[0]!.sha256 = current.sha256;
+  await assert.rejects(kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), Buffer.from(JSON.stringify(wrong))), { requiresNativePlacement: false }), /catalog-only|descriptor|source/i);
+  assert.deepEqual(await readFile(box.file), manual);
 });
 
 test("S5 generalized kernel accepts only an authentic byte-bound review with matching per-item/file approvals", async (t) => {
@@ -254,15 +373,15 @@ test("S5 generalized kernel accepts only an authentic byte-bound review with mat
   assert.deepEqual(readStorageReview(review).sensitivePaths, approvedSensitivePaths);
   const approval = { confirmed: true, reviewId: review.reviewId, approvedSensitivePaths };
   for (const invalid of [{ ...approval, confirmed: false }, { ...approval, reviewId: "another-review" }, { ...approval, approvedSensitivePaths: [] }]) {
-    await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval: invalid })), /approval|review/i);
+    await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval: invalid }), { requiresNativePlacement: false }), /approval|review/i);
   }
-  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review: {reviewId:review.reviewId} as StorageReview, approval })), /review/i);
+  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review: {reviewId:review.reviewId} as StorageReview, approval }), { requiresNativePlacement: false }), /review/i);
   const wrongBytes = [{ itemId: box.item.id, files: [{ ...box.files[0]!, bytes: Buffer.from("apiKey=sk_live_unreviewed123456\n") }] }];
-  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, wrongBytes, { review, approval })), /review|bytes/i);
+  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, wrongBytes, { review, approval }), { requiresNativePlacement: false }), /review|bytes/i);
   (readStorageReview(review).sensitivePaths as string[]).length = 0;
   const expected = Buffer.from(secret);
   const kernel = new StorageTransactions({ checkpoint: (point) => { if (point === "stage-write") { secret.fill(0); bytes.fill(0); } } });
-  await kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval }));
+  await kernel.run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, { review, approval }), { requiresNativePlacement: false });
   assert.deepEqual(await readFile(box.file), expected);
   assert.deepEqual((await readSnapshotFiles(box.libraryDir, box.item))[0]!.bytes, expected);
 });
@@ -282,7 +401,7 @@ for (const boundary of ["stage-write", "stage-sync"] as const) {
 
 test("S3 two editing processes preparing the same revision permit one commit, refuse the other, and retain the winner", async (t) => {
   const box = await transactionFixture(t);
-  const module = new URL("../src/resource-mutations.js", import.meta.url).href;
+  const module = fixtureModuleUrl(import.meta.url, "../src/resource-mutations");
   const code = (value: string) => `import {prepareSavedEdit,prepareSavedChange,commitSavedChange} from ${JSON.stringify(module)};
 const edit=await prepareSavedEdit(${JSON.stringify(box.libraryDir)},${JSON.stringify(box.item.id)},'source.md');
 const change=await prepareSavedChange(edit,Buffer.from(${JSON.stringify(value)})); console.log('READY');
@@ -302,14 +421,17 @@ await commitSavedChange(change,{confirmed:true,reviewId:change.reviewId,approved
   } finally { a.kill(); b.kill(); }
 });
 
-test("S4 new private descriptors cannot be registered by catalog-only save", async (t) => {
-  const box = await transactionFixture(t);
+test("S4 catalog-only save cannot register a private tree child", async (t) => {
+  const box = await treeTransactionFixture(t);
   const file = path.join(path.dirname(box.file), ".envrc");
   await writeFile(file, "manually installed private file");
   const catalog = await loadCatalog(box.libraryDir);
+  assertModernCatalog(catalog);
+  const files = await readSnapshotFiles(box.libraryDir, catalog.items[0]!);
+  assert.ok(!files.some((entry) => entry.path === ".envrc"));
   catalog.items[0]!.files.push({ path: ".envrc", mode: 0o600, sha256: createHash("sha256").update("manually installed private file").digest("hex") });
   const before = await readFile(path.join(box.libraryDir, "catalog.json"));
-  await assert.rejects(saveCatalog(box.libraryDir, catalog), /private|excluded/i);
+  await assert.rejects(saveCatalog(box.libraryDir, catalog), /private|excluded|catalog-only|content/i);
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
   assert.equal(await readFile(file, "utf8"), "manually installed private file");
 });
@@ -323,7 +445,7 @@ test("S2 interruption after journal removal still recovers the finalized consist
   assert.equal(stopped.signal, "SIGKILL");
   const catalog = await loadCatalog(box.libraryDir);
   assert.equal((await readSnapshotFiles(box.libraryDir, catalog.items[0]!))[0]!.bytes.toString(), "new snapshot\n");
-  assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "items"]);
+  assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "sources"]);
 });
 
 test("S1/S5 externally altered staged bytes cannot become an unreviewed saved secret", async (t) => {
@@ -333,7 +455,7 @@ test("S1/S5 externally altered staged bytes cannot become an unreviewed saved se
   await assert.rejects(kernelCommit(box, async (point, root) => {
     if (point === "stage-sync" && !injected) {
       injected = true;
-      await writeFile(path.join(root, ".copi-transaction", "next-0", "files", "source.md"), "apiKey=sk_live_unreviewedstage123456\n");
+      await writeFile(path.join(root, ".copi-transaction", "next-0"), "apiKey=sk_live_unreviewedstage123456\n");
     }
   }), /staged|fixed|bytes|changed|inspection/i);
   assert.ok(injected);
@@ -354,7 +476,7 @@ test("S1 altered staged catalog is detected before any live snapshot rename", as
 
 for (const boundary of ["stage-sync", "before-catalog"] as const) {
   test(`S2 multi-file replacement fault at ${boundary} retains the complete old snapshot`, async (t) => {
-    const box = await transactionFixture(t);
+    const box = await treeTransactionFixture(t);
     const additional = Buffer.from("second new file\n");
     box.files.push({ path: "nested/new.md", mode: 0o600, bytes: additional });
     box.next.items[0]!.files.push({ path: "nested/new.md", mode: 0o600, sha256: createHash("sha256").update(additional).digest("hex") });
@@ -377,7 +499,7 @@ for (const ownerKind of ["active", "unknown host"] as const) {
     await mkdir(lock, { mode: 0o700 });
     const { hostname } = await import("node:os");
     await writeFile(path.join(lock, "owner.json"), JSON.stringify({version:1,pid:process.pid,host:ownerKind === "active" ? hostname() : "unknown-machine",token:randomUUID()}), {mode:0o600});
-    await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(box.libraryDir, false, async () => {}), /active process|unknown host|unsafe/i);
+    await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(box.libraryDir, false, async () => {}, { requiresNativePlacement: false }), /active process|unknown host|unsafe/i);
     assert.ok(await lstat(lock));
     assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
   });
@@ -391,7 +513,7 @@ test("S3 a valid dead transaction copied into a different library is not replaye
   const lock = path.join(b.libraryDir, ".copi-transaction");
   await cp(path.join(a.libraryDir, ".copi-transaction"), lock, { recursive: true });
   const before = await readFile(path.join(b.libraryDir, "catalog.json"));
-  await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(b.libraryDir, false, async () => {}), /journal|recovery/i);
+  await assert.rejects(new StorageTransactions({waitMilliseconds:60}).run(b.libraryDir, false, async () => {}, { requiresNativePlacement: false }), /journal|recovery/i);
   assert.deepEqual(await readFile(path.join(b.libraryDir, "catalog.json")), before);
   assert.equal(await readFile(b.file, "utf8"), "old snapshot\n");
   assert.ok(await lstat(lock));
@@ -411,7 +533,7 @@ test("S3 raw kernel cannot bypass name uniqueness and make the saved library unu
 
 test("S3 late writes to the moved old snapshot inode are preserved, never deleted by successful cleanup", async (t) => {
   const box = await transactionFixture(t);
-  const retained = path.join(box.libraryDir, ".copi-transaction", "old-0", "files", "source.md");
+  const retained = path.join(box.libraryDir, ".copi-transaction", "old-0");
   await assert.rejects(kernelCommit(box, async (point) => {
     if (point === "old-renamed") await writeFile(retained, "external old-inode bytes\n");
   }), /changed|altered|recover|external/i);
@@ -447,13 +569,15 @@ test("S3 actual EEXIST during exclusive catalog installation preserves the manua
   await assert.rejects(kernelCommit(box, async (point) => {
     if (point === "catalog-held") { reached = true; await writeFile(path.join(box.libraryDir, "catalog.json"), external); }
   }), (error: unknown) => {
-    assert.ok(error instanceof Error && error.cause instanceof AggregateError);
-    assert.equal((error.cause.errors[0] as NodeJS.ErrnoException).code, "EEXIST", "must reach the real fs.link exclusive-create failure");
+    assert.ok(containsErrnoCode(error, "EEXIST"), `expected fs.link EEXIST in recovery error chain, got ${String(error)}`);
     return true;
   });
   assert.ok(reached);
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), external);
-  console.log("S3 catalog hold: actual fs.link EEXIST, external catalog bytes preserved, journal retained");
+  const lock = path.join(box.libraryDir, ".copi-transaction");
+  assert.ok(await lstat(lock));
+  assert.ok(await lstat(path.join(lock, "journal.json")));
+  console.log("S3 catalog hold: fs.link EEXIST retained in error chain; external catalog and journal preserved");
 });
 
 test("S2 SIGKILL during catalog hold restores checked old catalog and all snapshot bytes", async (t) => {
@@ -464,13 +588,13 @@ test("S2 SIGKILL during catalog hold restores checked old catalog and all snapsh
   assert.equal((await exit).signal, "SIGKILL");
   const catalog = await loadCatalog(box.libraryDir);
   assert.equal((await readSnapshotFiles(box.libraryDir, catalog.items[0]!))[0]!.bytes.toString(), "old snapshot\n");
-  assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "items"]);
+  assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "sources"]);
   console.log("S2 SIGKILL catalog-held: absent live catalog recovered to exact checked old state");
 });
 
 test("S3 late writes to the displaced new snapshot during rollback are preserved, not cleaned up", async (t) => {
   const box = await transactionFixture(t);
-  const retained = path.join(box.libraryDir, ".copi-transaction", "displaced-0", "files", "source.md");
+  const retained = path.join(box.libraryDir, ".copi-transaction", "displaced-0");
   await assert.rejects(kernelCommit(box, async (point) => {
     if (point === "before-catalog") throw new Error("Injected before catalog");
     if (point === "rollback-restored") await writeFile(retained, "external displaced-inode bytes\n");
@@ -488,7 +612,7 @@ test("S2 SIGKILL while rollback holds the catalog resumes the checked old state"
   assert.equal((await exit).signal, "SIGKILL");
   const catalog = await loadCatalog(box.libraryDir);
   assert.equal((await readSnapshotFiles(box.libraryDir, catalog.items[0]!))[0]!.bytes.toString(), "old snapshot\n");
-  assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "items"]);
+  assert.deepEqual((await readdir(box.libraryDir)).sort(), ["catalog.json", "sources"]);
 });
 
 test("S2 a forged session with the real nonce still has no issued lease", async (t) => {
@@ -501,7 +625,7 @@ test("S2 a forged session with the real nonce still has no issued lease", async 
     const { StorageSession } = await import("../src/storage-transaction.ts");
     const forged = new StorageSession(session.root, lock, owner.token);
     await assert.rejects(forged.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }]), /invalid|session|lease/i);
-  });
+  }, { requiresNativePlacement: false });
   assert.deepEqual(await readFile(path.join(box.libraryDir, "catalog.json")), before);
   assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
 });
@@ -549,7 +673,7 @@ test("S2 an externally recreated lock with identical owner fields is not the iss
 
 test("S2 callback expiry also revokes capture and recovery entry points", async (t) => {
   const box = await transactionFixture(t);
-  const session = await new StorageTransactions().run(box.libraryDir, false, async (issued) => { assert.ok(issued); return issued; });
+  const session = await new StorageTransactions().run(box.libraryDir, false, async (issued) => { assert.ok(issued); return issued; }, { requiresNativePlacement: false });
   await assert.rejects(session.capture(), /expired|session|lease/i);
   await assert.rejects(session.recover(true), /expired|session|lease/i);
   await assert.rejects(lstat(path.join(box.libraryDir, ".copi-transaction")), { code: "ENOENT" });
@@ -572,7 +696,7 @@ test("S2 F5 callback closes while commit waits after old rename: no half-update 
     pending = session.commit(await session.capture(), catalogBytes(box.next), [{ itemId: box.item.id, files: box.files }])
       .then(() => ({ success: true }), (error: Error) => ({ success: false, error: error.message }));
     await reached;
-  });
+  }, { requiresNativePlacement: false });
   // Same ordering as the independent F5: only resume after run has returned.
   resume();
   assert.ok(pending);
@@ -597,6 +721,6 @@ test("S5 raw storage approval requires boolean true as well as the authenticated
   box.next.items[0]!.files[0]!.sha256 = createHash("sha256").update(box.files[0]!.bytes).digest("hex");
   const bytes = catalogBytes(box.next); const replacements = [{itemId:box.item.id,files:box.files}];
   const review = prepareStorageReview(bytes, replacements);
-  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, {review,approval:{confirmed:"false" as unknown as boolean,reviewId:review.reviewId,approvedSensitivePaths:readStorageReview(review).sensitivePaths}})), /approval|confirm/i);
+  await assert.rejects(new StorageTransactions().run(box.libraryDir, false, async (session) => session!.commit(await session!.capture(), bytes, replacements, {review,approval:{confirmed:"false" as unknown as boolean,reviewId:review.reviewId,approvedSensitivePaths:readStorageReview(review).sensitivePaths}}), { requiresNativePlacement: false }), /approval|confirm/i);
   assert.equal(await readFile(box.file, "utf8"), "old snapshot\n");
 });

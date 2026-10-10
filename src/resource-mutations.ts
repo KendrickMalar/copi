@@ -1,11 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
-import { lstat, readdir } from "node:fs/promises";
 import { createTwoFilesPatch } from "diff";
 import { catalogBytes, readPreparedResource, withSavedLibrary, type PreparedResource, type SavedLibraryState } from "./catalog.ts";
 import { inspectFixedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNoNameConflicts } from "./names.ts";
-import { prepareStorageReview, privateStoragePath as privatePath, safeStoragePath, type StorageFile, type StorageRevision } from "./storage-transaction.ts";
+import { privateStoragePath as privatePath, readStorageBeforeReviewFiles, safeStoragePath, type StorageFile, type StorageReview, type StorageRevision, type StorageSession } from "./storage-transaction.ts";
 import type { Catalog, InspectionResult, InspectionWarning, ResourceCandidate, ResourceDestination, SavedItem, SnapshotFileContents } from "./types.ts";
 
 declare const editBrand: unique symbol;
@@ -17,7 +16,7 @@ export interface SavedEditView { readonly item: SavedItem; readonly file: Snapsh
 export interface SavedFileDiff { readonly path: string; readonly bytesChanged: boolean; readonly diff: string; readonly summary: string }
 export interface SavedChangeView { readonly reviewId: string; readonly item: SavedItem; readonly diffs: readonly SavedFileDiff[]; readonly sensitivePaths: readonly string[]; readonly excludedPaths: readonly string[]; readonly warnings: readonly InspectionWarning[]; readonly bytesChanged: boolean }
 interface EditState { libraryDir: string; revision: StorageRevision; catalog: Catalog; item: SavedItem; files: SnapshotFileContents[]; filePath: string }
-interface ChangeState extends Omit<EditState, "filePath"> { nextFiles: StorageFile[]; nextItem: SavedItem; excludedPaths: string[]; inspection: InspectionResult; diffs: SavedFileDiff[]; changed: boolean; used: boolean }
+interface ChangeState extends Omit<EditState, "filePath"> { storageReview: StorageReview; nextFiles: StorageFile[]; nextItem: SavedItem; excludedPaths: string[]; inspection: InspectionResult; diffs: SavedFileDiff[]; changed: boolean; used: boolean }
 const edits = new WeakMap<PreparedSavedEdit, EditState>();
 const changes = new WeakMap<PreparedSavedChange, ChangeState>();
 const sha256 = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
@@ -33,23 +32,12 @@ function findItem(state: SavedLibraryState, itemId: string): SavedItem {
   if (!item) throw new Error("Unknown saved item.");
   return item;
 }
-async function assertKnownLayout(root: string, item: SavedItem): Promise<void> {
-  const itemRoot = path.join(root, "items", item.id);
-  if ((await readdir(itemRoot)).some((name) => name !== "files")) throw new Error("Unexpected unregistered content in saved item layout; no files were removed.");
-  const known = new Set(item.files.map((file) => file.path));
-  const visit = async (directory: string, relative: string): Promise<void> => {
-    for (const name of await readdir(directory)) {
-      const child = path.join(directory, name);
-      const filePath = relative ? `${relative}/${name}` : name;
-      const stat = await lstat(child);
-      if (stat.isSymbolicLink()) throw new Error("Unsafe symbolic link in snapshot layout.");
-      if (stat.isDirectory()) {
-        if (![...known].some((entry) => entry.startsWith(`${filePath}/`))) throw new Error("Unexpected unregistered directory in saved snapshot layout.");
-        await visit(child, filePath);
-      } else if (!stat.isFile() || !known.has(filePath)) throw new Error("Unexpected unregistered file in saved snapshot layout; no files were removed.");
-    }
-  };
-  await visit(path.join(itemRoot, "files"), "");
+function assertKnownLayout(item: SavedItem, files: readonly SnapshotFileContents[]): void {
+  const current = new Map(files.map((file) => [file.path, file]));
+  if (current.size !== files.length) throw new Error("Registered sources content has duplicate paths.");
+  if (item.content.kind === "file" && (files.length !== 1 || files[0]?.path !== path.posix.basename(item.content.path))) {
+    throw new Error("Registered sources file must resolve to its single catalog path.");
+  }
 }
 
 function editState(edit: PreparedSavedEdit): EditState {
@@ -79,15 +67,36 @@ function fileDiffs(before: readonly StorageFile[], after: readonly StorageFile[]
     return { path: filePath, bytesChanged, diff, summary: `${bytesChanged ? "Bytes changed" : "Bytes unchanged"}; ${old?.bytes.length ?? 0} → ${current?.bytes.length ?? 0} bytes; mode ${old?.mode.toString(8) ?? "absent"} → ${current?.mode.toString(8) ?? "absent"}.` };
   });
 }
-function makeChange(state: Omit<EditState, "filePath">, nextFiles: readonly StorageFile[], nextItem: SavedItem, excludedPaths: readonly string[] = []): PreparedSavedChange {
+function sameIncludedFiles(before: readonly StorageFile[], current: readonly SnapshotFileContents[]): boolean {
+  if (before.length !== current.length) return false;
+  const byPath = new Map(current.map((file) => [file.path, file]));
+  return byPath.size === current.length && before.every((file) => {
+    const listed = byPath.get(file.path);
+    return listed !== undefined && file.bytes.equals(listed.bytes);
+  });
+}
+async function makeChange(state: Omit<EditState, "filePath">, session: StorageSession, nextFiles: readonly StorageFile[], nextItem: SavedItem, excludedPaths: readonly string[] = []): Promise<PreparedSavedChange> {
   const files = nextFiles.map((file) => ({ path: file.path, mode: file.mode, bytes: Buffer.from(file.bytes) }));
   for (const file of files) if (!safeStoragePath(file.path) || privatePath(file.path)) throw new Error("Unsafe or excluded snapshot path in saved change.");
   if (files.length === 0 || new Set(files.map((file) => file.path)).size !== files.length) throw new Error("Saved replacement must contain unique registered files.");
-  const diffs = fileDiffs(state.files, files);
   const item = structuredClone(nextItem);
   item.files = files.map((file) => ({ path: file.path, mode: file.mode, sha256: sha256(file.bytes) }));
+  const catalog = structuredClone(state.catalog);
+  const itemIndex = catalog.items.findIndex((entry) => entry.id === item.id);
+  if (itemIndex < 0) throw new Error("Saved item changed after preparation.");
+  catalog.items[itemIndex] = structuredClone(item);
+  const replacements = [{ itemId: item.id, files }];
+  const storageReview = await session.prepareSourcesReview(state.revision, catalogBytes(catalog), replacements);
+  const capturedBefore = readStorageBeforeReviewFiles(storageReview, item.id);
+  if (!sameIncludedFiles(capturedBefore, state.files)) throw new Error("Before-reviewed source list does not match the current included files for this revision.");
+  const currentByPath = new Map(state.files.map((file) => [file.path, file]));
+  const beforeFiles = capturedBefore.map((file) => ({
+    ...file,
+    mode: currentByPath.get(file.path)!.mode,
+  }));
+  const diffs = fileDiffs(beforeFiles, files);
   const change = Object.freeze({ reviewId: randomUUID() }) as PreparedSavedChange;
-  changes.set(change, { ...state, nextFiles: files, nextItem: item, excludedPaths: [...excludedPaths], inspection: inspect(item, files, excludedPaths), diffs, changed: diffs.some((diff) => diff.bytesChanged) || JSON.stringify(item) !== JSON.stringify(state.item), used: false });
+  changes.set(change, { ...state, storageReview, nextFiles: files, nextItem: item, excludedPaths: [...excludedPaths], inspection: inspect(item, files, excludedPaths), diffs, changed: diffs.some((diff) => diff.bytesChanged) || JSON.stringify(item) !== JSON.stringify(state.item), used: false });
   return change;
 }
 export async function prepareSavedEdit(libraryDir: string, itemId: string, filePath: string): Promise<PreparedSavedEdit> {
@@ -95,8 +104,9 @@ export async function prepareSavedEdit(libraryDir: string, itemId: string, fileP
   return withSavedLibrary(libraryDir, async (state) => {
     assertNoNameConflicts(state.catalog);
     const item = findItem(state, itemId);
-    await assertKnownLayout(state.session.root, item);
     const files = state.files.get(item.id)!;
+    assertKnownLayout(item, files);
+    if (!item.files.some((entry) => entry.path === filePath)) throw new Error("Only an existing registered snapshot file can be edited.");
     const file = files.find((entry) => entry.path === filePath);
     if (!file) throw new Error("Only an existing registered snapshot file can be edited.");
     editable(file.bytes);
@@ -106,10 +116,27 @@ export async function prepareSavedEdit(libraryDir: string, itemId: string, fileP
   });
 }
 export async function prepareSavedChange(edit: PreparedSavedEdit, bytes: Buffer): Promise<PreparedSavedChange> {
-  const state = editState(edit);
+  const prepared = editState(edit);
   const fixed = Buffer.from(bytes);
   editable(fixed);
-  return makeChange(state, state.files.map((file) => ({ ...file, bytes: file.path === state.filePath ? fixed : file.bytes })), state.item);
+  return withSavedLibrary(prepared.libraryDir, async (state) => {
+    await state.session.assertRevision(prepared.revision);
+    assertNoNameConflicts(state.catalog);
+    const item = findItem(state, prepared.item.id);
+    const files = state.files.get(item.id)!;
+    assertKnownLayout(item, files);
+    if (!item.files.some((entry) => entry.path === prepared.filePath)) throw new Error("Only an existing registered snapshot file can be edited.");
+    const sourceFile = files.find((file) => file.path === prepared.filePath);
+    if (!sourceFile) throw new Error("Registered source file disappeared before edit preparation.");
+    const current: Omit<EditState, "filePath"> = {
+      libraryDir: state.session.root,
+      revision: state.revision,
+      catalog: structuredClone(state.catalog),
+      item: structuredClone(item),
+      files,
+    };
+    return makeChange(current, state.session, files.map((file) => ({ ...file, bytes: file.path === prepared.filePath ? fixed : file.bytes })), item);
+  });
 }
 export function readSavedEdit(edit: PreparedSavedEdit): SavedEditView {
   const state = editState(edit);
@@ -138,7 +165,7 @@ export async function commitSavedChange(change: PreparedSavedChange, approval: C
     catalog.items[catalog.items.indexOf(item)] = structuredClone(state.nextItem);
     const bytes = catalogBytes(catalog);
     const replacements = [{ itemId: item.id, files: state.nextFiles }];
-    const review = prepareStorageReview(bytes, replacements);
+    const review = state.storageReview;
     await session.commit(state.revision, bytes, replacements, { review, approval: { reviewId: review.reviewId, confirmed: true, approvedSensitivePaths: [...approved].map((filePath) => `${item.id}/${filePath}`) } });
     state.used = true;
     return structuredClone(state.nextItem);
@@ -163,10 +190,11 @@ export async function prepareSavedReplacement(libraryDir: string, itemId: string
   return withSavedLibrary(libraryDir, async (state) => {
     assertNoNameConflicts(state.catalog);
     const item = findItem(state, itemId);
-    await assertKnownLayout(state.session.root, item);
+    const currentFiles = state.files.get(item.id)!;
+    assertKnownLayout(item, currentFiles);
     if (source.candidate.kind !== item.kind) throw new Error("Replacement source must have the same resource kind.");
     if (source.candidate.destination.kind === "global-only" && item.destination.kind !== "global-only") throw new Error("A reference-only/global-only replacement source cannot become project-applicable.");
     const next = { ...structuredClone(item), source: source.candidate.source, scope: source.candidate.scope, sourcePath: source.candidate.sourcePath };
-    return makeChange({ libraryDir: state.session.root, revision: state.revision, catalog: structuredClone(state.catalog), item: structuredClone(item), files: state.files.get(item.id)! }, source.files, next, source.excludedPaths);
+    return makeChange({ libraryDir: state.session.root, revision: state.revision, catalog: structuredClone(state.catalog), item: structuredClone(item), files: currentFiles }, state.session, source.files, next, source.excludedPaths);
   });
 }

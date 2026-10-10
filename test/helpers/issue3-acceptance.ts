@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { loadCatalog, readSnapshotFiles } from "../../src/catalog.ts";
+import type { SavedItem } from "../../src/types.ts";
 // Reuse only the earlier independent transport/FS observer, never coder fixtures or oracles.
 import { cli, down, environment, hash, plain, pty, tree, type Step } from "./issue6-acceptance.ts";
 export { cli, down, environment, hash, plain, pty, tree };
@@ -13,14 +14,43 @@ export const answer = (message: string, text = "y\r"): Step => ({ wait: message,
 export const finish = select("Manage saved resources", 4);
 export const route = (index: number): Step[] => [select("Manage saved resources"), select("Select saved resource"), select("Resource action", index)];
 
-// This suite has exactly one assigned canonical runtime. Retain every new fixture.
+// Retain every new fixture; accept only complete, explicitly assigned runtimes.
 export async function box() {
-  assert.equal(process.env.HOME, "/tmp/copi-issue1-tester3.3V4nH5/home");
-  assert.equal(process.env.PI_CODING_AGENT_DIR, `${process.env.HOME}/.pi/agent`);
-  assert.equal(process.env.NPM_CONFIG_CACHE, "/tmp/copi-issue1-tester3.3V4nH5/npm-cache");
-  assert.equal(process.env.NPM_CONFIG_USERCONFIG, "/dev/null");
+  const envHome = process.env.HOME;
+  const envAgent = process.env.PI_CODING_AGENT_DIR;
+  const envCache = process.env.NPM_CONFIG_CACHE;
   const assigned = await realpath(process.env.TMPDIR!);
-  assert.equal(assigned, "/private/tmp/copi-issue1-tester3.3V4nH5/tmp");
+  const legacy = {
+    home: "/tmp/copi-issue1-tester3.3V4nH5/home",
+    cache: "/tmp/copi-issue1-tester3.3V4nH5/npm-cache",
+    tmp: "/private/tmp/copi-issue1-tester3.3V4nH5/tmp",
+  };
+  const sandboxes = [
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/tmp",
+    },
+  ];
+  const matches = (runtime: { home: string; cache: string; tmp: string }) =>
+    envHome === runtime.home && envAgent === `${runtime.home}/.pi/agent` && envCache === runtime.cache && assigned === runtime.tmp;
+  assert.ok(matches(legacy) || sandboxes.some(matches), "I3 requires one exactly assigned isolated environment");
+  assert.equal(process.env.NPM_CONFIG_USERCONFIG, "/dev/null");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-i3-independent-")));
   assert.equal(path.dirname(root), assigned);
   const home = path.join(root, "home"), agent = path.join(home, ".pi/agent"), cwd = path.join(root, "project");
@@ -34,6 +64,9 @@ export async function box() {
   return b;
 }
 export type Fixture = Awaited<ReturnType<typeof box>>;
+export function savedContentRoot(b: Fixture, item: SavedItem): string {
+  return path.join(b.library, ...item.content.path.split("/"));
+}
 export const originals = {
   "SKILL.md": "# Embedded MapKit\napiKey: sk_live_i3OriginalMap123456\n最初の本文\n",
   "a.md": "password: i3OriginalOther123456\nsecond original\n",
@@ -84,8 +117,10 @@ export async function register(b: Fixture, files: Record<string, string | Buffer
   assert.ok(!r.output.includes("sk_live_i3OriginalMap123456") && !r.output.includes("i3OriginalOther123456"));
   assert.deepEqual(await tree(b.source), before);
   const c = await loadCatalog(b.library);
-  assert.equal(c.version, 1); assert.equal(c.items.length, 1); assert.equal(c.groups.length, 1);
+  if (c.version !== 2) throw new Error("New registrations must use catalog v2 sources content.");
+  assert.equal(c.items.length, 1); assert.equal(c.groups.length, 1);
   const item = c.items[0]!;
+  assert.deepEqual(item.content, { kind: "tree", path: `sources/${item.id}` });
   assert.equal(item.name, "MapKit"); assert.equal(item.kind, "skill");
   assert.deepEqual(item.destination, { kind: "project", path: ".pi/skills/MapKit" });
   assert.deepEqual(c.groups[0]!.itemIds, [item.id]);
@@ -93,7 +128,9 @@ export async function register(b: Fixture, files: Record<string, string | Buffer
   return item;
 }
 export async function snapshot(b: Fixture, expected: Record<string, string | Buffer>, modes: Record<string, number>) {
-  const c = await loadCatalog(b.library), item = c.items[0]!;
+  const c = await loadCatalog(b.library);
+  if (c.version !== 2) throw new Error("Saved snapshots must use catalog v2 sources content.");
+  const item = c.items[0]!;
   const actual = await readSnapshotFiles(b.library, item);
   assert.deepEqual(actual.map(f => f.path).sort(), Object.keys(expected).sort());
   assert.deepEqual(item.files.map(f => f.path).sort(), Object.keys(expected).sort());
@@ -102,7 +139,7 @@ export async function snapshot(b: Fixture, expected: Record<string, string | Buf
     assert.deepEqual(f.bytes, bytes); assert.equal(f.sha256, hash(bytes)); assert.equal(f.mode, modes[f.path]);
     const desc = item.files.find(d => d.path === f.path)!;
     assert.equal(desc.sha256, hash(bytes)); assert.equal(desc.mode, modes[f.path]);
-    const inode = (await tree(path.join(b.library, "items", item.id, "files")))[f.path]!;
+    const inode = (await tree(savedContentRoot(b, item)))[f.path]!;
     assert.equal(inode.mode, 0o600); assert.equal(inode.hex, bytes.toString("hex"));
   }
   return item;

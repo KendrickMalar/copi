@@ -10,8 +10,38 @@ export type { Step };
 // No teardown: retain all new integration fixtures and raw PTY/FS evidence.
 export async function integrationBox(): Promise<Box & { sourcePath: string; target: string }> {
   const assigned = await realpath(process.env.TMPDIR!);
-  assert.ok(assigned === "/private/tmp/copi-issue1-coder3.v57BLf/tmp" ||
-    assigned === "/private/tmp/copi-issue1-tester3.3V4nH5/tmp", "integration needs an explicitly assigned canonical TMPDIR");
+  const runtimes = [
+    {
+      home: "/tmp/copi-issue1-tester3.3V4nH5/home",
+      cache: "/tmp/copi-issue1-tester3.3V4nH5/npm-cache",
+      tmp: "/private/tmp/copi-issue1-tester3.3V4nH5/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/coder/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/tester/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/coder/tmp",
+    },
+    {
+      home: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/home",
+      cache: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/cache",
+      tmp: "/Users/papillon/Code/copi/.worktrees/sources-only/.pi/subagents/sandboxes/production/tester/tmp",
+    },
+  ];
+  const matches = (runtime: { home: string; cache: string; tmp: string }) =>
+    process.env.HOME === runtime.home && process.env.PI_CODING_AGENT_DIR === `${runtime.home}/.pi/agent` &&
+    process.env.NPM_CONFIG_CACHE === runtime.cache && assigned === runtime.tmp;
+  assert.ok(runtimes.some(matches), "integration requires one exactly assigned isolated environment tuple");
+  assert.equal(process.env.NPM_CONFIG_USERCONFIG, "/dev/null");
   const root = await realpath(await mkdtemp(path.join(assigned, "copi-manage-integration-")));
   assert.equal(path.dirname(root), assigned);
   const home = path.join(root, "home"), agent = path.join(home, ".pi/agent"), cwd = path.join(root, "project");
@@ -89,13 +119,16 @@ export async function registered(b: IntegrationBox) {
   assert.ok(!run.output.includes("setupSecond12345678"));
   assert.deepEqual(await tree(b.source), before);
   const catalog = await loadCatalog(b.library);
-  assert.equal(catalog.version, 1); assert.equal(catalog.items.length, 1); assert.equal(catalog.groups.length, 1);
+  if (catalog.version !== 2) throw new Error("New registrations must use catalog v2 sources content.");
+  assert.equal(catalog.items.length, 1); assert.equal(catalog.groups.length, 1);
   const item = catalog.items[0]!;
+  assert.deepEqual(item.content, { kind: "tree", path: `sources/${item.id}` });
   assert.equal(item.name, "original"); assert.equal(item.kind, "skill");
   assert.deepEqual(item.destination, { kind: "project", path: ".pi/skills/original" });
   assert.deepEqual(catalog.groups[0]!.itemIds, [item.id]);
   assert.deepEqual(item.files.map(f => f.path).sort(), ["SKILL.md", "second.md"].sort());
-  for (const [file, text] of Object.entries(initialFiles)) assert.deepEqual(await readFile(path.join(b.library, "items", item.id, "files", file)), Buffer.from(text));
+  const contentRoot = path.join(b.library, ...item.content.path.split("/"));
+  for (const [file, text] of Object.entries(initialFiles)) assert.deepEqual(await readFile(path.join(contentRoot, file)), Buffer.from(text));
   await evidence(b, "registered");
   return item;
 }

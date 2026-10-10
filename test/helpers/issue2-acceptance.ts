@@ -5,7 +5,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, writeFile } from "n
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { importResource, loadCatalog, prepareResource, saveCatalog, type PreparedInspection } from "../../src/catalog.ts";
+import { assertModernCatalog, importResource, loadCatalog, prepareResource, saveCatalog, type PreparedInspection } from "../../src/catalog.ts";
 import { inspectPreparedResource } from "../../src/inspect.ts";
 import type { ResourceCandidate, ResourceKind } from "../../src/types.ts";
 
@@ -26,13 +26,24 @@ export type AcceptanceBox = Awaited<ReturnType<typeof acceptanceBox>>;
 export const secret = "sk_live_independentfixture1234567890";
 export async function candidate(box: AcceptanceBox, name: string, kind: ResourceKind = "skill"): Promise<ResourceCandidate> {
   const token = randomUUID();
-  const sourcePath = path.join(box.source, token);
-  await mkdir(path.join(sourcePath, "nested"), { recursive: true });
-  await writeFile(path.join(sourcePath, "SKILL.md"), `# Original Straße / ①\napiKey: ${secret}\n`);
-  await writeFile(path.join(sourcePath, "nested", "notes.txt"), "e\u0301\nUNCHANGED content\n");
-  await writeFile(path.join(sourcePath, "asset.bin"), Buffer.from([0, 255, 1, 128]));
+  const resourceRoot = path.join(box.source, token);
+  let sourcePath: string;
+  let destinationPath: string;
+  if (kind === "skill") {
+    sourcePath = resourceRoot;
+    await mkdir(path.join(sourcePath, "nested"), { recursive: true });
+    await writeFile(path.join(sourcePath, "SKILL.md"), `# Original Straße / ①\napiKey: ${secret}\n`);
+    await writeFile(path.join(sourcePath, "nested", "notes.txt"), "e\u0301\nUNCHANGED content\n");
+    await writeFile(path.join(sourcePath, "asset.bin"), Buffer.from([0, 255, 1, 128]));
+    destinationPath = `.pi/skills/${token}`;
+  } else {
+    await mkdir(resourceRoot, { recursive: true });
+    sourcePath = path.join(resourceRoot, "SKILL.md");
+    await writeFile(sourcePath, `# Original Straße / ①\napiKey: ${secret}\n`);
+    destinationPath = kind === "subagent" ? `.pi/agents/${token}.md` : `${token}.md`;
+  }
   return { id: token, name, kind, source: "independent-acceptance", scope: "project", sourceRoot: box.source,
-    sourcePath, destination: { kind: "project", path: `.pi/skills/${token}` } };
+    sourcePath, destination: { kind: "project", path: destinationPath } };
 }
 export function fixtureImportOptions(inspection: PreparedInspection, groupIds: string[] = []) {
   // Only this fixture's known, fictional secret is approved, at its concrete file path.
@@ -74,6 +85,7 @@ export async function legacy(box: AcceptanceBox) {
   const items = [];
   for (const name of ["① Kit", "temporary-one", "ΟΣ", "temporary-two", "safe"]) items.push(await add(box, name));
   const catalog = await loadCatalog(box.library);
+  assertModernCatalog(catalog);
   catalog.groups = [
     { id: "day-a", name: "Daily", itemIds: items.map((item) => item.id) },
     { id: "day-b", name: "temporary-day", itemIds: [items[0]!.id, items[4]!.id] },
@@ -90,10 +102,11 @@ export async function legacy(box: AcceptanceBox) {
   await writeFile(path.join(box.library, "catalog.json"), `  ${JSON.stringify(catalog)}  \n\n`);
   return catalog;
 }
-export const cli = fileURLToPath(new URL("../../src/cli.js", import.meta.url));
+const sourceTest = import.meta.url.endsWith(".ts");
+export const cli = fileURLToPath(new URL(sourceTest ? "../../src/cli.ts" : "../../src/cli.js", import.meta.url));
 export function wizardArgv(box: AcceptanceBox) {
-  const url = new URL("../../src/wizard.js", import.meta.url).href;
-  return [process.execPath, "--input-type=module", "-e", `import {resolveNameConflicts} from ${JSON.stringify(url)}; await resolveNameConflicts(${JSON.stringify(box.library)});`];
+  const url = new URL(sourceTest ? "../../src/wizard.ts" : "../../src/wizard.js", import.meta.url).href;
+  return [process.execPath, ...(sourceTest ? ["--experimental-transform-types"] : []), "--input-type=module", "-e", `import {resolveNameConflicts} from ${JSON.stringify(url)}; await resolveNameConflicts(${JSON.stringify(box.library)});`];
 }
 function childEnvironment(box: AcceptanceBox) {
   return { ...process.env, HOME: box.home, PI_CODING_AGENT_DIR: box.agent, TMPDIR: box.tmp,
@@ -104,8 +117,11 @@ export async function cliPipe(box: AcceptanceBox, args: string[]) {
   return runChild(box, process.execPath, [cli, ...args]);
 }
 async function runChild(box: AcceptanceBox, command: string, args: string[]) {
+  const childArgs = command === process.execPath && sourceTest && args[0] !== "--experimental-transform-types"
+    ? ["--experimental-transform-types", ...args]
+    : args;
   const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
-    const child = spawn(command, args, { cwd: box.project, env: childEnvironment(box) });
+    const child = spawn(command, childArgs, { cwd: box.project, env: childEnvironment(box) });
     let output = "";
     child.stdout.on("data", (data: Buffer) => { output += data.toString(); });
     child.stderr.on("data", (data: Buffer) => { output += data.toString(); });
@@ -150,7 +166,10 @@ try:
 finally:
  os.close(master)
 `;
-  return runChild(box, "python3", ["-c", driver, JSON.stringify(argv), JSON.stringify(actions), box.project]);
+  const childArgv = sourceTest && argv[0] === process.execPath && argv[1] !== "--experimental-transform-types"
+    ? [argv[0]!, "--experimental-transform-types", ...argv.slice(1)]
+    : argv;
+  return runChild(box, "python3", ["-c", driver, JSON.stringify(childArgv), JSON.stringify(actions), box.project]);
 }
 export const choose = { waitFor: "Select a conflicting name to rename", send: "\r" };
 export function renameSteps(names: string[]): Action[] {

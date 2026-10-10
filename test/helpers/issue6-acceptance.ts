@@ -4,10 +4,22 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, readdir, readlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
+import { assertModernCatalog, importPreparedResource, loadCatalog as loadStoredCatalog, prepareResource, saveCatalog } from "../../src/catalog.ts";
 import { inspectPreparedResource } from "../../src/inspect.ts";
 
-export const cli = new URL("../../src/cli.js", import.meta.url).pathname;
+const sourceTypeScript = import.meta.url.endsWith(".ts");
+export const sourceNodeFlags = sourceTypeScript ? ["--experimental-transform-types"] : [];
+export const cli = new URL(sourceTypeScript ? "../../src/cli.ts" : "../../src/cli.js", import.meta.url).pathname;
+export const catalogModule = new URL(sourceTypeScript ? "../../src/catalog.ts" : "../../src/catalog.js", import.meta.url).href;
+export const terminalEditorModule = new URL(sourceTypeScript ? "../../src/terminal-editor.ts" : "../../src/terminal-editor.js", import.meta.url).href;
+export async function loadCatalog(library: string) {
+  const catalog = await loadStoredCatalog(library);
+  assertModernCatalog(catalog);
+  return catalog;
+}
+export function storedContentPath(library: string, contentPath: string): string {
+  return path.join(library, ...contentPath.split("/"));
+}
 export const down = "\x1b[B";
 export interface Step {
   wait?: string; text?: string; hex?: string; delayMs?: number; signal?: "SIGINT" | "SIGTERM" | "SIGHUP";
@@ -30,15 +42,18 @@ export async function add(b: Box, files: Record<string, string | Buffer>, name =
   for (const [relative, bytes] of Object.entries(files)) {
     const file = path.join(sourcePath, relative); await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, bytes);
   }
+  if (!Object.hasOwn(files, "SKILL.md")) throw new Error("A skill fixture must include root SKILL.md.");
   const prepared = await prepareResource({ id: "independent-source", name, kind: "skill", source: "acceptance-fixture", scope: "project",
     sourceRoot: b.source, sourcePath, destination: { kind: "project", path: destination } });
   const inspection = await inspectPreparedResource(prepared);
   const item = await importPreparedResource(b.library, prepared, { confirmed: true, groupIds: [], inspection, approvedSensitivePaths: inspection.sensitivePaths });
   assert.ok(item);
-  return { item, sourcePath, saved: (relative: string) => path.join(b.library, "items", item.id, "files", relative) };
+  if (item.content.kind !== "tree" || item.content.path !== `sources/${item.id}`) throw new Error("Skill fixture must use its UUID-bound sources tree.");
+  const contentPath = storedContentPath(b.library, item.content.path);
+  return { item, sourcePath, saved: (relative: string) => path.join(contentPath, ...relative.split("/")) };
 }
 export async function fixture(bytes: string | Buffer = "north\nsouth\n", files: Record<string, string | Buffer> = {}) {
-  const b = await box(); const a = await add(b, { "ROUTE.md": bytes, ...files });
+  const b = await box(); const a = await add(b, { "SKILL.md": bytes, ...files });
   const catalog = await loadCatalog(b.library);
   const group = { id: "51013c26-3c16-4e80-aea4-60f77a402911", name: "出張 bundle", itemIds: [a.item.id] };
   catalog.groups.push(group); await saveCatalog(b.library, catalog);
@@ -68,7 +83,7 @@ export const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest
 export function plain(output: string): string { return output.replace(/\x1b\[[0-9;?]*[A-Za-z~]/g, ""); }
 export function noIds(output: string, ids: string[]) { for (const id of ids) assert.ok(!output.includes(id), `management ID leaked: ${id}`); }
 export function runCli(b: Box, args: string[], entry = cli) {
-  return spawnSync(process.execPath, [entry, ...args], { cwd: b.cwd, env: environment(b), encoding: "utf8", timeout: 15_000 });
+  return spawnSync(process.execPath, [...sourceNodeFlags, entry, ...args], { cwd: b.cwd, env: environment(b), encoding: "utf8", timeout: 15_000 });
 }
 
 // Independent PTY observer: no stty, no flush, no unconditional PENDIN mask.
@@ -143,12 +158,12 @@ export function restored(run: PtyState, pendinException = false) {
 }
 export function editRoute(): Step[] { return [{ wait: "Manage saved resources", text: "\r" }, { wait: "Select saved resource", text: "\r" }, { wait: "Resource action", text: `${down}\r` }, { wait: "Select saved file", text: "\r" }]; }
 export const finish: Step = { wait: "◆  Manage saved resources", text: "\x03" };
-export const manage = (b: Box, steps: Step[]) => pty(b, [process.execPath, cli, "manage"], steps);
+export const manage = (b: Box, steps: Step[]) => pty(b, [process.execPath, ...sourceNodeFlags, cli, "manage"], steps);
 
 export async function editor(initial: string, steps: Step[], extra = "", canonical = false, pendinException = false, size: [number, number] = [14, 72]) {
   const b = await box(), initialFile = path.join(b.root, "initial.bin"), resultFile = path.join(b.root, "result.json");
   await writeFile(initialFile, initial);
-  const module = new URL("../../src/terminal-editor.js", import.meta.url).href;
+  const module = terminalEditorModule;
   const code = `import {readFile,writeFile} from 'node:fs/promises';
 import {editTerminalText} from ${JSON.stringify(module)};
 const counts=()=>['data','end','close','error'].map(e=>process.stdin.listenerCount(e)).concat(['SIGINT','SIGTERM','SIGHUP'].map(e=>process.listenerCount(e)),['resize','error'].map(e=>process.stdout.listenerCount(e)));
@@ -160,7 +175,7 @@ let canonical;
 if(${canonical}) { process.stdout.write('CANONICAL_READY'); canonical=await new Promise(resolve=>{process.stdin.once('data',chunk=>{process.stdin.pause();resolve(chunk.toString())});process.stdin.resume()}); process.stdout.write('CANONICAL_DONE'); }
 await new Promise(resolve=>setTimeout(resolve,150));
 await writeFile(${JSON.stringify(resultFile)},JSON.stringify({result,before,after,rawBefore,rawAfter:process.stdin.isRaw,flowBefore,flowAfter,canonical,timersBefore,timersAfter:process.getActiveResourcesInfo().filter(r=>r==='Timeout').length}));`;
-  const run = await pty(b, [process.execPath, "--input-type=module", "-e", code], steps, "tty", size);
+  const run = await pty(b, [process.execPath, ...sourceNodeFlags, "--input-type=module", "-e", code], steps, "tty", size);
   restored(run, pendinException); assert.equal(run.code, 0, run.output);
   const saved = JSON.parse(await readFile(resultFile, "utf8")) as { result: { kind: string; text?: string }; before: number[]; after: number[]; rawBefore: boolean; rawAfter: boolean; flowBefore: boolean | null; flowAfter: boolean | null; canonical?: string; timersBefore: number; timersAfter: number };
   assert.deepEqual(saved.after, saved.before, "all editor listeners restored"); assert.equal(saved.rawAfter, Boolean(saved.rawBefore));
