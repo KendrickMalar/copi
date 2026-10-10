@@ -4,7 +4,7 @@ import { chmod, cp, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink } from 
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { prepareMigration, readMigration } from "../src/migration.ts";
+import { prepareMigration, readMigration, setMigrationPreviewCheckpointForTests } from "../src/migration.ts";
 import {
   createLegacyLibrary,
   legacyFileBytes,
@@ -160,17 +160,17 @@ test("blocks a preview if an ancestor directory mode changes during the scan", a
   try {
     await writeLegacyCatalog(root);
     await writeLegacySnapshot(root);
-    await Promise.all(Array.from({ length: 240 }, (_, index) =>
-      writeBytes(root, `sources/unregistered-${index}.txt`, Buffer.from(`unregistered ${index}\n`))));
 
-    const preview = prepareMigration(root);
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-    await chmod(parent, 0o750);
-    const view = readMigration(await preview);
+    // Change the ancestor after the preview has captured it and scanned the trees, before it rechecks them.
+    setMigrationPreviewCheckpointForTests(async (point) => {
+      if (point === "after-tree-scan") await chmod(parent, 0o750);
+    });
+    const view = readMigration(await prepareMigration(root));
 
     assert.equal(view.status, "blocked");
     assert.ok(view.conflicts.some((conflict) => conflict.includes("ancestor changed")));
   } finally {
+    setMigrationPreviewCheckpointForTests(undefined);
     await chmod(parent, 0o700);
     await rm(parent, { recursive: true, force: true });
   }
