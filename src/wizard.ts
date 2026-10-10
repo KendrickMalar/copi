@@ -588,9 +588,13 @@ function formatPlan(plan: ApplyPlan, catalog: Catalog): string {
       : "";
     return `${file.status}: ${file.path}${mark}${alternatives}${preview}`;
   });
+  const proposal = plan.referenceProposal;
+  const reference = proposal
+    ? [`reference (optional, approval required during apply): ${proposal.status}: ${proposal.path}${proposal.preview.kind === "text" ? `\n${proposal.preview.diff}` : `\n${proposal.preview.summary}`}`]
+    : [];
   const warnings = plan.warnings.map((warning) => `warning${warning.path ? ` ${warning.path}` : ""}: ${warning.message}`);
   const skipped = plan.skippedItems.map((id) => `save-only resource skipped from apply: ${itemNames.get(id) ?? "Unavailable resource"}`);
-  return [...lines, ...warnings, ...skipped].join("\n\n") || "No project files need changes.";
+  return [...lines, ...reference, ...warnings, ...skipped].join("\n\n") || "No project files need changes.";
 }
 
 export function formatApplyOptionPreview(filePath: string, resourceName: string, option: ApplyFileOption): string {
@@ -692,6 +696,18 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
     }
   }
   decisions.secretApprovals = [...selectedSecrets];
+  if (plan.referenceProposal) {
+    const proposal = plan.referenceProposal;
+    const addReference = await confirm({
+      message: `${proposal.status === "new" ? "Create" : "Append to"} ${proposal.path} with a reference line for ${proposal.instructionPaths.join(", ")}? Pi does not load these files automatically.`,
+      initialValue: false,
+    });
+    if (isCancel(addReference)) {
+      cancel("Apply cancelled; project files were not changed.");
+      return;
+    }
+    decisions.addReference = addReference;
+  }
   const apply = await confirm({ message: `Apply the selected snapshots to ${projectDir}?`, initialValue: false });
   if (isCancel(apply) || !apply) {
     outro("Project files were not changed.");
@@ -702,5 +718,6 @@ export async function runApplyWizard(libraryDir: string, groupValue: string, pro
     outro("Apply aborted; project files were not changed.");
     return;
   }
-  outro(`Applied ${result.written.length} file(s); kept ${result.kept.length}; saved ${result.backups.length} private backup(s).`);
+  const referenceNote = result.referenceAdded ? ` Added a reference line to ${result.referenceAdded}.` : "";
+  outro(`Applied ${result.written.length} file(s); kept ${result.kept.length}; saved ${result.backups.length} private backup(s).${referenceNote}`);
 }

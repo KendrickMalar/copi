@@ -189,3 +189,29 @@ test("apply --dry-run displays masked plans without changing the synthetic proje
   assert.ok(!result.stdout.includes(secret));
   await assert.rejects(readFile(path.join(box.project, ".pi", "skills", "credential-skill", "SKILL.md")), { code: "ENOENT" });
 });
+
+test("apply --dry-run explains an unloaded instruction and the optional reference without writing", async (t) => {
+  const box = await sandbox(t);
+  const sourceRoot = path.join(box.root, "synthetic-source");
+  await mkdir(sourceRoot, { recursive: true });
+  const sourcePath = path.join(sourceRoot, "RULES.md");
+  await writeFile(sourcePath, "# Rules\n");
+  const catalog = newCatalog();
+  catalog.groups.push({ id: "bundle", name: "Bundle", itemIds: [] });
+  await saveCatalog(box.library, catalog);
+  const candidate: ResourceCandidate = {
+    id: "rules", kind: "instruction", source: "synthetic-test", scope: "project", sourceRoot, sourcePath,
+    name: "RULES.md", destination: { kind: "project", path: "RULES.md" },
+  };
+  const prepared = await prepareResource(candidate);
+  const inspection = await inspectPreparedResource(prepared);
+  await importResource(box.library, candidate, { confirmed: true, groupIds: ["bundle"], inspection, approvedSensitivePaths: [] });
+  await writeFile(path.join(box.project, "AGENTS.md"), "# Project\n");
+
+  const result = runCli(box, ["apply", "bundle", box.project, "--dry-run"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /warning RULES\.md: Pi does not load this instruction automatically/);
+  assert.match(result.stdout, /reference \(optional, approval required during apply\): append: AGENTS\.md/);
+  assert.ok(result.stdout.includes("+- 作業を始める前に `RULES.md` を読み、その指示に従うこと。"));
+  assert.equal(await readFile(path.join(box.project, "AGENTS.md"), "utf8"), "# Project\n");
+});
