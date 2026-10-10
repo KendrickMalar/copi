@@ -6,6 +6,7 @@ import { createTwoFilesPatch } from "diff";
 import { withSavedLibrary, type SavedLibraryState } from "./catalog.ts";
 import type { StorageRevision } from "./storage-transaction.ts";
 import { maskSensitiveText } from "./inspect.ts";
+import { appendReferenceLines, chooseReferenceTarget, contextFileNames, isAutoLoadedInstruction, referenceLine, unreferencedPaths } from "./instruction-reference.ts";
 import { assertNoNameConflicts } from "./names.ts";
 import type { InspectionWarning, SavedItem, SnapshotFileContents } from "./types.ts";
 
@@ -35,12 +36,20 @@ export interface ApplyCollision {
   itemIds: string[];
 }
 
+export interface ApplyReferenceProposal {
+  path: string;
+  status: "new" | "append";
+  instructionPaths: string[];
+  preview: ApplyPreview;
+}
+
 export interface ApplyPlan {
   projectDir: string;
   files: ApplyFilePlan[];
   collisions: ApplyCollision[];
   warnings: InspectionWarning[];
   skippedItems: string[];
+  referenceProposal?: ApplyReferenceProposal;
 }
 
 export interface ApplyDecisions {
@@ -86,6 +95,7 @@ interface InternalPlan {
   candidates: Map<string, SnapshotCandidate[]>;
   existing: Map<string, DestinationFile | undefined>;
   skippedItems: string[];
+  reference?: { path: string; candidate: SnapshotCandidate };
 }
 
 interface WriteOperation {
@@ -258,6 +268,71 @@ function targetPath(item: SavedItem, filePath: string, fileCount: number): strin
   return item.destination.path;
 }
 
+async function readRootContextFiles(root: string): Promise<Map<string, DestinationFile | "unusable">> {
+  const files = new Map<string, DestinationFile | "unusable">();
+  const seen = new Set<number>();
+  for (const name of contextFileNames) {
+    const target = path.join(root, name);
+    const stat = await maybeLstat(target);
+    if (!stat || seen.has(stat.ino)) continue;
+    seen.add(stat.ino);
+    if (!stat.isFile()) {
+      files.set(name, "unusable");
+      continue;
+    }
+    const bytes = await readFile(target);
+    files.set(name, textFrom(bytes) === undefined ? "unusable" : { bytes, mode: stat.mode & 0o777, sha256: sha256(bytes) });
+  }
+  return files;
+}
+
+async function planInstructionReference(
+  root: string,
+  instructionPaths: readonly string[],
+  candidates: Map<string, SnapshotCandidate[]>,
+  warnings: InspectionWarning[],
+): Promise<{ proposal: ApplyReferenceProposal; path: string; candidate: SnapshotCandidate; before: DestinationFile | undefined } | undefined> {
+  const targets = instructionPaths.filter((value) => !isAutoLoadedInstruction(value));
+  if (targets.length === 0) return undefined;
+  const current = await readRootContextFiles(root);
+  const planned = contextFileNames.filter((name) => candidates.has(name));
+  const texts: string[] = [];
+  for (const name of contextFileNames) {
+    const options = candidates.get(name);
+    if (options) {
+      for (const option of options) {
+        const text = textFrom(option.bytes);
+        if (text !== undefined) texts.push(text);
+      }
+      continue;
+    }
+    const file = current.get(name);
+    if (file && file !== "unusable") texts.push(textFrom(file.bytes)!);
+  }
+  const missing = unreferencedPaths(targets, texts);
+  if (missing.length === 0) return undefined;
+  const targetName = chooseReferenceTarget([...current.keys(), ...planned]);
+  const existing = current.get(targetName);
+  const manual = planned.length > 0 || existing === "unusable";
+  for (const value of missing) {
+    const how = manual
+      ? `Add this line to ${targetName} yourself: ${referenceLine(value)}`
+      : `Approve the optional reference line for ${targetName} during apply, or add it yourself: ${referenceLine(value)}`;
+    addWarning(warnings, "instruction-not-loaded", `Pi does not load this instruction automatically and no root context file mentions it. ${how}`, value);
+  }
+  if (manual) return undefined;
+  const before = existing as DestinationFile | undefined; // "unusable" always sets manual, which returned above
+  const bytes = Buffer.from(appendReferenceLines(before ? textFrom(before.bytes) : undefined, missing), "utf8");
+  const candidate: SnapshotCandidate = { itemId: "copi-reference", bytes, mode: before?.mode ?? 0o644, sha256: sha256(bytes), sensitive: false, preview: { kind: "binary", summary: "" } };
+  candidate.preview = previewFor(targetName, candidate, before);
+  return {
+    proposal: { path: targetName, status: before ? "append" : "new", instructionPaths: missing, preview: candidate.preview },
+    path: targetName,
+    candidate,
+    before,
+  };
+}
+
 function candidateKey(candidate: SnapshotCandidate): string {
   return `${candidate.sha256}:${candidate.mode}`;
 }
@@ -277,6 +352,7 @@ async function planApplyLocked(state: SavedLibraryState, groupId: string, projec
   const skippedItems: string[] = [];
   const candidates = new Map<string, SnapshotCandidate[]>();
   const existing = new Map<string, DestinationFile | undefined>();
+  const instructionPaths: string[] = [];
   for (const itemId of group.itemIds) {
     const item = catalog.items.find((entry) => entry.id === itemId);
     if (!item) throw new Error(`Group references an unavailable item: ${itemId}`);
@@ -294,6 +370,7 @@ async function planApplyLocked(state: SavedLibraryState, groupId: string, projec
       const destination = targetPath(item, snapshot.path, snapshotFiles.length);
       const relativePath = path.posix.normalize(destination);
       if (!safeRelativePath(relativePath) || isExcludedSnapshotPath(relativePath)) throw new Error(`Unsafe or private/excluded project destination in catalog: ${relativePath}`);
+      if (item.kind === "instruction") instructionPaths.push(relativePath);
       const fileCandidates = candidates.get(relativePath) ?? [];
       const candidate: SnapshotCandidate = {
         itemId: item.id,
@@ -332,7 +409,11 @@ async function planApplyLocked(state: SavedLibraryState, groupId: string, projec
       alternatives: uniqueCandidates.map(({ itemId, sensitive, preview }) => ({ itemId, sensitive, preview })),
     });
   }
-  const plan: ApplyPlan = { projectDir: project.canonical, files, collisions, warnings, skippedItems };
+  const reference = await planInstructionReference(project.canonical, instructionPaths, candidates, warnings);
+  if (reference) existing.set(reference.path, reference.before);
+  const plan: ApplyPlan = reference
+    ? { projectDir: project.canonical, files, collisions, warnings, skippedItems, referenceProposal: reference.proposal }
+    : { projectDir: project.canonical, files, collisions, warnings, skippedItems };
   await state.session.assertRevision(state.revision);
   planState.set(plan, {
     revision: state.revision,
@@ -342,6 +423,7 @@ async function planApplyLocked(state: SavedLibraryState, groupId: string, projec
     candidates: new Map([...candidates].map(([key, values]) => [key, [...new Map(values.map((candidate) => [candidateKey(candidate), candidate])).values()]])),
     existing,
     skippedItems: [...skippedItems],
+    ...(reference ? { reference: { path: reference.path, candidate: reference.candidate } } : {}),
   });
   return plan;
 }
