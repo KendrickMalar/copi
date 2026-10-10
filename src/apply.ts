@@ -56,6 +56,7 @@ export interface ApplyDecisions {
   collisions?: Record<string, string>;
   existing?: Record<string, "keep" | "replace" | "abort">;
   secretApprovals?: string[];
+  addReference?: boolean;
 }
 
 export interface ApplyBackup {
@@ -70,6 +71,7 @@ export interface ApplyResult {
   skippedItems: string[];
   backups: ApplyBackup[];
   cancelled: boolean;
+  referenceAdded?: string;
 }
 
 interface DestinationFile {
@@ -572,6 +574,13 @@ async function executeApplyLocked(state: SavedLibraryState, plan: ApplyPlan, dec
     if (previous) operations.push({ path: relativePath, candidate, before: previous });
     else operations.push({ path: relativePath, candidate });
   }
+  if (decisions.addReference === true) {
+    if (!internal.reference) throw new Error("The apply plan has no reference proposal to add.");
+    const before = internal.existing.get(internal.reference.path);
+    operations.push(before
+      ? { path: internal.reference.path, candidate: internal.reference.candidate, before }
+      : { path: internal.reference.path, candidate: internal.reference.candidate });
+  }
   if (cancelled) return { written: [], kept: [], skippedItems: [...internal.skippedItems], backups: [], cancelled: true };
   for (const operation of operations) {
     const current = await inspectDestination(internal.projectRoot, operation.path);
@@ -594,5 +603,8 @@ async function executeApplyLocked(state: SavedLibraryState, plan: ApplyPlan, dec
     await writeSnapshotFile(internal.projectRoot, operation.path, operation.candidate);
     written.push(operation.path);
   }
-  return { written, kept, skippedItems: [...internal.skippedItems], backups, cancelled: false };
+  const referenceAdded = internal.reference && written.includes(internal.reference.path) ? internal.reference.path : undefined;
+  return referenceAdded
+    ? { written, kept, skippedItems: [...internal.skippedItems], backups, cancelled: false, referenceAdded }
+    : { written, kept, skippedItems: [...internal.skippedItems], backups, cancelled: false };
 }

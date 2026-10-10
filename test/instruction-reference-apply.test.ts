@@ -126,3 +126,69 @@ test("does not propose editing a symlinked context file", async (t) => {
   assert.deepEqual(warned(plan), ["RULES.md"]);
   assert.equal(await readFile(path.join(box.root, "outside.md"), "utf8"), "# outside\n");
 });
+
+test("appends the reference only after approval and backs up the previous file", async (t) => {
+  const box = await sandbox(t);
+  await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+  const agents = path.join(box.projectDir, "AGENTS.md");
+  await writeFile(agents, "# Project", { mode: 0o640 });
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  const result = await executeApply(box.libraryDir, plan, { addReference: true });
+  assert.equal(await readFile(agents, "utf8"), `# Project\n\n${referenceLine("RULES.md")}\n`);
+  assert.equal((await stat(agents)).mode & 0o777, 0o640);
+  assert.equal(result.referenceAdded, "AGENTS.md");
+  assert.equal(await readFile(path.join(box.projectDir, "RULES.md"), "utf8"), "# Rules\n");
+  const backup = result.backups.find((entry) => entry.path === "AGENTS.md");
+  assert.ok(backup);
+  assert.equal(await readFile(backup.backupPath, "utf8"), "# Project");
+});
+
+test("creates AGENTS.md with mode 0644 when approved and none exists", async (t) => {
+  const box = await sandbox(t);
+  await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  const result = await executeApply(box.libraryDir, plan, { addReference: true });
+  const agents = path.join(box.projectDir, "AGENTS.md");
+  assert.equal(await readFile(agents, "utf8"), `${referenceLine("RULES.md")}\n`);
+  assert.equal((await stat(agents)).mode & 0o777, 0o644);
+  assert.equal(result.referenceAdded, "AGENTS.md");
+});
+
+test("leaves context files untouched when the reference is declined", async (t) => {
+  const box = await sandbox(t);
+  await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+  await writeFile(path.join(box.projectDir, "AGENTS.md"), "# Project\n");
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  const result = await executeApply(box.libraryDir, plan, { addReference: false });
+  assert.equal(await readFile(path.join(box.projectDir, "AGENTS.md"), "utf8"), "# Project\n");
+  assert.equal(await readFile(path.join(box.projectDir, "RULES.md"), "utf8"), "# Rules\n");
+  assert.equal(result.referenceAdded, undefined);
+  assert.deepEqual(result.backups, []);
+});
+
+test("rejects addReference without a proposal", async (t) => {
+  const box = await sandbox(t);
+  await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+  await writeFile(path.join(box.projectDir, "AGENTS.md"), "Read RULES.md.\n");
+  const plan = await planApply(box.libraryDir, "bundle", box.projectDir);
+  await assert.rejects(executeApply(box.libraryDir, plan, { addReference: true }), /no reference proposal/i);
+  await assert.rejects(readFile(path.join(box.projectDir, "RULES.md")), { code: "ENOENT" });
+});
+
+test("writes nothing when the context file changes or appears after planning", async (t) => {
+  const box = await sandbox(t);
+  await addInstruction(box, "rules", "RULES.md", "# Rules\n");
+  const agents = path.join(box.projectDir, "AGENTS.md");
+  await writeFile(agents, "# Project\n");
+  const changed = await planApply(box.libraryDir, "bundle", box.projectDir);
+  await writeFile(agents, "# Edited\n");
+  await assert.rejects(executeApply(box.libraryDir, changed, { addReference: true }), /Destination changed/);
+  assert.equal(await readFile(agents, "utf8"), "# Edited\n");
+  await assert.rejects(readFile(path.join(box.projectDir, "RULES.md")), { code: "ENOENT" });
+
+  await rm(agents);
+  const created = await planApply(box.libraryDir, "bundle", box.projectDir);
+  await writeFile(agents, "# Appeared\n");
+  await assert.rejects(executeApply(box.libraryDir, created, { addReference: true }), /Destination changed/);
+  assert.equal(await readFile(agents, "utf8"), "# Appeared\n");
+});
