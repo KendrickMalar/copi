@@ -48,6 +48,12 @@ secrets on the screen, scrollback or recordings: individual approval to expose
 is separate from approval to save. Fixed bytes are inspected before saving;
 each suspected sensitive file requires fresh individual approval.
 
+Pi loads only root context files (AGENTS.override.md, AGENTS.md, AGENTS.MD,
+CLAUDE.md, CLAUDE.MD) and .pi/SYSTEM.md or .pi/APPEND_SYSTEM.md automatically.
+apply warns when another instruction is not mentioned by a root context file and
+can add one reference line after a separate default-no approval; --dry-run shows
+the same warning and diff without writing.
+
 Refresh can reselect a same-kind source with explicit read permission; the whole
 saved copy is replaced after masked diff and individual file approvals. Copi-only edits
 will be lost. Originals are not written back. No history, restore or automatic merge
