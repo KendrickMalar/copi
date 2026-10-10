@@ -138,7 +138,8 @@ export async function pty(b: Box, argv: string[], steps: Step[], mode = "tty", s
   const prefix = path.join(b.root, `pty-${randomUUID()}`), output = `${prefix}.bin`, state = `${prefix}.state.json`, config = `${prefix}.actions.json`;
   await writeFile(config, JSON.stringify({ argv, steps, cwd: b.cwd, mode, size, output, state }));
   const diagnostics = await new Promise<string>((resolve, reject) => {
-    const child = spawn("python3", ["-c", driver, config], { cwd: b.cwd, env: environment(b) });
+    // The driver must not write bytecode caches into the isolated HOME it shares with the CLI.
+    const child = spawn("python3", ["-c", driver, config], { cwd: b.cwd, env: { ...environment(b), PYTHONDONTWRITEBYTECODE: "1" } });
     const chunks: Buffer[] = []; child.stdout.on("data", chunk => chunks.push(chunk)); child.stderr.on("data", chunk => chunks.push(chunk));
     child.on("error", reject); child.on("close", code => code === 0 ? resolve(Buffer.concat(chunks).toString()) : reject(new Error(`PTY driver exit ${code}: ${Buffer.concat(chunks)}`)));
   });
