@@ -1,6 +1,6 @@
 {
   "name": "@papillon6814/copi",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Collect and organize reusable Pi coding-agent resources",
   "license": "MIT",
   "type": "module",
@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/build-native.mjs",
-    "test": "npm run build && node --test dist/test/*.test.js",
+    "test": "npm run build && node --import ./dist/test/helpers/test-env.js --test dist/test/*.test.js",
     "check": "npm run build && npm test && npm pack --dry-run"
   },
   "dependencies": {
