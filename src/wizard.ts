@@ -9,6 +9,7 @@ import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
+import { resourcePicker } from "./resource-picker.ts";
 import type { Catalog, Group, LegacySavedItem, ResourceCandidate, SavedItem, StoredCatalog } from "./types.ts";
 
 /** Mask display metadata too, and render controls literally rather than executing VT sequences. */
@@ -508,22 +509,23 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       "(suspected secrets need approval one by one; No skips that resource) \u2192 final confirmation.",
       `Copies are saved to ${displayPath(libraryDir, homeDir)} only if you answer Yes at the final confirmation.`,
       "Ctrl-C at any point saves nothing, and your original files are never changed.",
-      "Row: [kind] name \u2014 where it was found. The focused row also shows size \u00b7 modified \u00b7 destination.",
+      "Tabs group resources by kind; the masked preview below the list follows the focused row.",
     ].join("\n"),
     "Choosing resources",
   );
   let previousSelection: string[] = [];
   let resolvedCandidates: ResourceCandidate[];
   while (true) {
-    const selectedIds = await autocompleteMultiselect({
-      message: "Select resources to review and save as copied snapshots",
-      options: sortedCandidates.map((candidate) => {
-        const label = candidateLabelMap.get(candidate.id)! + identicalCopiesSuffix(identicalCopies.get(candidate.id));
-        return { value: candidate.id, label, hint: candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, process.stdout.columns, label.length) };
-      }),
-      required: false,
+    const selectedIds = await resourcePicker({
+      message: `Select resources to review and save as copied snapshots ${multiselectKeyHint}`,
+      rows: sortedCandidates.map((candidate) => ({
+        candidate,
+        label: safeDisplay(candidateLabelMap.get(candidate.id)! + identicalCopiesSuffix(identicalCopies.get(candidate.id))),
+        details: safeDisplay(candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, undefined, 0)),
+      })),
       initialValues: previousSelection,
-      placeholder: "Filter resources...",
+      sanitize: safeDisplay,
+      ...inheritedSignal(),
     });
     if (isCancel(selectedIds)) {
       cancel("Setup cancelled; no resources were saved.");

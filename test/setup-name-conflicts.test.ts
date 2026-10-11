@@ -168,8 +168,8 @@ test("#9 go back re-shows the list with the previous selection, then resolves", 
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     ...start, selectFirstTwo,
     { waitFor: "Go back to the list", send: `${down}${down}${down}\r` },
-    // Both rows are preselected and the cursor sits on the last selected row (set-1): un-select it.
-    { waitFor: "Select resources to review", send: "\t\r" },
+    // Both rows are preselected and the cursor starts on the first row (set-0): move to set-1 and un-select it.
+    { waitFor: "Select resources to review", send: `${down}\t\r` },
     { waitFor: "Create the first resource group", send: "team\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);

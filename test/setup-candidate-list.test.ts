@@ -15,7 +15,7 @@ test("#8 setup lists same-named candidates with distinct source labels, adjacent
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     { waitFor: "Choose the locations", send: "\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
-    { waitFor: "Filter resources", send: "\u0003" },
+    { waitFor: "Search:", send: "\u0003" },
   ]);
   const text = result.output.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
   assert.match(text, /PTY actions 3\/3/);

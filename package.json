@@ -26,6 +26,7 @@
     "check": "npm run build && npm test && npm pack --dry-run"
   },
   "dependencies": {
+    "@clack/core": "^1.5.1",
     "@clack/prompts": "^1.8.1",
     "diff": "^9.0.0"
   },
