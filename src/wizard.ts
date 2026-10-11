@@ -4,7 +4,7 @@ import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { formatOutsideRootSummary } from "./setup-display.ts";
+import { displayPath, formatOutsideRootSummary } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -303,31 +303,27 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   assertModernCatalog(initial);
   assertNoNameConflicts(initial);
   intro("copi setup");
-  const scopeOptions: Array<{ value: "home" | "project"; label: string; hint: string }> = [];
-  if (roots.homeDir) {
-    scopeOptions.push({
-      value: "home",
-      label: `Search entire HOME: ${roots.homeDir}`,
-      hint: `Includes supported Pi resources under HOME and Pi agent directory ${roots.agentDir}`,
-    });
-  }
-  scopeOptions.push({ value: "project", label: `Search current project: ${roots.projectDir}`, hint: "Supported Pi resources and instruction files in this project" });
-  const selectedScopes = await autocompleteMultiselect({
+  type LocationChoice = "home" | "project" | "both" | "cancel";
+  const homeDir = roots.homeDir;
+  const projectLabel = displayPath(roots.projectDir, homeDir);
+  const projectIsHome = Boolean(homeDir) && roots.projectDir === homeDir;
+  const projectInsideHome = Boolean(homeDir) && !projectIsHome && displayPath(roots.projectDir, homeDir) !== roots.projectDir;
+  const locationOptions: Array<{ value: LocationChoice; label: string }> = [];
+  if (homeDir) locationOptions.push({ value: "home", label: "HOME and Pi agent directory \u2014 ~ (can take a minute or more)" });
+  if (!projectIsHome) locationOptions.push({ value: "project", label: `This project only \u2014 ${projectLabel} (fast)` });
+  if (homeDir && !projectIsHome && !projectInsideHome) locationOptions.push({ value: "both", label: "Both" });
+  locationOptions.push({ value: "cancel", label: "Cancel" });
+  const choice = await select<LocationChoice>({
     message: "Choose the locations copi may inspect",
-    options: scopeOptions,
-    required: false,
-    placeholder: "Search locations...",
+    options: locationOptions,
+    initialValue: locationOptions[0]!.value,
   });
-  if (isCancel(selectedScopes)) {
+  if (isCancel(choice) || choice === "cancel") {
     cancel("Setup cancelled.");
     return;
   }
-  const scopes: SearchScopes = { home: selectedScopes.includes("home"), project: selectedScopes.includes("project") };
-  const searchOptions = buildSearchOptions(roots, scopes);
-  if (!searchOptions) {
-    outro("No locations selected; nothing was searched or saved.");
-    return;
-  }
+  const scopes: SearchScopes = { home: choice === "home" || choice === "both", project: choice === "project" || choice === "both" };
+  const searchOptions = buildSearchOptions(roots, scopes)!; // every non-cancel choice enables at least one scope
   note(
     [
       `HOME: ${scopes.home ? roots.homeDir : "not selected"}`,

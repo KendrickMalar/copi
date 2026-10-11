@@ -132,7 +132,7 @@ test("N1 real CLI setup preflights conflicting selected batch before any catalog
   }
   const projectBefore = await treeBytes(box.project);
   const result = await realPty(box, [process.execPath, cli, "setup"], [
-    { waitFor: "Choose the locations", send: "\u001b[B\t\r" },
+    { waitFor: "Choose the locations", send: "\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
     { waitFor: "Select resources to review", send: "\t\u001b[B\t\r" },
     { waitFor: "Create the first resource group", send: "test-team\r" },

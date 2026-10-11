@@ -77,8 +77,8 @@ test("U2 real colliding saved candidates/existing target/secret No are guarded; 
 
 test("U2/U7 empty library group/apply/setup exits remain read-only without authorized search", async () => {
   const b = await box(), before = await custody(b);
-  const run = await manage(b, [choose("Manage saved resources", 1), choose("Manage saved resources", 0), choose("Manage saved groups", 1), choose("Manage saved resources", 2), { wait: "Choose the locations", text: "\r" }, finish]);
-  success(run); assert.match(run.output, /No groups to apply/); assert.match(run.output, /No locations selected/); assert.deepEqual(await custody(b), before);
+  const run = await manage(b, [choose("Manage saved resources", 1), choose("Manage saved resources", 0), choose("Manage saved groups", 1), choose("Manage saved resources", 2), { wait: "Choose the locations", text: "\r" }, { wait: "Authorize copi to search only", text: "\r" }, finish]);
+  success(run); assert.match(run.output, /No groups to apply/); assert.match(run.output, /Search not authorized/); assert.deepEqual(await custody(b), before);
 });
 
 for (const initial of ["\ufeffCafe\u0301\r\n旅程🙂\r\n\r\n", "", "A".repeat(1_000_000)]) test(`U3 independent no-op prefill bytes ${Buffer.byteLength(initial)}`, async () => {
