@@ -26,7 +26,7 @@ async function seedGroups(box: AcceptanceBox, names: string[]): Promise<void> {
 const flat = (output: string) => output.replace(/[│┌└├─]/g, " ").replace(/\s+/g, " ");
 
 const start = [
-  { waitFor: "Choose the locations", send: "\u001b[B\u001b[B\r" },
+  { waitFor: "Choose the locations", send: "\u001b[B\r" },
   { waitFor: "Authorize copi", send: "y" },
 ];
 const selectTwo = { waitFor: "Select resources to review", send: "\t\u001b[B\t\r" };

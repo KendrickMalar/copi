@@ -73,7 +73,7 @@ export const at = (wait: string, text = "y\r"): Step => ({ wait, text });
 export const finish = choose("Manage saved resources", 4);
 export const resource = (index: number): Step[] => [choose("Manage saved resources"), choose("Select saved resource"), choose("Resource action", index)];
 export function setupSteps(): Step[] {
-  return [at("Choose the locations copi may inspect", `${down}${down}\r`), at("Authorize copi to search only", "y\r"),
+  return [at("Choose the locations copi may inspect", `${down}\r`), at("Authorize copi to search only", "y\r"),
     at("Select resources to review", "\t\r"), at("Create the first resource group", "First bundle\r"),
     at("Save suspected sensitive file second.md", "y\r"), at("Save suspected sensitive file SKILL.md", "y\r"),
     at("Save 1 copied resource(s)", "y\r")];

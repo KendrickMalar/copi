@@ -132,7 +132,7 @@ test("N1/#9 real CLI setup resolves a conflicting selected batch before review; 
   }
   const projectBefore = await treeBytes(box.project);
   const result = await realPty(box, [process.execPath, cli, "setup"], [
-    { waitFor: "Choose the locations", send: "\u001b[B\u001b[B\r" },
+    { waitFor: "Choose the locations", send: "\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
     { waitFor: "Select resources to review", send: "\t\u001b[B\t\r" },
     { waitFor: "Keep all and rename the others", send: "\u001b[B\u001b[B\r" },

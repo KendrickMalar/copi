@@ -14,7 +14,7 @@ test("setup merges identical same-named candidates into one row and keeps differ
     await writeFile(path.join(folder, "SKILL.md"), body);
   }
   const result = await realPty(box, [process.execPath, cli, "setup"], [
-    { waitFor: "Choose the locations", send: "\u001b[B\u001b[B\r" },
+    { waitFor: "Choose the locations", send: "\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
     { waitFor: "Select resources to review", send: "\u0003" },
   ]);

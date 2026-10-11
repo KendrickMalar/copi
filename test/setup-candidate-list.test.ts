@@ -13,7 +13,7 @@ test("#8 setup lists same-named candidates with distinct source labels, adjacent
     await writeFile(path.join(folder, "SKILL.md"), `# safe ${dir}\n`); // distinct content: identical copies would be merged
   }
   const result = await realPty(box, [process.execPath, cli, "setup"], [
-    { waitFor: "Choose the locations", send: "\u001b[B\u001b[B\r" },
+    { waitFor: "Choose the locations", send: "\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
     { waitFor: "Filter resources", send: "\u0003" },
   ]);
