@@ -1,4 +1,4 @@
-import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, text as clackText } from "@clack/prompts";
+import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, spinner as clackSpinner, text as clackText } from "@clack/prompts";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
@@ -36,8 +36,10 @@ const select: typeof clackSelect = (options) => clackSelect({
   ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message),
   options: options.options.map((option) => ({ ...option, label: safeDisplay(option.label ?? "Unavailable entry"), ...(option.hint === undefined ? {} : { hint: safeDisplay(option.hint) }) })),
 });
+// Clack's own key legend is dim and below the list; repeat it in the question so Tab-to-select is not missed.
+export const multiselectKeyHint = "(Tab: select, Enter: confirm)";
 const autocompleteMultiselect: typeof clackMultiselect = (options) => clackMultiselect({
-  ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message),
+  ...options, ...inheritedSignal(options.signal), message: `${safeDisplay(options.message)} ${multiselectKeyHint}`,
   options: typeof options.options === "function" ? options.options : options.options.map((option) => ({ ...option, label: safeDisplay(option.label ?? "Unavailable entry"), ...(option.hint === undefined ? {} : { hint: safeDisplay(option.hint) }) })),
 });
 const text: typeof clackText = (options) => clackText({ ...options, ...inheritedSignal(options.signal), message: safeDisplay(options.message) });
@@ -338,7 +340,16 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     return;
   }
 
-  const discovery = await discoverResources(searchOptions);
+  const progress = clackSpinner(inheritedSignal());
+  progress.start("Searching selected locations (searching all of HOME can take a minute or more)");
+  let discovery: Awaited<ReturnType<typeof discoverResources>>;
+  try {
+    discovery = await discoverResources(searchOptions);
+  } catch (error) {
+    progress.error("Search failed");
+    throw error;
+  }
+  progress.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
   showWarnings(discovery.warnings, "Search warnings");
   if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.join("\n"), "Excluded paths");
   if (discovery.candidates.length === 0) {
