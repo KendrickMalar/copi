@@ -501,6 +501,17 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const candidateStats = await gatherCandidateStats(sortedCandidates);
   const savedNames = new Set(initial.items.map((item) => nameKey(item.name)));
   const candidateLabelMap = candidateLabels(sortedCandidates, homeDir, (candidate) => savedNames.has(nameKey(candidate.name)), process.stdout.columns);
+  note(
+    [
+      "Pick candidates to review. Nothing is saved yet.",
+      "Next: resolve duplicate names \u2192 choose groups \u2192 check each masked preview",
+      "(suspected secrets need approval one by one; No skips that resource) \u2192 final confirmation.",
+      `Copies are saved to ${displayPath(libraryDir, homeDir)} only if you answer Yes at the final confirmation.`,
+      "Ctrl-C at any point saves nothing, and your original files are never changed.",
+      "Row: [kind] name \u2014 where it was found. The focused row also shows size \u00b7 modified \u00b7 destination.",
+    ].join("\n"),
+    "Choosing resources",
+  );
   let previousSelection: string[] = [];
   let resolvedCandidates: ResourceCandidate[];
   while (true) {
