@@ -1,10 +1,10 @@
-import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, select as clackSelect, spinner as clackSpinner, text as clackText } from "@clack/prompts";
+import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, confirm as clackConfirm, intro as clackIntro, isCancel, log, note as clackNote, outro as clackOutro, progress as clackProgress, select as clackSelect, spinner as clackSpinner, text as clackText } from "@clack/prompts";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
-import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
+import { discoverResources, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { candidateHint, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates } from "./setup-display.ts";
+import { candidateHint, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -444,16 +444,32 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     return;
   }
 
-  const progress = clackSpinner(inheritedSignal());
-  progress.start("Searching selected locations (searching all of HOME can take a minute or more)");
+  // A spinner covers the quick phases; once HOME's top-level directories are known, a bar fills one step per directory.
+  let indicator: ReturnType<typeof clackSpinner> = clackSpinner(inheritedSignal());
+  indicator.start("Searching selected locations (searching all of HOME can take a minute or more)");
+  let bar: ReturnType<typeof clackProgress> | undefined;
+  let barDone = 0;
+  const onProgress = (event: DiscoveryProgress) => {
+    if (!bar) {
+      if (event.total === 0) return;
+      indicator.clear();
+      bar = clackProgress({ ...inheritedSignal(), max: event.total });
+      indicator = bar;
+      bar.start(safeDisplay(formatSearchProgress(event, homeDir)));
+      return;
+    }
+    const step = event.done - barDone;
+    barDone = event.done;
+    bar.advance(step, safeDisplay(formatSearchProgress(event, homeDir)));
+  };
   let discovery: Awaited<ReturnType<typeof discoverResources>>;
   try {
-    discovery = await discoverResources(searchOptions);
+    discovery = await discoverResources(searchOptions, onProgress);
   } catch (error) {
-    progress.error("Search failed");
+    indicator.error("Search failed");
     throw error;
   }
-  progress.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
+  indicator.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
   showSearchWarnings(discovery.warnings, roots.homeDir);
   if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.map((excluded) => displayPath(excluded, homeDir)).join("\n"), "Excluded paths");
   if (discovery.candidates.length === 0) {

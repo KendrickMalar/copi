@@ -150,7 +150,14 @@ async function exists(target: string): Promise<boolean> {
   return lstat(target).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
 }
 
-export async function discoverResources(options: DiscoveryOptions): Promise<DiscoveryResult> {
+/** HOME search progress: `total` top-level directories, `done` finished so far, `current` the one being searched. */
+export interface DiscoveryProgress {
+  done: number;
+  total: number;
+  current?: string;
+}
+
+export async function discoverResources(options: DiscoveryOptions, onProgress?: (progress: DiscoveryProgress) => void): Promise<DiscoveryResult> {
   const scopes = options.scopes ?? inferSearchScopes(options);
   if (!scopes.home && !scopes.project) return { candidates: [], warnings: [], excludedPaths: [] };
   const warnings: DiscoveryWarning[] = [];
@@ -200,10 +207,10 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     });
   };
 
-  const walk = async (root: string, startPath: string, onFile: (file: string) => Promise<void>): Promise<void> => {
+  const walk = async (root: string, startPath: string, onFile: (file: string) => Promise<void>, progress?: (progress: DiscoveryProgress) => void): Promise<void> => {
     const canonicalRoot = await canonicalDirectory(root);
     if (!canonicalRoot) return;
-    const visit = async (directory: string): Promise<void> => {
+    const visit = async (directory: string, topLevel = false): Promise<void> => {
       let entries;
       try {
         entries = await readdir(directory, { withFileTypes: true });
@@ -212,6 +219,11 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
         addWarning(warnings, code === "EACCES" ? "permission-denied" : "scan-error", directory, code === "EACCES" ? "Permission denied while searching this directory." : "Unable to search this directory.");
         return;
       }
+      const tracked = topLevel && progress
+        ? entries.filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && !shouldExclude(path.relative(canonicalRoot, path.join(directory, entry.name))))
+        : [];
+      let done = 0;
+      if (topLevel && progress) progress({ done, total: tracked.length });
       for (const entry of entries) {
         const child = path.join(directory, entry.name);
         const relative = path.relative(canonicalRoot, child);
@@ -227,8 +239,12 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
           addWarning(warnings, target && isWithin(canonicalRoot, target) ? "symlink-skipped" : "external-symlink", child, "Symbolic links are not followed during resource discovery.");
           continue;
         }
-        if (entry.isDirectory()) await visit(child);
-        else if (entry.isFile()) await onFile(child);
+        if (entry.isDirectory()) {
+          const isTracked = tracked.includes(entry);
+          if (isTracked) progress!({ done, total: tracked.length, current: child });
+          await visit(child);
+          if (isTracked) progress!({ done: ++done, total: tracked.length });
+        } else if (entry.isFile()) await onFile(child);
       }
     };
     const canonicalStart = await realpath(startPath).catch(() => undefined);
@@ -248,7 +264,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     const stat = await lstat(canonicalStart).catch(() => undefined);
     if (!stat) return;
     if (stat.isFile()) await onFile(canonicalStart);
-    else if (stat.isDirectory()) await visit(canonicalStart);
+    else if (stat.isDirectory()) await visit(canonicalStart, true);
   };
 
   const addSkillRoot = async (root: string, startPath: string, scope: ResourceScope, source: string, destinationRoot: string): Promise<void> => {
@@ -566,7 +582,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
         if (projectRoot !== home && !isWithin(path.join(home, ".pi"), projectRoot)) homeProjects.add(projectRoot);
         await addCandidate("instruction", home, file, base, "project", "project-instructions", { kind: "project", path: base });
       }
-    });
+    }, onProgress);
     for (const profileRoot of homeProfiles) {
       await scanSettings(path.join(profileRoot, "settings.json"), "user", [profileRoot, home], profileRoot);
     }

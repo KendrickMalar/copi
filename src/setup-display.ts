@@ -184,3 +184,9 @@ export function pendingNameError(name: string | undefined, taken: ReadonlySet<st
   try { key = nameKey(name ?? ""); } catch { return "Enter a non-empty display name."; }
   return taken.has(key) ? "That name is already used by a saved or selected resource; choose another." : undefined;
 }
+
+/** Bar message for the HOME search: `14/36  ~/Library`, or just the count between directories. */
+export function formatSearchProgress(progress: { done: number; total: number; current?: string }, home: string): string {
+  const count = `${progress.done}/${progress.total}`;
+  return progress.current === undefined ? `${count}  Searching HOME` : `${count}  ${displayPath(progress.current, home)}`;
+}

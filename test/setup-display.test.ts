@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle } from "../src/setup-display.ts";
+import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress } from "../src/setup-display.ts";
 import { nameKey } from "../src/names.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
@@ -165,4 +165,9 @@ test("#9 pendingNameError rejects empty names and names taken by the library or 
   assert.match(pendingNameError(undefined, taken) ?? "", /non-empty/);
   assert.match(pendingNameError(" known ", taken) ?? "", /already used/);
   assert.match(pendingNameError("STRASSE", taken) ?? "", /already used/);
+});
+
+test("formatSearchProgress shows count and the directory being searched", () => {
+  assert.equal(formatSearchProgress({ done: 14, total: 36, current: "/Users/a/Library" }, "/Users/a"), "14/36  ~/Library");
+  assert.equal(formatSearchProgress({ done: 36, total: 36 }, "/Users/a"), "36/36  Searching HOME");
 });
