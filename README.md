@@ -5,9 +5,9 @@
 ## Status and requirements
 
 - Package: `@papillon6814/copi`; command: `copi`.
-- macOS only; Node.js 22.19.0 or newer.
-- The package is not published yet. Do not rely on the npm install command below until publication is announced.
-- If published, install with `npm install --global @papillon6814/copi`.
+- macOS only (saving resources into the library requires Apple Silicon / arm64); Node.js 22.19.0 or newer.
+- Install with `npm install --global @papillon6814/copi`. npm creates the `copi` command.
+- Version 0.1.0 predates the catalog v2 `sources` layout. Use 0.2.0 or newer with a migrated library.
 - An older, unrelated tool may already provide a `copi` command. Check `command -v copi` before installing globally; resolve any command-name conflict deliberately.
 
 For a local checkout, run `npm install --ignore-scripts`, `npm run build`, then `node dist/src/cli.js help`.
