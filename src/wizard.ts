@@ -9,6 +9,7 @@ import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
 import { executeApply, planApply } from "./apply.ts";
+import { askPiForSuggestions, resolvePiCommand, type Suggestion } from "./pi-suggestions.ts";
 import { resourcePicker } from "./resource-picker.ts";
 import type { Catalog, Group, LegacySavedItem, ResourceCandidate, SavedItem, StoredCatalog } from "./types.ts";
 
@@ -513,7 +514,31 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     ].join("\n"),
     "Choosing resources",
   );
-  let previousSelection: string[] = [];
+  let suggestions = new Map<string, Suggestion>();
+  const piCommand = resolvePiCommand();
+  if (piCommand) {
+    const ask = await confirm({
+      message: `Ask Pi to suggest which resources are worth saving? Masked excerpts (up to ${40} lines each, no paths) are sent to your Pi model; Pi gets no tools and nothing is saved by this.`,
+      initialValue: false,
+    });
+    if (isCancel(ask)) {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    if (ask) {
+      const asking = clackSpinner(inheritedSignal());
+      asking.start(`Asking Pi about ${sortedCandidates.length} resource(s)`);
+      const answer = await askPiForSuggestions(sortedCandidates, { command: piCommand, ...inheritedSignal() });
+      if (answer.ok) {
+        suggestions = answer.suggestions;
+        const kept = [...suggestions.values()].filter((suggestion) => suggestion.keep).length;
+        asking.stop(`Pi suggested ${kept} of ${sortedCandidates.length} resource(s); they start selected (\u2605). You decide.`);
+      } else {
+        asking.error(safeDisplay(`Pi suggestions unavailable: ${answer.reason}. Continuing without them.`));
+      }
+    }
+  }
+  let previousSelection: string[] = sortedCandidates.filter((candidate) => suggestions.get(candidate.id)?.keep).map((candidate) => candidate.id);
   let resolvedCandidates: ResourceCandidate[];
   while (true) {
     const selectedIds = await resourcePicker({
@@ -522,6 +547,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
         candidate,
         label: safeDisplay(candidateLabelMap.get(candidate.id)! + identicalCopiesSuffix(identicalCopies.get(candidate.id))),
         details: safeDisplay(candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, undefined, 0)),
+        ...(suggestions.has(candidate.id) ? { suggestion: { keep: suggestions.get(candidate.id)!.keep, reason: safeDisplay(suggestions.get(candidate.id)!.reason) } } : {}),
       })),
       initialValues: previousSelection,
       sanitize: safeDisplay,

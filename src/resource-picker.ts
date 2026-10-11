@@ -23,6 +23,8 @@ export interface PickerRow {
   label: string;
   /** Already safe for display: size · modified · destination. */
   details: string;
+  /** Pi's keep/skip suggestion; `reason` is already safe for display. */
+  suggestion?: { keep: boolean; reason: string };
 }
 
 export interface PickerOptions {
@@ -193,7 +195,9 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
     const tabLine = this.tabs.map((tab, index) => {
       const rows = this.rowsByTab.get(tab) ?? [];
       const picked = rows.filter((row) => this.selected.has(row.candidate.id)).length;
-      const text = `${tab} ${rows.length}${picked ? ` (${picked} selected)` : ""}`;
+      const suggested = rows.filter((row) => row.suggestion?.keep).length;
+      const notes = [picked ? `${picked} selected` : "", suggested ? `${suggested} suggested` : ""].filter(Boolean).join(", ");
+      const text = `${tab} ${rows.length}${notes ? ` (${notes})` : ""}`;
       return index === this.tab ? styleText(["inverse", "bold"], ` ${text} `) : styleText("dim", ` ${text} `);
     }).join(styleText("gray", "│"));
     lines.push(`${bar}  ${tabLine}`);
@@ -207,8 +211,9 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
       const index = start + offset;
       const box = this.selected.has(row.candidate.id) ? styleText("green", S_CHECKBOX_SELECTED) : styleText("dim", S_CHECKBOX_INACTIVE);
       // Middle truncation keeps both the name and trailing markers such as "(+1 identical copy)".
-      const text = clipMiddle(row.label, width - 4);
-      lines.push(`${bar}  ${box} ${index === this.cursor ? styleText("underline", text) : text}`);
+      const mark = row.suggestion ? (row.suggestion.keep ? styleText("yellow", "★ ") : styleText("dim", "· ")) : "";
+      const text = clipMiddle(row.label, width - 4 - (mark ? 2 : 0));
+      lines.push(`${bar}  ${box} ${mark}${index === this.cursor ? styleText("underline", text) : text}`);
     }
     if (start + maxRows < rows.length) lines.push(`${bar}  ${styleText("dim", "…")}`);
     const focused = rows[this.cursor];
@@ -216,6 +221,7 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
       const preview = this.preview(focused);
       lines.push(bar);
       lines.push(`${bar}  ${styleText("dim", clipMiddle(`── Preview: ${preview.title} (masked) · ${focused.details} ──`, width))}`);
+      if (focused.suggestion) lines.push(`${bar}  ${styleText(focused.suggestion.keep ? "yellow" : "dim", clip(`Pi: ${focused.suggestion.keep ? "keep" : "skip"}${focused.suggestion.reason ? ` \u2014 ${focused.suggestion.reason}` : ""}`, width))}`);
       for (const line of preview.body) lines.push(`${bar}  ${styleText("dim", clip(line, width))}`);
     }
     lines.push(`${bar}  ${styleText("dim", "←/→ tabs • ↑/↓ move • Tab: select • Enter: confirm • Type: to search")}`);
