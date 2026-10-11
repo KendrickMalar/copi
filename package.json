@@ -26,9 +26,10 @@
     "check": "npm run build && npm test && npm pack --dry-run"
   },
   "dependencies": {
-    "@clack/core": "^1.5.1",
+    "@clack/core": "1.5.1",
     "@clack/prompts": "^1.8.1",
-    "diff": "^9.0.0"
+    "diff": "^9.0.0",
+    "fast-string-width": "^3.0.2"
   },
   "devDependencies": {
     "@types/node": "^22.15.30",

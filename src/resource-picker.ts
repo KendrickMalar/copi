@@ -1,10 +1,10 @@
-import { Prompt, type CANCEL_SYMBOL } from "@clack/core";
-import { S_BAR, S_BAR_END, S_CHECKBOX_INACTIVE, S_CHECKBOX_SELECTED, symbol } from "@clack/prompts";
-import { closeSync, lstatSync, openSync, readdirSync, readSync } from "node:fs";
+import { isCancel as isCoreCancel, Prompt } from "@clack/core";
+import { CANCEL_SYMBOL, S_BAR, S_BAR_END, S_CHECKBOX_INACTIVE, S_CHECKBOX_SELECTED, symbol } from "@clack/prompts";
+import stringWidth from "fast-string-width";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import path from "node:path";
 import { styleText } from "node:util";
 import { maskSensitiveText } from "./inspect.ts";
-import { truncateMiddle } from "./setup-display.ts";
 import type { ResourceCandidate, ResourceKind } from "./types.ts";
 
 export type ResourceTab = "Skills" | "Agents" | "Instructions" | "Settings";
@@ -39,16 +39,14 @@ export interface PickerOptions {
 
 const previewReadBytes = 64 * 1024;
 
-/** The file whose head the preview shows: the file itself, or a skill's SKILL.md (else its first regular file). */
+/** The file whose head the preview shows: the file itself, or a skill directory's regular SKILL.md (never a symlink). */
 export function previewFile(candidate: ResourceCandidate): string | undefined {
   try {
     const stat = lstatSync(candidate.sourcePath);
     if (stat.isFile()) return candidate.sourcePath;
     if (!stat.isDirectory()) return undefined;
     const skill = path.join(candidate.sourcePath, "SKILL.md");
-    if (lstatSync(skill, { throwIfNoEntry: false })?.isFile()) return skill;
-    const first = readdirSync(candidate.sourcePath, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => entry.name).sort()[0];
-    return first === undefined ? undefined : path.join(candidate.sourcePath, first);
+    return lstatSync(skill, { throwIfNoEntry: false })?.isFile() ? skill : undefined;
   } catch {
     return undefined;
   }
@@ -61,13 +59,16 @@ export function previewText(candidate: ResourceCandidate, lines: number, sanitiz
   const title = sanitize(path.relative(path.dirname(candidate.sourcePath), file) || path.basename(file));
   let fd: number | undefined;
   try {
-    fd = openSync(file, "r");
+    // No symlink following and no blocking on FIFOs swapped in after the lstat above.
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return { title, body: ["[unreadable]"] };
     const buffer = Buffer.alloc(previewReadBytes);
     const read = readSync(fd, buffer, 0, previewReadBytes, 0);
     const bytes = buffer.subarray(0, read);
     if (bytes.includes(0)) return { title, body: ["[binary file]"] };
     let text: string;
-    try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { return { title, body: ["[not UTF-8 text]"] }; }
+    // Streaming decode drops a multi-byte character cut at the read limit instead of rejecting valid UTF-8.
+    try { text = new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: read === previewReadBytes }); } catch { return { title, body: ["[not UTF-8 text]"] }; }
     const all = maskSensitiveText(text).replace(/\r\n/g, "\n").split("\n");
     if (all.at(-1) === "") all.pop();
     const shown = all.slice(0, lines).map(sanitize);
@@ -81,8 +82,32 @@ export function previewText(candidate: ResourceCandidate, lines: number, sanitiz
   }
 }
 
-function clip(text: string, width: number): string {
-  return text.length > width ? `${text.slice(0, Math.max(0, width - 1))}…` : text;
+/** Cut to `width` terminal columns (CJK counts double), never splitting a code point. */
+export function clip(text: string, width: number): string {
+  if (stringWidth(text) <= width) return text;
+  let out = "";
+  for (const char of text) {
+    if (stringWidth(out + char) > width - 1) break;
+    out += char;
+  }
+  return `${out}…`;
+}
+
+/** Keep head and tail within `width` columns, so trailing markers such as "(+1 identical copy)" stay visible. */
+export function clipMiddle(text: string, width: number): string {
+  if (stringWidth(text) <= width) return text;
+  const chars = [...text];
+  let head = "", tail = "";
+  for (let i = 0, j = chars.length - 1; i <= j;) {
+    if (stringWidth(head) <= stringWidth(tail)) {
+      if (stringWidth(head + chars[i]! + tail) > width - 1) break;
+      head += chars[i++]!;
+    } else {
+      if (stringWidth(head + chars[j]! + tail) > width - 1) break;
+      tail = chars[j--]! + tail;
+    }
+  }
+  return `${head}…${tail}`;
 }
 
 /**
@@ -141,7 +166,7 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
     } else if (name === "backspace") {
       this.filter = this.filter.slice(0, -1);
       this.cursor = 0;
-    } else if (name !== "return" && char !== undefined && char.length === 1 && char >= " " && char !== "\x7f") {
+    } else if (name !== "return" && char !== undefined && [...char].length === 1 && this.options.sanitize(char) === char && char >= " ") {
       this.filter += char;
       this.cursor = 0;
     }
@@ -172,7 +197,7 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
       return index === this.tab ? styleText(["inverse", "bold"], ` ${text} `) : styleText("dim", ` ${text} `);
     }).join(styleText("gray", "│"));
     lines.push(`${bar}  ${tabLine}`);
-    lines.push(`${bar}  ${styleText("dim", "Search:")} ${this.filter}${styleText("inverse", " ")}`);
+    lines.push(`${bar}  ${styleText("dim", "Search:")} ${clip(this.options.sanitize(this.filter), width - 10)}${styleText("inverse", " ")}`);
     const rows = this.visibleRows();
     const maxRows = Math.max(3, Math.min(10, (process.stdout.rows ?? 30) - 20));
     const start = Math.min(Math.max(0, this.cursor - Math.floor(maxRows / 2)), Math.max(0, rows.length - maxRows));
@@ -182,7 +207,7 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
       const index = start + offset;
       const box = this.selected.has(row.candidate.id) ? styleText("green", S_CHECKBOX_SELECTED) : styleText("dim", S_CHECKBOX_INACTIVE);
       // Middle truncation keeps both the name and trailing markers such as "(+1 identical copy)".
-      const text = truncateMiddle(row.label, width - 4);
+      const text = clipMiddle(row.label, width - 4);
       lines.push(`${bar}  ${box} ${index === this.cursor ? styleText("underline", text) : text}`);
     }
     if (start + maxRows < rows.length) lines.push(`${bar}  ${styleText("dim", "…")}`);
@@ -190,7 +215,7 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
     if (focused) {
       const preview = this.preview(focused);
       lines.push(bar);
-      lines.push(`${bar}  ${styleText("dim", clip(`── Preview: ${preview.title} (masked) · ${focused.details} ──`, width))}`);
+      lines.push(`${bar}  ${styleText("dim", clipMiddle(`── Preview: ${preview.title} (masked) · ${focused.details} ──`, width))}`);
       for (const line of preview.body) lines.push(`${bar}  ${styleText("dim", clip(line, width))}`);
     }
     lines.push(`${bar}  ${styleText("dim", "←/→ tabs • ↑/↓ move • Tab: select • Enter: confirm • Type: to search")}`);
@@ -201,5 +226,7 @@ export class ResourcePickerPrompt extends Prompt<string[]> {
 
 export async function resourcePicker(options: PickerOptions): Promise<string[] | typeof CANCEL_SYMBOL> {
   const result = await new ResourcePickerPrompt(options).prompt();
+  // Translate core's cancel into the symbol @clack/prompts' isCancel recognizes, even if two core copies were installed.
+  if (isCoreCancel(result)) return CANCEL_SYMBOL;
   return result ?? [];
 }

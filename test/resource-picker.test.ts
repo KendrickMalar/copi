@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { loadCatalog } from "../src/catalog.ts";
-import { previewText, tabOf } from "../src/resource-picker.ts";
+import stringWidth from "fast-string-width";
+import { clip, clipMiddle, previewText, tabOf } from "../src/resource-picker.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 import { safeDisplay } from "../src/wizard.ts";
 import { acceptanceBox, cli, realPty } from "./helpers/issue2-acceptance.ts";
@@ -78,4 +79,44 @@ test("Ctrl-C in the picker cancels setup and saves nothing", async () => {
   assert.match(flat(result.output), /Setup cancelled; no resources were saved\./);
   const catalog = await loadCatalog(box.library).catch(() => undefined);
   assert.ok(!catalog || catalog.items.length === 0, "nothing was saved");
+});
+
+test("previewText keeps valid UTF-8 cut at the read limit and only previews a regular SKILL.md", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-picker-edge-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "big.md"), "a".repeat(65_535) + "あいう\n");
+  assert.notDeepEqual(previewText(cand(path.join(root, "big.md"), "instruction"), 6, safeDisplay).body, ["[not UTF-8 text]"]);
+  await writeFile(path.join(root, "latin1.md"), Buffer.from([0x61, 0xe9, 0x0a]));
+  assert.deepEqual(previewText(cand(path.join(root, "latin1.md"), "instruction"), 6, safeDisplay).body, ["[not UTF-8 text]"]);
+  await mkdir(path.join(root, "sym"), { recursive: true });
+  await writeFile(path.join(root, "elsewhere.md"), "outside\n");
+  await symlink(path.join(root, "elsewhere.md"), path.join(root, "sym", "SKILL.md"));
+  await writeFile(path.join(root, "sym", ".env"), "TOKEN=hunter2-not-for-display\n");
+  const sym = previewText(cand(path.join(root, "sym")), 6, safeDisplay);
+  assert.equal(sym.title, "no previewable file");
+  assert.deepEqual(sym.body, []);
+  await mkdir(path.join(root, "nofile", "refs"), { recursive: true });
+  await writeFile(path.join(root, "nofile", "refs", "x.md"), "x\n");
+  assert.equal(previewText(cand(path.join(root, "nofile")), 6, safeDisplay).title, "no previewable file");
+});
+
+test("clip and clipMiddle count CJK as double width and never split characters", () => {
+  assert.equal(clip("あいうえお", 6), "あい…");
+  assert.equal(clip("abc", 6), "abc");
+  const middle = clipMiddle("[subagent] とても長い名前のエージェント.md — ~/.pi/agent/agents (+1 identical copy)", 40);
+  assert.ok(stringWidth(middle) <= 40);
+  assert.ok(middle.endsWith("copy)"));
+  assert.ok(!middle.includes("�"));
+});
+
+test("picker filter, Backspace, no-match message and Esc cancel", async () => {
+  const box = await mixedProject();
+  const result = await realPty(box, [process.execPath, cli, "setup"], [
+    ...start,
+    { waitFor: "Preview: alpha/SKILL.md", send: "zz" },
+    { waitFor: "No matches found", send: "\u007f\u007f" },
+    { waitFor: "Preview: alpha/SKILL.md", send: "\u001b" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  assert.match(flat(result.output), /Setup cancelled; no resources were saved\./);
 });
