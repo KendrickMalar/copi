@@ -518,7 +518,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const piCommand = resolvePiCommand();
   if (piCommand) {
     const ask = await confirm({
-      message: `Ask Pi to suggest which resources are worth saving? Masked excerpts (up to ${40} lines each, no paths) are sent to your Pi model; Pi gets no tools and nothing is saved by this.`,
+      message: "Ask Pi to suggest which resources are worth saving? Kind, name and a masked excerpt (up to 40 lines; settings files: name only; no paths) of each candidate are sent to your Pi model. Masking is heuristic. Pi gets no tools and nothing is saved by this.",
       initialValue: false,
     });
     if (isCancel(ask)) {
@@ -533,6 +533,10 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
         suggestions = answer.suggestions;
         const kept = [...suggestions.values()].filter((suggestion) => suggestion.keep).length;
         asking.stop(`Pi suggested ${kept} of ${sortedCandidates.length} resource(s); they start selected (\u2605). You decide.`);
+      } else if (answer.reason === "cancelled") {
+        asking.stop("Cancelled");
+        cancel("Setup cancelled; no resources were saved.");
+        return;
       } else {
         asking.error(safeDisplay(`Pi suggestions unavailable: ${answer.reason}. Continuing without them.`));
       }

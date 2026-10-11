@@ -120,3 +120,30 @@ test("setup: suggestions are opt-in (default No never runs Pi) and keep-verdicts
   assert.match(screen, /· \[skill\] dropper/);
   assert.match(screen, /Pi: skip — near empty/);
 });
+
+test("settings-like kinds are sent by name only and reasons are flattened to one clean line", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-suggest-hardening-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(path.join(root, "mcp.json"), '{"env":{"NOTION_TOKEN":"ntn_plainlyVisible123"}}\n');
+  const prompt = buildSuggestionPrompt([{ id: "r1", candidate: cand("m", path.join(root, "mcp.json"), "mcp-config") }]);
+  assert.ok(!prompt.includes("ntn_plainlyVisible123"));
+  assert.match(prompt, /"excerpt": ""/);
+  const parsed = parseSuggestions('[{"id":"r1","verdict":"keep","reason":"ok\\n◼ fake row\\u202e\\u200b  verified"}]', new Set(["r1"]));
+  assert.equal(parsed!.get("r1")!.reason, "ok ◼ fake row verified");
+});
+
+test("askPiForSuggestions does not start Pi when already cancelled and kills it on abort", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-suggest-abort-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "a"), { recursive: true });
+  await writeFile(path.join(root, "a", "SKILL.md"), "# a\n");
+  const slow = await fakePi(root, "sleep 30");
+  const aborted = new AbortController(); aborted.abort();
+  assert.deepEqual(await askPiForSuggestions([cand("A", path.join(root, "a"))], { command: slow.command, signal: aborted.signal }), { ok: false, reason: "cancelled" });
+  await assert.rejects(readFile(slow.argsLog), { code: "ENOENT" }, "Pi never started");
+  const later = new AbortController();
+  setTimeout(() => later.abort(), 200);
+  const started = Date.now();
+  assert.deepEqual(await askPiForSuggestions([cand("A", path.join(root, "a"))], { command: slow.command, signal: later.signal }), { ok: false, reason: "cancelled" });
+  assert.ok(Date.now() - started < 5000);
+});
