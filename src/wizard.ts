@@ -4,6 +4,7 @@ import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
+import { candidateHint, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -149,6 +150,12 @@ export async function saveReviewedCandidate(
   });
 }
 
+function showSearchWarnings(warnings: readonly { code: string; path?: string; message: string }[], home: string): void {
+  const summary = formatOutsideRootSummary(warnings.filter((warning) => warning.code === "resource-outside-root" && warning.path !== undefined).map((warning) => warning.path as string), home);
+  if (summary) note(summary.body, summary.title);
+  showWarnings(warnings.filter((warning) => warning.code !== "resource-outside-root" || warning.path === undefined), "Search warnings");
+}
+
 function showWarnings(warnings: readonly { code: string; path?: string; message: string }[], title: string): void {
   if (warnings.length === 0) return;
   note(warnings.map((warning) => `${warning.path ? `${warning.path}: ` : ""}${warning.message}`).join("\n"), title);
@@ -275,13 +282,18 @@ async function handleNameConflicts(libraryDir: string): Promise<boolean> {
   }
 }
 
-function groupOptions(groups: Group[]) {
-  return groups.map((group) => ({ value: group.id, label: group.name, hint: `${group.itemIds.length} saved resources` }));
+function groupOptions(groups: Group[], pendingCounts?: ReadonlyMap<string, number>) {
+  return groups.map((group) => ({
+    value: group.id,
+    label: group.name,
+    hint: pendingCounts ? `${group.itemIds.length} saved \u00b7 ${pendingCounts.get(group.id) ?? 0} pending` : `${group.itemIds.length} saved resources`,
+  }));
 }
 
-async function askForGroupName(message: string): Promise<string | undefined> {
+async function askForGroupName(message: string, placeholder?: string): Promise<string | undefined> {
   const value = await text({
     message,
+    ...(placeholder !== undefined ? { placeholder } : {}),
     validate: (name) => {
       try { nameKey(name ?? ""); return undefined; }
       catch { return "Enter a non-empty group name."; }
@@ -290,42 +302,134 @@ async function askForGroupName(message: string): Promise<string | undefined> {
   return isCancel(value) ? undefined : value.trim();
 }
 
+/**
+ * Rename prompt text. The suggestion is prefilled only when it renders unchanged through `safeDisplay`
+ * (`initialValue` is echoed raw); otherwise the field stays empty and the masked suggestion is shown in the message.
+ */
+export function renamePrompt(name: string, sourceDir: string, suggestion: string): { message: string; initialValue?: string } {
+  const message = `New display name for ${name} \u2014 ${sourceDir} (display name only; files are not changed)`;
+  return safeDisplay(suggestion) === suggestion
+    ? { message, initialValue: suggestion }
+    : { message: `${message}. Suggestion: ${suggestion}` };
+}
+
+/**
+ * Resolve display-name conflicts right after selection (#9): within the selection first, one group at a time,
+ * then against saved library names. Returns the candidates to review (renamed ones are copies with a new
+ * display name only), "back" to re-show the list, or "cancel".
+ */
+async function resolveSelectedNames(
+  selection: readonly ResourceCandidate[],
+  library: StoredCatalog,
+  labels: ReadonlyMap<string, string>,
+  homeDir: string,
+): Promise<ResourceCandidate[] | "back" | "cancel"> {
+  let pending = [...selection];
+  const libraryKeys = new Set(library.items.map((item) => nameKey(item.name)));
+  const askNewName = async (candidate: ResourceCandidate, group: readonly ResourceCandidate[] = [candidate]): Promise<string | undefined> => {
+    // Taken: every saved name and every other pending name (assertNameAvailable semantics for the library).
+    const taken = new Set([...libraryKeys, ...pending.filter((other) => other.id !== candidate.id).map((other) => nameKey(other.name))]);
+    const value = await text({
+      ...renamePrompt(candidate.name, displayPath(path.dirname(candidate.sourcePath), homeDir), defaultRenameName(candidate, group)),
+      validate: (name) => {
+        const error = pendingNameError(name, taken);
+        if (error) return error;
+        try { assertNameAvailable(library, "item", name ?? ""); return undefined; }
+        catch { return "That name is already used by a saved or selected resource; choose another."; }
+      },
+    });
+    return isCancel(value) ? undefined : value.trim();
+  };
+  const rename = (candidate: ResourceCandidate, name: string) => {
+    pending = pending.map((entry) => (entry.id === candidate.id ? { ...entry, name } : entry));
+  };
+
+  for (const group of findSelectionConflicts(pending)) {
+    const choice = await select<string>({
+      message: `${group.length} selected resources share the name ${group[0]!.name}; choose what to save`,
+      options: [
+        ...group.map((candidate) => ({ value: `keep:${candidate.id}`, label: `Keep ${labels.get(candidate.id) ?? candidate.name}` })),
+        { value: "rename", label: "Keep all and rename the others" },
+        { value: "back", label: "Go back to the list" },
+      ],
+    });
+    if (isCancel(choice)) return "cancel";
+    if (choice === "back") return "back";
+    if (choice === "rename") {
+      for (const candidate of group.slice(1)) {
+        const name = await askNewName(pending.find((entry) => entry.id === candidate.id)!, group);
+        if (name === undefined) return "cancel";
+        rename(candidate, name);
+      }
+    } else {
+      const kept = choice.slice("keep:".length);
+      const dropped = new Set(group.filter((candidate) => candidate.id !== kept).map((candidate) => candidate.id));
+      pending = pending.filter((candidate) => !dropped.has(candidate.id));
+    }
+  }
+
+  for (const candidate of [...pending]) {
+    if (!libraryKeys.has(nameKey(candidate.name))) continue;
+    const choice = await select<"skip" | "rename" | "back">({
+      message: `${candidate.name} \u2014 ${displayPath(path.dirname(candidate.sourcePath), homeDir)}: a saved resource already uses this name. To update the saved copy, use Refresh in copi manage.`,
+      options: [
+        { value: "skip", label: "Skip (keep the saved copy)" },
+        { value: "rename", label: "Rename" },
+        { value: "back", label: "Go back to the list" },
+      ],
+    });
+    if (isCancel(choice)) return "cancel";
+    if (choice === "back") return "back";
+    if (choice === "skip") {
+      pending = pending.filter((entry) => entry.id !== candidate.id);
+      continue;
+    }
+    const name = await askNewName(candidate);
+    if (name === undefined) return "cancel";
+    rename(candidate, name);
+  }
+  return pending;
+}
+
+/** Quote for POSIX shells only when needed (single quotes, embedded quotes escaped as '\\''). */
+function shellQuote(value: string): string {
+  if (value === "<group>" || /^[A-Za-z0-9_.\/@%+=:,-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<void> {
   if (await handleNameConflicts(libraryDir)) return;
   const initial = await loadCatalog(libraryDir);
   assertModernCatalog(initial);
   assertNoNameConflicts(initial);
   intro("copi setup");
-  const scopeOptions: Array<{ value: "home" | "project"; label: string; hint: string }> = [];
-  if (roots.homeDir) {
-    scopeOptions.push({
-      value: "home",
-      label: `Search entire HOME: ${roots.homeDir}`,
-      hint: `Includes supported Pi resources under HOME and Pi agent directory ${roots.agentDir}`,
-    });
-  }
-  scopeOptions.push({ value: "project", label: `Search current project: ${roots.projectDir}`, hint: "Supported Pi resources and instruction files in this project" });
-  const selectedScopes = await autocompleteMultiselect({
+  type LocationChoice = "home" | "project" | "both" | "cancel";
+  const homeDir = roots.homeDir;
+  const projectLabel = displayPath(roots.projectDir, homeDir);
+  const homeBase = homeDir.length > 1 && homeDir.endsWith(path.sep) ? homeDir.slice(0, -1) : homeDir;
+  const projectIsHome = Boolean(homeDir) && roots.projectDir === homeBase;
+  const projectInsideHome = Boolean(homeDir) && !projectIsHome && roots.projectDir.startsWith(homeBase + path.sep);
+  const locationOptions: Array<{ value: LocationChoice; label: string }> = [];
+  if (homeDir) locationOptions.push({ value: "home", label: "HOME and Pi agent directory \u2014 ~ (can take a minute or more)" });
+  if (!projectIsHome) locationOptions.push({ value: "project", label: `This project only \u2014 ${projectLabel} (fast)` });
+  if (homeDir && !projectIsHome && !projectInsideHome) locationOptions.push({ value: "both", label: "Both" });
+  locationOptions.push({ value: "cancel", label: "Cancel" });
+  const choice = await select<LocationChoice>({
     message: "Choose the locations copi may inspect",
-    options: scopeOptions,
-    required: false,
-    placeholder: "Search locations...",
+    options: locationOptions,
+    initialValue: locationOptions[0]!.value,
   });
-  if (isCancel(selectedScopes)) {
+  if (isCancel(choice) || choice === "cancel") {
     cancel("Setup cancelled.");
     return;
   }
-  const scopes: SearchScopes = { home: selectedScopes.includes("home"), project: selectedScopes.includes("project") };
-  const searchOptions = buildSearchOptions(roots, scopes);
-  if (!searchOptions) {
-    outro("No locations selected; nothing was searched or saved.");
-    return;
-  }
+  const scopes: SearchScopes = { home: choice === "home" || choice === "both", project: choice === "project" || choice === "both" };
+  const searchOptions = buildSearchOptions(roots, scopes)!; // every non-cancel choice enables at least one scope
   note(
     [
-      `HOME: ${scopes.home ? roots.homeDir : "not selected"}`,
-      `Pi agent directory: ${scopes.home ? roots.agentDir : "not selected"}`,
-      `Project: ${scopes.project ? roots.projectDir : "not selected"}`,
+      `HOME: ${scopes.home ? displayPath(roots.homeDir, homeDir) : "not selected"}`,
+      `Pi agent directory: ${scopes.home ? displayPath(roots.agentDir, homeDir) : "not selected"}`,
+      `Project: ${scopes.project ? projectLabel : "not selected"}`,
       "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git.",
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
@@ -350,27 +454,44 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     throw error;
   }
   progress.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
-  showWarnings(discovery.warnings, "Search warnings");
-  if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.join("\n"), "Excluded paths");
+  showSearchWarnings(discovery.warnings, roots.homeDir);
+  if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.map((excluded) => displayPath(excluded, homeDir)).join("\n"), "Excluded paths");
   if (discovery.candidates.length === 0) {
     outro("No supported resources were found.");
     return;
   }
-  const selectedIds = await autocompleteMultiselect({
-    message: "Select resources to review and save as copied snapshots",
-    options: discovery.candidates.map((candidate) => ({
-      value: candidate.id,
-      label: `[${candidate.kind}] ${candidate.name}`,
-      hint: `${candidate.scope} · ${candidate.sourcePath} · ${candidate.destination.kind === "global-only" ? "save only" : candidate.destination.path}`,
-    })),
-    required: false,
-    placeholder: "Filter resources...",
-  });
-  if (isCancel(selectedIds)) {
-    cancel("Setup cancelled; no resources were saved.");
-    return;
+  const sortedCandidates = sortCandidates(discovery.candidates);
+  const candidateStats = await gatherCandidateStats(sortedCandidates);
+  const savedNames = new Set(initial.items.map((item) => nameKey(item.name)));
+  const candidateLabelMap = candidateLabels(sortedCandidates, homeDir, (candidate) => savedNames.has(nameKey(candidate.name)), process.stdout.columns);
+  let previousSelection: string[] = [];
+  let resolvedCandidates: ResourceCandidate[];
+  while (true) {
+    const selectedIds = await autocompleteMultiselect({
+      message: "Select resources to review and save as copied snapshots",
+      options: sortedCandidates.map((candidate) => {
+        const label = candidateLabelMap.get(candidate.id)!;
+        return { value: candidate.id, label, hint: candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, process.stdout.columns, label.length) };
+      }),
+      required: false,
+      initialValues: previousSelection,
+      placeholder: "Filter resources...",
+    });
+    if (isCancel(selectedIds)) {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    previousSelection = selectedIds;
+    const outcome = await resolveSelectedNames(sortedCandidates.filter((candidate) => selectedIds.includes(candidate.id)), initial, candidateLabelMap, homeDir);
+    if (outcome === "cancel") {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    if (outcome === "back") continue;
+    resolvedCandidates = outcome;
+    break;
   }
-  if (selectedIds.length === 0) {
+  if (resolvedCandidates.length === 0) {
     outro("No resources selected; nothing was saved.");
     return;
   }
@@ -378,7 +499,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const catalog = await loadCatalog(libraryDir);
   assertModernCatalog(catalog);
   if (catalog.groups.length === 0) {
-    const name = await askForGroupName("Create the first resource group");
+    const name = await askForGroupName("Create the first resource group \u2014 used later with: copi apply <group>", "e.g. game-review");
     if (name === undefined) {
       cancel("Setup cancelled; no resources were saved.");
       return;
@@ -401,12 +522,52 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     }
   }
 
-  const selectedCandidates = discovery.candidates.filter((candidate) => selectedIds.includes(candidate.id));
+  // Keep discovery order for review; renamed copies replace their originals by id.
+  const resolvedById = new Map(resolvedCandidates.map((candidate) => [candidate.id, candidate]));
+  const selectedCandidates = discovery.candidates.flatMap((candidate) => resolvedById.get(candidate.id) ?? []);
   const approvedCandidates: Array<{ review: CandidateReview; groupIds: string[]; approvedSensitivePaths: string[] }> = [];
-  for (const candidate of selectedCandidates) {
+  // Decide the assignment mode once; "bulk" assigns every approved resource to bulkGroupIds.
+  let bulkGroupIds: string[] | undefined;
+  const count = selectedCandidates.length;
+  const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
+  let bulk = count === 1;
+  if (count >= 2) {
+    const mode = await select<"all" | "each">({
+      message: "How should these resources be grouped?",
+      options: [
+        { value: "all", label: onlyGroup ? `Put all ${count} resources in "${onlyGroup.name}"` : `Put all ${count} resources in the same groups` },
+        { value: "each", label: "Choose groups for each resource" },
+      ],
+      initialValue: "all",
+    });
+    if (isCancel(mode)) {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    bulk = mode === "all";
+  }
+  if (bulk) {
+    if (onlyGroup) bulkGroupIds = [onlyGroup.id];
+    else {
+      const chosen = await autocompleteMultiselect({
+        message: count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`,
+        options: groupOptions(catalog.groups),
+        required: true,
+        placeholder: "Filter groups...",
+      });
+      if (isCancel(chosen)) {
+        cancel("Setup cancelled; no resources were saved.");
+        return;
+      }
+      bulkGroupIds = chosen;
+    }
+  }
+  for (const [index, candidate] of selectedCandidates.entries()) {
     const review = await prepareCandidateForReview(candidate);
-    note(review.preview.length > 0 ? review.preview.join("\n\n") : "No previewable files.", `Masked preview: ${review.candidate.name}`);
-    showWarnings(review.inspection.warnings, `${review.candidate.name} inspection warnings`);
+    const previewTitle = `Masked preview (${index + 1}/${count}): ${review.candidate.name} \u2014 ${displayPath(path.dirname(candidate.sourcePath), homeDir)}`;
+    note(review.preview.length > 0 ? review.preview.join("\n\n") : "No previewable files.", previewTitle);
+    // The heuristic caveat is stated once in the scope note and the summary; per-resource it would only repeat.
+    showWarnings(review.inspection.warnings.filter((warning) => warning.code !== "secret-detection-limited"), `${review.candidate.name} inspection warnings`);
     if (review.inspection.excludedPaths.length > 0) {
       note(review.inspection.excludedPaths.join("\n"), `${review.candidate.name} excluded paths`);
     }
@@ -414,7 +575,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     const approvedSensitivePaths: string[] = [];
     for (const relativePath of review.inspection.sensitivePaths) {
       const approval = await confirm({
-        message: `Save suspected sensitive file ${relativePath} from ${review.candidate.name}? Detection is heuristic; the file content remains masked in previews.`,
+        message: `Save suspected sensitive file ${relativePath} from ${review.candidate.name}? Detection is heuristic; the file content remains masked in previews. No = ${review.candidate.name} will not be saved at all.`,
         initialValue: false,
       });
       if (isCancel(approval)) {
@@ -428,9 +589,15 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       log.warn(safeDisplay(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`));
       continue;
     }
+    if (bulkGroupIds) {
+      approvedCandidates.push({ review, groupIds: bulkGroupIds, approvedSensitivePaths });
+      continue;
+    }
+    const pendingCounts = new Map<string, number>();
+    for (const approved of approvedCandidates) for (const id of approved.groupIds) pendingCounts.set(id, (pendingCounts.get(id) ?? 0) + 1);
     const groupIds = await autocompleteMultiselect({
       message: `Assign ${review.candidate.name} to one or more groups`,
-      options: groupOptions(catalog.groups),
+      options: groupOptions(catalog.groups, pendingCounts),
       required: true,
       placeholder: "Filter groups...",
     });
@@ -449,9 +616,10 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? "Unavailable group").join(", ");
     return `${review.candidate.name} → ${names}`;
   }).join("\n");
-  note(summary, "Resources ready to copy");
+  note(`${summary}\n\nSecret detection is heuristic and cannot guarantee completeness.`, "Resources ready to copy");
+  const libraryLabel = displayPath(libraryDir, homeDir);
   const save = await confirm({
-    message: `Save ${approvedCandidates.length} copied resource(s) in ${libraryDir}? Original files will not be changed.`,
+    message: `Save ${approvedCandidates.length} copied resource(s) in ${libraryLabel}? Original files will not be changed.`,
     initialValue: false,
   });
   if (isCancel(save) || !save) {
@@ -474,7 +642,10 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
     await saveReviewedCandidate(libraryDir, review, groupIds, approvedSensitivePaths, true);
   }
-  outro(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryDir}.`);
+  const usedGroupIds = new Set(approvedCandidates.flatMap(({ groupIds }) => groupIds));
+  const usedGroups = catalog.groups.filter((group) => usedGroupIds.has(group.id)).map((group) => group.name);
+  log.info(safeDisplay(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryLabel} (group: ${usedGroups.join(", ")}).`));
+  outro(`Next: copi apply ${shellQuote(usedGroups[0] ?? "<group>")} <project> --dry-run   (edit or rename: copi manage)`);
 }
 
 export async function runGroupManager(libraryDir: string): Promise<void> {

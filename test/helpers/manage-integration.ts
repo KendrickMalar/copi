@@ -73,10 +73,10 @@ export const at = (wait: string, text = "y\r"): Step => ({ wait, text });
 export const finish = choose("Manage saved resources", 4);
 export const resource = (index: number): Step[] => [choose("Manage saved resources"), choose("Select saved resource"), choose("Resource action", index)];
 export function setupSteps(): Step[] {
-  return [at("Choose the locations copi may inspect", `${down} \r`), at("Authorize copi to search only", "y\r"),
+  return [at("Choose the locations copi may inspect", `${down}\r`), at("Authorize copi to search only", "y\r"),
     at("Select resources to review", "\t\r"), at("Create the first resource group", "First bundle\r"),
     at("Save suspected sensitive file second.md", "y\r"), at("Save suspected sensitive file SKILL.md", "y\r"),
-    at("Assign original to one or more groups", "\t\r"), at("Save 1 copied resource(s)", "y\r")];
+    at("Save 1 copied resource(s)", "y\r")];
 }
 export function addGroupSteps(name: string, index: number): Step[] {
   return [choose("Manage saved resources", 1), choose("Manage saved groups"), at("New group name", `${name}\r`),
@@ -113,7 +113,7 @@ export async function registered(b: IntegrationBox) {
   await sourceFiles(b);
   const before = await tree(b.source);
   const run = await interactive(b, "setup", "setup", setupSteps());
-  assert.match(plain(run.output), /Masked preview: original/);
+  assert.match(plain(run.output), /Masked preview \(1\/\d+\): original/);
   assert.match(plain(run.output), /Search scope and exclusions/);
   assert.ok(!run.output.includes("sk_live_setupFirst12345678"));
   assert.ok(!run.output.includes("setupSecond12345678"));

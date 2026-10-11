@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
+import { displayPath } from "../src/setup-display.ts";
 import { addGroupSteps, at, choose, evidence, finish, hash, initialFiles, integrationBox, interactive, plain, registered,
   resource, runCli, setupSteps, sourceFiles, tree, type IntegrationBox, type Step } from "./helpers/manage-integration.ts";
 
@@ -170,11 +171,45 @@ for (const stage of ["second-secret-No", "final-No", "stale-catalog", "stale-con
   }
 });
 
+test("setup location select: Enter right after start chooses HOME and reaches the search authorization", async () => {
+  const b = await integrationBox();
+  const run = plain((await interactive(b, "location-default", "setup", [at("Choose the locations copi may inspect", "\r"), at("Authorize copi to search only", "\r")])).output);
+  assert.ok(run.includes("Choose the locations copi may inspect"));
+  assert.ok(run.includes("Authorize copi to search only"));
+  assert.match(run, /Search not authorized/);
+  assert.ok(!run.includes("No locations selected"));
+  // The scope note proves HOME (not project-only) was chosen, and prints before the Authorize prompt.
+  assert.match(run, /HOME: ~(?![\w/])/);
+  assert.ok(!run.includes(`HOME: ${b.home}`), "absolute HOME path is not printed");
+  assert.ok(run.includes(`Pi agent directory: ${displayPath(b.agent, b.home)}`));
+  assert.ok(run.includes("Project: not selected"));
+  assert.ok(run.indexOf("Project: not selected") < run.indexOf("Authorize copi to search only"));
+});
+
+for (const [name, project, labels] of [
+  ["project outside HOME", (b: IntegrationBox) => b.cwd, { project: true, both: true }],
+  ["project nested in HOME", (b: IntegrationBox) => path.join(b.home, "work"), { project: true, both: false }],
+  ["project equal to HOME", (b: IntegrationBox) => b.home, { project: false, both: false }],
+] as const) test(`setup location options: ${name}; Cancel (last option) searches and saves nothing`, async () => {
+  const b = await integrationBox(); const cwd = project(b); await mkdir(cwd, { recursive: true });
+  const downs = "\u001b[B".repeat(1 + Number(labels.project) + Number(labels.both));
+  const run = plain((await interactive({ ...b, cwd }, "location-options", "setup", [at("Choose the locations copi may inspect", `${downs}\r`)])).output);
+  assert.ok(run.includes("HOME and Pi agent directory \u2014 ~ (can take a minute or more)"));
+  assert.equal(run.includes("This project only \u2014 "), labels.project);
+  assert.equal(/\bBoth\b/.test(run), labels.both);
+  assert.ok(run.includes("Cancel"));
+  assert.ok(run.includes("Setup cancelled."));
+  assert.ok(!run.includes("Authorize copi to search only") && !run.includes("Search scope and exclusions") && !run.includes("Search complete"));
+  await assert.rejects(lstat(b.library), { code: "ENOENT" });
+});
+
 test("setup and group prompts show the Tab key hint and a search progress indicator", async () => {
   const b = await integrationBox();
   await sourceFiles(b);
   const setup = plain((await interactive(b, "key-hint-setup", "setup", setupSteps())).output);
-  for (const prompt of ["Choose the locations copi may inspect", "Select resources to review and save as copied snapshots", "Assign original to one or more groups"]) {
+  assert.ok(setup.includes("Choose the locations copi may inspect"));
+  assert.ok(!setup.includes("Choose the locations copi may inspect (Tab"));
+  for (const prompt of ["Select resources to review and save as copied snapshots"]) {
     assert.ok(setup.includes(`${prompt} (Tab: select, Enter: confirm)`), prompt);
   }
   // The spinner draws its first frame after 80 ms; this tiny fixture finishes sooner, so only the stop line is observable.
