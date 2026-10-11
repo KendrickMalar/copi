@@ -76,9 +76,9 @@ test("add refuses suspected secrets, settings files, symlinks, name conflicts an
   assert.equal(result.status, 1);
   const reasons = Object.fromEntries(result.json.results.map((r: { path: string; status: string; reason?: string }) => [path.basename(r.path), `${r.status}: ${r.reason ?? ""}`]));
   assert.match(reasons.leaky, /^refused: suspected sensitive content in SKILL\.md/);
-  assert.match(reasons["settings.json"], /^refused: settings files are registered with copi setup/);
+  assert.match(reasons["settings.json"], /^refused: settings and credential files are registered with copi setup/);
   assert.match(reasons["notes.txt"], /^refused: cannot tell the kind/);
-  assert.match(reasons["linked.md"], /^refused: symbolic links are not added/);
+  assert.match(reasons["linked.md"], /^refused: symbolic links \(in the path or its parent directories\) are not followed/);
   assert.match(reasons.missing, /^refused: path does not exist/);
   assert.match(reasons["ok.md"], /^added/);
   assert.ok(!result.stdout.includes(secret));
@@ -98,4 +98,55 @@ test("add --dry-run reports without creating the library", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /would add: dry\.md \[subagent\] → g/);
   await assert.rejects(readFile(path.join(b.library, "catalog.json")), { code: "ENOENT" });
+});
+
+test("add refuses excluded ancestors, case variants of settings files, non-Markdown kinds and credential files inside skills", async (t) => {
+  const b = await box(t);
+  await put(path.join(b.project, "auth", "notes.md"), "# notes\n");
+  await put(path.join(b.project, "Settings.json"), "{}\n");
+  await put(path.join(b.project, ".mcp.json"), "{}\n");
+  await put(path.join(b.project, "plain.txt"), "text\n");
+  await put(path.join(b.project, "skills", "keyed", "SKILL.md"), "# keyed\n");
+  await put(path.join(b.project, "skills", "keyed", "ssh", "id_ed25519"), "not a real key\n");
+  await put(path.join(b.project, "skills", "configured", "SKILL.md"), "# configured\n");
+  await put(path.join(b.project, "skills", "configured", "MCP.json"), "{}\n");
+  await mkdir(path.join(b.project, "skills", "empty"), { recursive: true });
+  const result = add(b, ["auth/notes.md", "Settings.json", ".mcp.json", "plain.txt", "skills/keyed", "skills/configured", "skills/empty", "--kind", "instruction", "--group", "g", "--json"]);
+  assert.equal(result.status, 1);
+  const reasons = result.json.results.map((r: { status: string; reason: string }) => `${r.status}: ${r.reason}`);
+  assert.match(reasons[0], /refused: this path is in an excluded location/);
+  assert.match(reasons[1], /refused: settings and credential files/);
+  assert.match(reasons[2], /refused: settings and credential files/);
+  assert.match(reasons[3], /refused: an instruction must be a Markdown/);
+  for (const reason of reasons.slice(4)) assert.match(reason, /^refused: an instruction must be a regular file/);
+  const asSkills = add(b, ["skills/keyed", "skills/configured", "skills/empty", "--kind", "skill", "--group", "g", "--json"]);
+  assert.equal(asSkills.status, 1);
+  const skillReasons = asSkills.json.results.map((r: { reason: string }) => r.reason);
+  assert.match(skillReasons[0], /id_ed25519 looks like a settings or credential file/);
+  assert.match(skillReasons[1], /MCP\.json looks like a settings or credential file/);
+  assert.match(skillReasons[2], /must be a directory containing a regular SKILL\.md/);
+  await assert.rejects(readFile(path.join(b.library, "catalog.json")), { code: "ENOENT" }, "nothing was saved, not even the group");
+});
+
+test("add reports symlinks inside skills and symlinked parents per path, and still saves the other paths", async (t) => {
+  const b = await box(t);
+  await put(path.join(b.project, "skills", "linky", "SKILL.md"), "# linky\n");
+  await put(path.join(b.root, "elsewhere.md"), "outside\n");
+  await symlink(path.join(b.root, "elsewhere.md"), path.join(b.project, "skills", "linky", "extra.md"));
+  await put(path.join(b.root, "real-agents", "far.md"), "---\nname: far\n---\n");
+  await symlink(path.join(b.root, "real-agents"), path.join(b.project, "agents"));
+  await put(path.join(b.project, "AGENTS.md"), "# rules\n");
+  const result = add(b, ["skills/linky", "agents/far.md", "AGENTS.md", "--group", "g", "--json"]);
+  assert.equal(result.status, 1);
+  const outcome = Object.fromEntries(result.json.results.map((r: { path: string; status: string; reason?: string }) => [path.basename(r.path), `${r.status}: ${r.reason ?? ""}`]));
+  assert.match(outcome.linky, /^refused: extra\.md is a symbolic link/);
+  assert.match(outcome["far.md"], /^refused: symbolic links \(in the path or its parent directories\)/);
+  assert.match(outcome["AGENTS.md"], /^added/);
+  assert.deepEqual((await loadCatalog(b.library)).items.map((item) => item.name), ["AGENTS.md"]);
+});
+
+test("parseAddArgs rejects empty names and repeated options and supports --", () => {
+  assert.throws(() => parseAddArgs(["a", "--group", "g", "--name", " "]), /--name must not be empty/);
+  assert.throws(() => parseAddArgs(["a", "--group", "g", "--group", "h"]), /--group was given twice/);
+  assert.deepEqual(parseAddArgs(["--group", "g", "--", "--weird-name.md"]).paths, ["--weird-name.md"]);
 });

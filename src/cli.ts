@@ -83,8 +83,10 @@ main integration and publishing require separate approval.
 add saves the given paths into the named group (created if missing) without prompts, so
 scripts and AI agents can register resources. It only reads the paths you name. Each path
 is inspected first: anything with suspected sensitive content, settings files (settings.json,
-mcp.json, models.json, keybindings.json), symbolic links, excluded paths and display-name
-conflicts are refused and left for copi setup, where a person reviews them. Kind is detected
+mcp.json, .mcp.json, models.json, keybindings.json) and credential files (SSH keys, *.pem,
+.netrc ...) - also inside a skill directory - symbolic links anywhere in the path, paths
+under excluded folders or inside the library, and display-name conflicts are refused per
+path and left for copi setup, where a person reviews them. Kind is detected
 (a directory with SKILL.md is a skill, agents/*.md a subagent, AGENTS.md/CLAUDE.md/SYSTEM.md an
 instruction) or given with --kind skill|subagent|instruction. --dry-run reports without saving;
 --json prints machine-readable results. Exit status is 1 if any path was refused. Secret
@@ -165,8 +167,8 @@ export async function main(
       process.stdout.write(`${JSON.stringify({ group: options.group, dryRun: options.dryRun, results: outcomes }, null, 2)}\n`);
     } else {
       for (const outcome of outcomes) {
-        const line = outcome.status === "refused"
-          ? `refused: ${outcome.path} \u2014 ${outcome.reason}`
+        const line = outcome.status === "refused" || outcome.status === "error"
+          ? `${outcome.status}: ${outcome.path} \u2014 ${outcome.reason}`
           : `${outcome.status === "added" ? "added" : "would add"}: ${outcome.name} [${outcome.kind}] \u2192 ${options.group}`;
         process.stdout.write(`${safeDisplay(line)}\n`);
       }
