@@ -381,3 +381,38 @@ test("does not warn for configured files that do not exist, but warns for dangli
   const dangling = await discoverResources({ homeDir, agentDir, projectDir });
   assert.equal(dangling.warnings.filter((warning) => warning.code === "resource-outside-root").length, 1);
 });
+
+test("reports HOME search progress per top-level directory, skipping excluded and symlinked entries", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-progress-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  await put(homeDir, "Code/app/AGENTS.md", "# app\n");
+  await put(homeDir, "Documents/notes.txt", "notes\n");
+  await put(agentDir, "agents/a.md", "---\nname: a\n---\n");
+  await put(homeDir, "node_modules/x/index.js", "excluded\n");
+  await put(homeDir, "top.txt", "file at top level\n");
+  await mkdir(path.join(root, "outside"));
+  await symlink(path.join(root, "outside"), path.join(homeDir, "linked"));
+
+  const events: Array<{ done: number; total: number; current?: string }> = [];
+  await discoverResources({ homeDir, agentDir, projectDir: homeDir, scopes: { home: true, project: false } }, (event) => events.push({ ...event }));
+
+  const totals = new Set(events.map((event) => event.total));
+  assert.deepEqual([...totals], [3]);
+  assert.deepEqual(events[0], { done: 0, total: 3 });
+  assert.deepEqual(events.at(-1), { done: 3, total: 3 });
+  const visited = events.filter((event) => event.current !== undefined).map((event) => path.basename(event.current!));
+  assert.deepEqual(visited.sort(), [".pi", "Code", "Documents"]);
+  for (let index = 1; index < events.length; index += 1) assert.ok(events[index]!.done >= events[index - 1]!.done);
+});
+
+test("does not report progress when HOME is not searched", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-progress-project-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const projectDir = path.join(root, "project");
+  await put(projectDir, "AGENTS.md", "# project\n");
+  const events: unknown[] = [];
+  await discoverResources({ homeDir: path.join(root, "home"), agentDir: path.join(root, "home/.pi/agent"), projectDir, scopes: { home: false, project: true } }, (event) => events.push(event));
+  assert.deepEqual(events, []);
+});
