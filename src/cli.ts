@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { listSnapshots, loadCatalog } from "./catalog.ts";
 import { printGroups, printItems, runApplyDryRun, runApplyWizard, runGroupManager, runSetup, safeDisplay } from "./wizard.ts";
+import { parseAddArgs, runAdd } from "./cli-add.ts";
 import { runManage } from "./manage.ts";
 import { runMigrateCommand, type MigrationCommandRuntime } from "./migrate.ts";
 
@@ -15,6 +16,7 @@ Usage:
   copi manage
   copi groups
   copi list
+  copi add <path>... --group <name> [--name <display name>] [--kind <kind>] [--dry-run] [--json]
   copi apply <group> [target]
   copi apply <group> [target] --dry-run
   copi migrate [--dry-run]
@@ -26,6 +28,7 @@ Commands:
   manage             Select saved copies by name; masked view, edit, rename, refresh, groups, apply
   groups             Manage groups interactively; without a TTY, list groups only
   list               List saved snapshots without modifying the library
+  add <path>...      Save explicit paths without a TTY (for scripts and AI agents); see below
   apply <group>      Review and apply one group to the current directory or target
   apply --dry-run    Show the masked plan without changing project files
   migrate            Review and migrate an eligible legacy library (TTY required)
@@ -76,6 +79,16 @@ items. Do not use an older copi binary while resolution artifacts remain. v4 jou
 the start inventory required for this procedure and remain on the existing hold-stop path.
 A migration backup is not general history or a restore feature. Migration, items deletion,
 main integration and publishing require separate approval.
+
+add saves the given paths into the named group (created if missing) without prompts, so
+scripts and AI agents can register resources. It only reads the paths you name. Each path
+is inspected first: anything with suspected sensitive content, settings files (settings.json,
+mcp.json, models.json, keybindings.json), symbolic links, excluded paths and display-name
+conflicts are refused and left for copi setup, where a person reviews them. Kind is detected
+(a directory with SKILL.md is a skill, agents/*.md a subagent, AGENTS.md/CLAUDE.md/SYSTEM.md an
+instruction) or given with --kind skill|subagent|instruction. --dry-run reports without saving;
+--json prints machine-readable results. Exit status is 1 if any path was refused. Secret
+detection is heuristic: a secret it misses is saved like any other content.
 
 Interactive changes require a TTY. Setup searches only locations explicitly selected
 and confirmed in the wizard. Directories named auth are excluded entirely; copied
@@ -144,6 +157,21 @@ export async function main(
     if (rest.length > 0) throw new Error("list does not accept positional arguments.");
     printItems(await listSnapshots(libraryDir));
     return 0;
+  }
+  if (command === "add") {
+    const options = parseAddArgs(rest);
+    const { outcomes, exitCode } = await runAdd(libraryDir, cwd, options);
+    if (options.json) {
+      process.stdout.write(`${JSON.stringify({ group: options.group, dryRun: options.dryRun, results: outcomes }, null, 2)}\n`);
+    } else {
+      for (const outcome of outcomes) {
+        const line = outcome.status === "refused"
+          ? `refused: ${outcome.path} \u2014 ${outcome.reason}`
+          : `${outcome.status === "added" ? "added" : "would add"}: ${outcome.name} [${outcome.kind}] \u2192 ${options.group}`;
+        process.stdout.write(`${safeDisplay(line)}\n`);
+      }
+    }
+    return exitCode;
   }
   if (command === "apply") {
     const dryRun = rest.includes("--dry-run");
