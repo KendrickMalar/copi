@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, readFile, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
@@ -177,6 +177,28 @@ test("setup location select: Enter right after start chooses HOME and reaches th
   assert.ok(run.includes("Authorize copi to search only"));
   assert.match(run, /Search not authorized/);
   assert.ok(!run.includes("No locations selected"));
+  // The scope note proves HOME (not project-only) was chosen, and prints before the Authorize prompt.
+  assert.ok(run.includes(`HOME: ${b.home}`));
+  assert.ok(run.includes(`Pi agent directory: ${b.agent}`));
+  assert.ok(run.includes("Project: not selected"));
+  assert.ok(run.indexOf("Project: not selected") < run.indexOf("Authorize copi to search only"));
+});
+
+for (const [name, project, labels] of [
+  ["project outside HOME", (b: IntegrationBox) => b.cwd, { project: true, both: true }],
+  ["project nested in HOME", (b: IntegrationBox) => path.join(b.home, "work"), { project: true, both: false }],
+  ["project equal to HOME", (b: IntegrationBox) => b.home, { project: false, both: false }],
+] as const) test(`setup location options: ${name}; Cancel (last option) searches and saves nothing`, async () => {
+  const b = await integrationBox(); const cwd = project(b); await mkdir(cwd, { recursive: true });
+  const downs = "\u001b[B".repeat(1 + Number(labels.project) + Number(labels.both));
+  const run = plain((await interactive({ ...b, cwd }, "location-options", "setup", [at("Choose the locations copi may inspect", `${downs}\r`)])).output);
+  assert.ok(run.includes("HOME and Pi agent directory \u2014 ~ (can take a minute or more)"));
+  assert.equal(run.includes("This project only \u2014 "), labels.project);
+  assert.equal(/\bBoth\b/.test(run), labels.both);
+  assert.ok(run.includes("Cancel"));
+  assert.ok(run.includes("Setup cancelled."));
+  assert.ok(!run.includes("Authorize copi to search only") && !run.includes("Search scope and exclusions") && !run.includes("Search complete"));
+  await assert.rejects(lstat(b.library), { code: "ENOENT" });
 });
 
 test("setup and group prompts show the Tab key hint and a search progress indicator", async () => {

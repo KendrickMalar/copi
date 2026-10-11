@@ -306,8 +306,9 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   type LocationChoice = "home" | "project" | "both" | "cancel";
   const homeDir = roots.homeDir;
   const projectLabel = displayPath(roots.projectDir, homeDir);
-  const projectIsHome = Boolean(homeDir) && roots.projectDir === homeDir;
-  const projectInsideHome = Boolean(homeDir) && !projectIsHome && displayPath(roots.projectDir, homeDir) !== roots.projectDir;
+  const homeBase = homeDir.length > 1 && homeDir.endsWith(path.sep) ? homeDir.slice(0, -1) : homeDir;
+  const projectIsHome = Boolean(homeDir) && roots.projectDir === homeBase;
+  const projectInsideHome = Boolean(homeDir) && !projectIsHome && roots.projectDir.startsWith(homeBase + path.sep);
   const locationOptions: Array<{ value: LocationChoice; label: string }> = [];
   if (homeDir) locationOptions.push({ value: "home", label: "HOME and Pi agent directory \u2014 ~ (can take a minute or more)" });
   if (!projectIsHome) locationOptions.push({ value: "project", label: `This project only \u2014 ${projectLabel} (fast)` });
