@@ -6,6 +6,8 @@ import type { DiscoveryResult, DiscoveryWarning, ResourceCandidate, ResourceDest
 export interface DiscoveryScopes {
   home: boolean;
   project: boolean;
+  /** Only the Pi agent directories under HOME (`~/.pi/agent`, `~/.pi/agent-*`, `~/.pi/agent_*`, `~/.agents`); ignored when `home` is set. */
+  piDirs?: boolean;
 }
 
 export interface DiscoveryOptions {
@@ -46,11 +48,46 @@ function isWithin(root: string, target: string): boolean {
   return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
 }
 
-function shouldExclude(relativePath: string): boolean {
+export function shouldExclude(relativePath: string): boolean {
   return relativePath.split(path.sep).some((part) => {
     const lower = part.toLowerCase();
     return excludedNames.has(lower) || lower === "auth.json" || lower === "mcp-auth.json" || lower === "oauth.json" || lower.startsWith(".env");
   });
+}
+
+/** Git worktrees and similar checkout copies duplicate their main repository, so whole-HOME searches skip them. */
+export function isWorktreeCopy(relativePath: string): boolean {
+  const parts = relativePath.split(path.sep);
+  return parts.some((part, index) => part === ".worktrees" || part === ".treehouse"
+    || (part === "worktrees" && (parts[index - 1] === ".claude" || (parts[index - 1] === "superpowers" && parts[index - 2] === ".config"))));
+}
+
+const piProfilePattern = /^agent([-_].+)?$/;
+
+/**
+ * The Pi agent directories searched by the `piDirs` scope, sorted. Symlinks are never followed: a symlinked
+ * `~/.pi`, profile directory or `~/.agents` is reported in `symlinks` instead (callers warn about it).
+ */
+export async function piAgentDirectories(homeDir: string): Promise<{ directories: string[]; symlinks: string[] }> {
+  const directories: string[] = [];
+  const symlinks: string[] = [];
+  const kind = (p: string) => lstat(p).then((stat) => stat.isSymbolicLink() ? "link" : stat.isDirectory() ? "dir" : "other").catch(() => "missing");
+  const piDir = path.join(homeDir, ".pi");
+  const piKind = await kind(piDir);
+  if (piKind === "link") symlinks.push(piDir);
+  if (piKind === "dir") {
+    for (const entry of await readdir(piDir, { withFileTypes: true }).catch(() => [])) {
+      if (!piProfilePattern.test(entry.name)) continue;
+      if (entry.isSymbolicLink()) symlinks.push(path.join(piDir, entry.name));
+      else if (entry.isDirectory()) directories.push(path.join(piDir, entry.name));
+    }
+  }
+  const shared = path.join(homeDir, ".agents");
+  const sharedKind = await kind(shared);
+  if (sharedKind === "link") symlinks.push(shared);
+  if (sharedKind === "dir") directories.push(shared);
+  const byPath = (left: string, right: string) => left.localeCompare(right);
+  return { directories: directories.sort(byPath), symlinks: symlinks.sort(byPath) };
 }
 
 function displayRelative(root: string, target: string): string {
@@ -159,16 +196,17 @@ export interface DiscoveryProgress {
 
 export async function discoverResources(options: DiscoveryOptions, onProgress?: (progress: DiscoveryProgress) => void): Promise<DiscoveryResult> {
   const scopes = options.scopes ?? inferSearchScopes(options);
-  if (!scopes.home && !scopes.project) return { candidates: [], warnings: [], excludedPaths: [] };
+  const piOnly = Boolean(scopes.piDirs) && !scopes.home;
+  if (!scopes.home && !scopes.project && !piOnly) return { candidates: [], warnings: [], excludedPaths: [] };
   const warnings: DiscoveryWarning[] = [];
   const excludedPaths = new Set<string>();
   const candidates: ResourceCandidate[] = [];
   const candidateKeys = new Set<string>();
-  const home = scopes.home ? await canonicalDirectory(options.homeDir) : undefined;
-  const agent = scopes.home ? await canonicalDirectory(options.agentDir) : undefined;
+  const home = scopes.home || piOnly ? await canonicalDirectory(options.homeDir) : undefined;
+  const agent = scopes.home || piOnly ? await canonicalDirectory(options.agentDir) : undefined;
   const project = scopes.project ? await canonicalDirectory(options.projectDir) : undefined;
   const packageAgentDir = agent;
-  if (scopes.home && !home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
+  if ((scopes.home || piOnly) && !home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
   if (scopes.home && !agent) addWarning(warnings, "unavailable-root", options.agentDir, "The explicitly selected Pi agent directory is unavailable.");
   if (scopes.project && !project) addWarning(warnings, "unavailable-root", options.projectDir, "The explicitly selected project directory is unavailable.");
 
@@ -227,6 +265,10 @@ export async function discoverResources(options: DiscoveryOptions, onProgress?: 
       for (const entry of entries) {
         const child = path.join(directory, entry.name);
         const relative = path.relative(canonicalRoot, child);
+        if (entry.isDirectory() && isWorktreeCopy(relative)) {
+          excludedPaths.add(child);
+          continue;
+        }
         if (shouldExclude(relative)) {
           excludedPaths.add(child);
           if (relative.split(path.sep).some((part) => part.toLowerCase() === "auth")) {
@@ -515,7 +557,7 @@ export async function discoverResources(options: DiscoveryOptions, onProgress?: 
   const homeProjects = new Set<string>();
   const homeProfiles = new Set<string>();
   if (home) {
-    await walk(home, home, async (file) => {
+    const classifyHomeFile = async (file: string): Promise<void> => {
       const relativeParts = path.relative(home, file).split(path.sep);
       const base = path.basename(file);
       const piIndex = relativeParts.indexOf(".pi");
@@ -582,7 +624,19 @@ export async function discoverResources(options: DiscoveryOptions, onProgress?: 
         if (projectRoot !== home && !isWithin(path.join(home, ".pi"), projectRoot)) homeProjects.add(projectRoot);
         await addCandidate("instruction", home, file, base, "project", "project-instructions", { kind: "project", path: base });
       }
-    }, onProgress);
+    };
+    if (scopes.home) {
+      await walk(home, home, classifyHomeFile, onProgress);
+    } else {
+      const { directories: starts, symlinks } = await piAgentDirectories(home);
+      for (const link of symlinks) addWarning(warnings, "symlink-skipped", link, "Symbolic links are not followed during resource discovery.");
+      onProgress?.({ done: 0, total: starts.length });
+      for (const [index, start] of starts.entries()) {
+        onProgress?.({ done: index, total: starts.length, current: start });
+        await walk(home, start, classifyHomeFile);
+        onProgress?.({ done: index + 1, total: starts.length });
+      }
+    }
     for (const profileRoot of homeProfiles) {
       await scanSettings(path.join(profileRoot, "settings.json"), "user", [profileRoot, home], profileRoot);
     }

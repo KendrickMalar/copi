@@ -81,7 +81,7 @@ export async function source(b: Fixture, files: Record<string, string | Buffer> 
   }
 }
 export function setupSteps(secret = true): Step[] {
-  return [answer("Choose the locations copi may inspect", `${down}\r`), answer("Authorize copi to search only the selected locations"),
+  return [answer("Choose the locations copi may inspect", `${down}${down}\r`), answer("Authorize copi to search only the selected locations"),
     answer("Select resources to review and save", "\t\r"), answer("Create the first resource group", "Alpha 日本\r"),
     ...(secret ? [answer("Save suspected sensitive file a.md"), answer("Save suspected sensitive file SKILL.md")] : []),
     answer("Save 1 copied resource(s)")];

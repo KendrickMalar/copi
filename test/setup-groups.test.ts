@@ -12,7 +12,7 @@ async function skill(box: AcceptanceBox, name: string, body = "# body\n"): Promi
 }
 
 const start = [
-  { waitFor: "Choose the locations", send: "\u001b[B\r" },
+  { waitFor: "Choose the locations", send: "\u001b[B\u001b[B\r" },
   { waitFor: "Authorize copi", send: "y" },
 ];
 // Select every listed row: Tab toggles without moving, so go down between Tabs.
