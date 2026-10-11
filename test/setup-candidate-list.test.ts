@@ -10,10 +10,10 @@ test("#8 setup lists same-named candidates with distinct source labels, adjacent
   for (const [dir, name] of [["set-0", "dup"], ["set-1", "dup"], ["set-2", "Known"], ["set-3", "zeta"]] as const) {
     const folder = path.join(box.project, ".pi", "skills", dir, name);
     await mkdir(folder, { recursive: true });
-    await writeFile(path.join(folder, "SKILL.md"), "# safe\n");
+    await writeFile(path.join(folder, "SKILL.md"), `# safe ${dir}\n`); // distinct content: identical copies would be merged
   }
   const result = await realPty(box, [process.execPath, cli, "setup"], [
-    { waitFor: "Choose the locations", send: "\u001b[B\r" },
+    { waitFor: "Choose the locations", send: "\u001b[B\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
     { waitFor: "Filter resources", send: "\u0003" },
   ]);

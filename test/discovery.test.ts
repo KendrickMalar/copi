@@ -416,3 +416,42 @@ test("does not report progress when HOME is not searched", async (t) => {
   await discoverResources({ homeDir: path.join(root, "home"), agentDir: path.join(root, "home/.pi/agent"), projectDir, scopes: { home: false, project: true } }, (event) => events.push(event));
   assert.deepEqual(events, []);
 });
+
+test("piDirs scope searches only the Pi agent directories under HOME", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-pidirs-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  await put(agentDir, "agents/main-agent.md", "---\nname: main-agent\n---\n");
+  await put(homeDir, ".pi/agent-rbx/agents/rbx-agent.md", "---\nname: rbx-agent\n---\n");
+  await put(homeDir, ".pi/agent_extra/skills/extra-skill/SKILL.md", "# extra\n");
+  await put(homeDir, ".agents/skills/shared-skill/SKILL.md", "# shared\n");
+  await put(homeDir, ".pi/not-a-profile/agents/ignored.md", "---\nname: ignored\n---\n");
+  await put(homeDir, "Code/app/.pi/agents/project-agent.md", "---\nname: project-agent\n---\n");
+  await put(homeDir, "Code/app/AGENTS.md", "# project instructions\n");
+
+  const events: Array<{ done: number; total: number; current?: string }> = [];
+  const result = await discoverResources({ homeDir, agentDir, projectDir: homeDir, scopes: { home: false, project: false, piDirs: true } }, (event) => events.push({ ...event }));
+  const names = result.candidates.map((candidate) => candidate.name).sort();
+  assert.deepEqual(names, ["extra-skill", "main-agent.md", "rbx-agent.md", "shared-skill"]);
+  assert.deepEqual(events[0], { done: 0, total: 4 });
+  assert.deepEqual(events.at(-1), { done: 4, total: 4 });
+});
+
+test("whole-HOME search skips worktree checkout copies but keeps ordinary worktrees folders", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-worktrees-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  await mkdir(agentDir, { recursive: true });
+  await put(homeDir, "Code/app/AGENTS.md", "# main checkout\n");
+  await put(homeDir, "Code/app/.worktrees/feat/AGENTS.md", "# copy 1\n");
+  await put(homeDir, "Code/app/.claude/worktrees/fix/AGENTS.md", "# copy 2\n");
+  await put(homeDir, ".config/superpowers/worktrees/app/feat/AGENTS.md", "# copy 3\n");
+  await put(homeDir, ".treehouse/app-1/AGENTS.md", "# copy 4\n");
+  await put(homeDir, "Code/worktrees/AGENTS.md", "# an ordinary folder named worktrees\n");
+
+  const result = await discoverResources({ homeDir, agentDir, projectDir: homeDir, scopes: { home: true, project: false } });
+  const found = result.candidates.filter((candidate) => candidate.kind === "instruction").map((candidate) => path.relative(homeDir, candidate.sourcePath)).sort();
+  assert.deepEqual(found, ["Code/app/AGENTS.md", "Code/worktrees/AGENTS.md"]);
+});

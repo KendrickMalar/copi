@@ -2,9 +2,9 @@ import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, con
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
-import { discoverResources, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
+import { discoverResources, piAgentDirectories, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { candidateHint, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates } from "./setup-display.ts";
+import { candidateHint, candidateLabels, collapseIdenticalCandidates, contentFingerprint, defaultRenameName, displayPath, findSelectionConflicts, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, identicalCopiesSuffix, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -88,13 +88,14 @@ export interface SearchRoots {
 export interface SearchScopes {
   home: boolean;
   project: boolean;
+  piDirs?: boolean;
 }
 
 export function buildSearchOptions(roots: SearchRoots, scopes: SearchScopes): DiscoveryOptions | undefined {
-  if (!scopes.home && !scopes.project) return undefined;
+  if (!scopes.home && !scopes.project && !scopes.piDirs) return undefined;
   return {
     ...roots,
-    scopes: { home: scopes.home, project: scopes.project },
+    scopes: { home: scopes.home, project: scopes.project, ...(scopes.piDirs ? { piDirs: true } : {}) },
   };
 }
 
@@ -403,14 +404,17 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   assertModernCatalog(initial);
   assertNoNameConflicts(initial);
   intro("copi setup");
-  type LocationChoice = "home" | "project" | "both" | "cancel";
+  type LocationChoice = "pi" | "home" | "project" | "both" | "cancel";
   const homeDir = roots.homeDir;
   const projectLabel = displayPath(roots.projectDir, homeDir);
   const homeBase = homeDir.length > 1 && homeDir.endsWith(path.sep) ? homeDir.slice(0, -1) : homeDir;
   const projectIsHome = Boolean(homeDir) && roots.projectDir === homeBase;
   const projectInsideHome = Boolean(homeDir) && !projectIsHome && roots.projectDir.startsWith(homeBase + path.sep);
   const locationOptions: Array<{ value: LocationChoice; label: string }> = [];
-  if (homeDir) locationOptions.push({ value: "home", label: "HOME and Pi agent directory \u2014 ~ (can take a minute or more)" });
+  if (homeDir) {
+    locationOptions.push({ value: "pi", label: "Pi agent directories only \u2014 ~/.pi/agent, ~/.pi/agent-*, ~/.agents (fast)" });
+    locationOptions.push({ value: "home", label: "All of HOME \u2014 ~ (can take a minute or more; worktree copies skipped)" });
+  }
   if (!projectIsHome) locationOptions.push({ value: "project", label: `This project only \u2014 ${projectLabel} (fast)` });
   if (homeDir && !projectIsHome && !projectInsideHome) locationOptions.push({ value: "both", label: "Both" });
   locationOptions.push({ value: "cancel", label: "Cancel" });
@@ -423,14 +427,15 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     cancel("Setup cancelled.");
     return;
   }
-  const scopes: SearchScopes = { home: choice === "home" || choice === "both", project: choice === "project" || choice === "both" };
+  const scopes: SearchScopes = { home: choice === "home" || choice === "both", project: choice === "project" || choice === "both", ...(choice === "pi" ? { piDirs: true } : {}) };
+  const piDirectories = choice === "pi" ? await piAgentDirectories(homeDir) : [];
   const searchOptions = buildSearchOptions(roots, scopes)!; // every non-cancel choice enables at least one scope
   note(
     [
       `HOME: ${scopes.home ? displayPath(roots.homeDir, homeDir) : "not selected"}`,
-      `Pi agent directory: ${scopes.home ? displayPath(roots.agentDir, homeDir) : "not selected"}`,
+      `Pi agent directory: ${scopes.home ? displayPath(roots.agentDir, homeDir) : choice === "pi" ? (piDirectories.map((dir) => displayPath(dir, homeDir)).join(", ") || "none found") : "not selected"}`,
       `Project: ${scopes.project ? projectLabel : "not selected"}`,
-      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git.",
+      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git. Whole-HOME searches also skip worktree copies (.worktrees, .claude/worktrees, .config/superpowers/worktrees, .treehouse).",
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
     "Search scope and exclusions",
@@ -476,7 +481,11 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     outro("No supported resources were found.");
     return;
   }
-  const sortedCandidates = sortCandidates(discovery.candidates);
+  const allSorted = sortCandidates(discovery.candidates);
+  const fingerprints = new Map(await Promise.all(allSorted.map(async (candidate) => [candidate.id, await contentFingerprint(candidate)] as const)));
+  const { kept: sortedCandidates, copies: identicalCopies } = collapseIdenticalCandidates(allSorted, fingerprints, homeDir);
+  const merged = allSorted.length - sortedCandidates.length;
+  if (merged > 0) log.info(safeDisplay(`Merged ${merged} identical copies; ${sortedCandidates.length} distinct resource(s) to choose from.`));
   const candidateStats = await gatherCandidateStats(sortedCandidates);
   const savedNames = new Set(initial.items.map((item) => nameKey(item.name)));
   const candidateLabelMap = candidateLabels(sortedCandidates, homeDir, (candidate) => savedNames.has(nameKey(candidate.name)), process.stdout.columns);
@@ -486,7 +495,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     const selectedIds = await autocompleteMultiselect({
       message: "Select resources to review and save as copied snapshots",
       options: sortedCandidates.map((candidate) => {
-        const label = candidateLabelMap.get(candidate.id)!;
+        const label = candidateLabelMap.get(candidate.id)! + identicalCopiesSuffix(identicalCopies.get(candidate.id));
         return { value: candidate.id, label, hint: candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, process.stdout.columns, label.length) };
       }),
       required: false,

@@ -3,7 +3,7 @@ import test from "node:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress } from "../src/setup-display.ts";
+import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress, collapseIdenticalCandidates, contentFingerprint, identicalCopiesSuffix } from "../src/setup-display.ts";
 import { nameKey } from "../src/names.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
@@ -170,4 +170,43 @@ test("#9 pendingNameError rejects empty names and names taken by the library or 
 test("formatSearchProgress shows count and the directory being searched", () => {
   assert.equal(formatSearchProgress({ done: 14, total: 36, current: "/Users/a/Library" }, "/Users/a"), "14/36  ~/Library");
   assert.equal(formatSearchProgress({ done: 36, total: 36 }, "/Users/a"), "36/36  Searching HOME");
+});
+
+test("contentFingerprint matches identical files and directories and differs on content", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-fingerprint-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const [dir, body] of [["a", "same\n"], ["b", "same\n"], ["c", "different\n"]] as const) {
+    await mkdir(path.join(root, dir, "skill", "refs"), { recursive: true });
+    await writeFile(path.join(root, dir, "skill", "SKILL.md"), body);
+    await writeFile(path.join(root, dir, "skill", "refs", "x.md"), "ref\n");
+    await writeFile(path.join(root, dir, "agent.md"), body);
+  }
+  await mkdir(path.join(root, "b", "skill", "node_modules"), { recursive: true });
+  await writeFile(path.join(root, "b", "skill", "node_modules", "ignored.js"), "excluded from the copy\n");
+  const fp = (p: string) => contentFingerprint(cand({ id: p, sourcePath: path.join(root, p) }));
+  assert.equal(await fp("a/skill"), await fp("b/skill"));
+  assert.notEqual(await fp("a/skill"), await fp("c/skill"));
+  assert.equal(await fp("a/agent.md"), await fp("b/agent.md"));
+  assert.notEqual(await fp("a/agent.md"), await fp("c/agent.md"));
+  assert.equal(await fp("missing"), undefined);
+});
+
+test("collapseIdenticalCandidates keeps one row per kind + name + content, preferring ~/.pi then the shortest path", () => {
+  const home = "/Users/a";
+  const list = [
+    cand({ id: "w", kind: "skill", name: "foo", sourcePath: "/Users/a/Code/app/.worktrees/x/.pi/skills/foo" }),
+    cand({ id: "p", kind: "skill", name: "foo", sourcePath: "/Users/a/.pi/agent/skills/foo" }),
+    cand({ id: "c", kind: "skill", name: "foo", sourcePath: "/Users/a/Code/app/.pi/skills/foo" }),
+    cand({ id: "d", kind: "skill", name: "foo", sourcePath: "/Users/a/Code/other/.pi/skills/foo" }),
+    cand({ id: "u", kind: "skill", name: "bar", sourcePath: "/Users/a/Code/app/.pi/skills/bar" }),
+    cand({ id: "v", kind: "skill", name: "bar", sourcePath: "/Users/a/Code/b/.pi/skills/bar" }),
+  ];
+  const fingerprints = new Map<string, string | undefined>([["w", "h1"], ["p", "h1"], ["c", "h1"], ["d", "h2"], ["u", undefined], ["v", undefined]]);
+  const { kept, copies } = collapseIdenticalCandidates(list, fingerprints, home);
+  assert.deepEqual(kept.map((c) => c.id), ["p", "d", "u", "v"]);
+  assert.equal(copies.get("p"), 2);
+  assert.equal(copies.has("d"), false);
+  assert.equal(identicalCopiesSuffix(copies.get("p")), " (+2 identical copies)");
+  assert.equal(identicalCopiesSuffix(1), " (+1 identical copy)");
+  assert.equal(identicalCopiesSuffix(undefined), "");
 });

@@ -1,5 +1,7 @@
-import { lstat, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
+import { shouldExclude } from "./discovery.ts";
 import { nameKey } from "./names.ts";
 import type { ResourceCandidate } from "./types.ts";
 
@@ -189,4 +191,75 @@ export function pendingNameError(name: string | undefined, taken: ReadonlySet<st
 export function formatSearchProgress(progress: { done: number; total: number; current?: string }, home: string): string {
   const count = `${progress.done}/${progress.total}`;
   return progress.current === undefined ? `${count}  Searching HOME` : `${count}  ${displayPath(progress.current, home)}`;
+}
+
+const fingerprintMaxFiles = 2000;
+const fingerprintMaxBytes = 50 * 1024 * 1024;
+
+/**
+ * SHA-256 over a candidate's copyable content: the file's bytes, or for a directory every regular file
+ * (relative path + bytes, sorted, same exclusions as discovery). `undefined` when unreadable or too large to compare.
+ */
+export async function contentFingerprint(c: ResourceCandidate): Promise<string | undefined> {
+  try {
+    const stat = await lstat(c.sourcePath);
+    if (stat.isFile()) return createHash("sha256").update(await readFile(c.sourcePath)).digest("hex");
+    if (!stat.isDirectory()) return undefined;
+    const files: string[] = [];
+    let bytes = 0;
+    const visit = async (dir: string): Promise<boolean> => {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        const child = path.join(dir, entry.name);
+        const relative = path.relative(c.sourcePath, child);
+        if (shouldExclude(relative) || entry.isSymbolicLink()) continue;
+        if (entry.isDirectory()) { if (!(await visit(child))) return false; }
+        else if (entry.isFile()) {
+          files.push(relative);
+          bytes += (await lstat(child)).size;
+          if (files.length > fingerprintMaxFiles || bytes > fingerprintMaxBytes) return false;
+        }
+      }
+      return true;
+    };
+    if (!(await visit(c.sourcePath))) return undefined;
+    const hash = createHash("sha256");
+    for (const relative of files.sort()) hash.update(relative).update("\0").update(await readFile(path.join(c.sourcePath, relative))).update("\0");
+    return hash.digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Collapse candidates with the same kind, display name (nameKey) and content fingerprint into one row.
+ * The kept row prefers a source under `~/.pi` or `~/.agents`, then the shortest path; input order is preserved.
+ * `copies` maps a kept candidate id to how many identical candidates it stands for (besides itself).
+ */
+export function collapseIdenticalCandidates(
+  list: readonly ResourceCandidate[],
+  fingerprints: ReadonlyMap<string, string | undefined>,
+  home: string,
+): { kept: ResourceCandidate[]; copies: Map<string, number> } {
+  const preferred = (c: ResourceCandidate) => [".pi", ".agents"].some((dir) => c.sourcePath.startsWith(path.join(home, dir) + path.sep)) ? 0 : 1;
+  const better = (a: ResourceCandidate, b: ResourceCandidate) =>
+    preferred(a) - preferred(b) || a.sourcePath.length - b.sourcePath.length || a.sourcePath.localeCompare(b.sourcePath);
+  const groups = new Map<string, ResourceCandidate[]>();
+  for (const c of list) {
+    const fingerprint = fingerprints.get(c.id);
+    const key = fingerprint === undefined ? `unique\0${c.id}` : `${c.kind}\0${nameKey(c.name)}\0${fingerprint}`;
+    groups.set(key, [...(groups.get(key) ?? []), c]);
+  }
+  const representative = new Map<string, ResourceCandidate>();
+  const copies = new Map<string, number>();
+  for (const group of groups.values()) {
+    const best = [...group].sort(better)[0]!;
+    for (const c of group) representative.set(c.id, best);
+    if (group.length > 1) copies.set(best.id, group.length - 1);
+  }
+  const kept = list.filter((c) => representative.get(c.id)!.id === c.id);
+  return { kept, copies };
+}
+
+export function identicalCopiesSuffix(count: number | undefined): string {
+  return count ? ` (+${count} identical ${count === 1 ? "copy" : "copies"})` : "";
 }
