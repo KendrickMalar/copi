@@ -64,15 +64,30 @@ export function isWorktreeCopy(relativePath: string): boolean {
 
 const piProfilePattern = /^agent([-_].+)?$/;
 
-/** The Pi agent directories searched by the `piDirs` scope, sorted; symlinks are not followed. */
-export async function piAgentDirectories(homeDir: string): Promise<string[]> {
-  const found: string[] = [];
+/**
+ * The Pi agent directories searched by the `piDirs` scope, sorted. Symlinks are never followed: a symlinked
+ * `~/.pi`, profile directory or `~/.agents` is reported in `symlinks` instead (callers warn about it).
+ */
+export async function piAgentDirectories(homeDir: string): Promise<{ directories: string[]; symlinks: string[] }> {
+  const directories: string[] = [];
+  const symlinks: string[] = [];
+  const kind = (p: string) => lstat(p).then((stat) => stat.isSymbolicLink() ? "link" : stat.isDirectory() ? "dir" : "other").catch(() => "missing");
   const piDir = path.join(homeDir, ".pi");
-  const entries = await readdir(piDir, { withFileTypes: true }).catch(() => []);
-  for (const entry of entries) if (entry.isDirectory() && piProfilePattern.test(entry.name)) found.push(path.join(piDir, entry.name));
+  const piKind = await kind(piDir);
+  if (piKind === "link") symlinks.push(piDir);
+  if (piKind === "dir") {
+    for (const entry of await readdir(piDir, { withFileTypes: true }).catch(() => [])) {
+      if (!piProfilePattern.test(entry.name)) continue;
+      if (entry.isSymbolicLink()) symlinks.push(path.join(piDir, entry.name));
+      else if (entry.isDirectory()) directories.push(path.join(piDir, entry.name));
+    }
+  }
   const shared = path.join(homeDir, ".agents");
-  if (await lstat(shared).then((stat) => stat.isDirectory()).catch(() => false)) found.push(shared);
-  return found.sort((left, right) => left.localeCompare(right));
+  const sharedKind = await kind(shared);
+  if (sharedKind === "link") symlinks.push(shared);
+  if (sharedKind === "dir") directories.push(shared);
+  const byPath = (left: string, right: string) => left.localeCompare(right);
+  return { directories: directories.sort(byPath), symlinks: symlinks.sort(byPath) };
 }
 
 function displayRelative(root: string, target: string): string {
@@ -191,7 +206,7 @@ export async function discoverResources(options: DiscoveryOptions, onProgress?: 
   const agent = scopes.home || piOnly ? await canonicalDirectory(options.agentDir) : undefined;
   const project = scopes.project ? await canonicalDirectory(options.projectDir) : undefined;
   const packageAgentDir = agent;
-  if (scopes.home && !home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
+  if ((scopes.home || piOnly) && !home) addWarning(warnings, "unavailable-root", options.homeDir, "The explicitly selected home directory is unavailable.");
   if (scopes.home && !agent) addWarning(warnings, "unavailable-root", options.agentDir, "The explicitly selected Pi agent directory is unavailable.");
   if (scopes.project && !project) addWarning(warnings, "unavailable-root", options.projectDir, "The explicitly selected project directory is unavailable.");
 
@@ -613,7 +628,8 @@ export async function discoverResources(options: DiscoveryOptions, onProgress?: 
     if (scopes.home) {
       await walk(home, home, classifyHomeFile, onProgress);
     } else {
-      const starts = await piAgentDirectories(home);
+      const { directories: starts, symlinks } = await piAgentDirectories(home);
+      for (const link of symlinks) addWarning(warnings, "symlink-skipped", link, "Symbolic links are not followed during resource discovery.");
       onProgress?.({ done: 0, total: starts.length });
       for (const [index, start] of starts.entries()) {
         onProgress?.({ done: index, total: starts.length, current: start });

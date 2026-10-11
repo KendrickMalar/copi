@@ -2,9 +2,9 @@ import { autocompleteMultiselect as clackMultiselect, cancel as clackCancel, con
 import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
-import { discoverResources, piAgentDirectories, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
+import { discoverResources, isWorktreeCopy, piAgentDirectories, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { candidateHint, candidateLabels, collapseIdenticalCandidates, contentFingerprint, defaultRenameName, displayPath, findSelectionConflicts, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, identicalCopiesSuffix, pendingNameError, sortCandidates } from "./setup-display.ts";
+import { candidateHint, candidateLabels, collapseIdenticalCandidates, contentFingerprint, defaultRenameName, displayPath, findSelectionConflicts, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, identicalCopiesSuffix, mapWithLimit, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -428,14 +428,15 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     return;
   }
   const scopes: SearchScopes = { home: choice === "home" || choice === "both", project: choice === "project" || choice === "both", ...(choice === "pi" ? { piDirs: true } : {}) };
-  const piDirectories = choice === "pi" ? await piAgentDirectories(homeDir) : [];
+  const piDirectories = choice === "pi" ? (await piAgentDirectories(homeDir)).directories : [];
   const searchOptions = buildSearchOptions(roots, scopes)!; // every non-cancel choice enables at least one scope
   note(
     [
       `HOME: ${scopes.home ? displayPath(roots.homeDir, homeDir) : "not selected"}`,
       `Pi agent directory: ${scopes.home ? displayPath(roots.agentDir, homeDir) : choice === "pi" ? (piDirectories.map((dir) => displayPath(dir, homeDir)).join(", ") || "none found") : "not selected"}`,
       `Project: ${scopes.project ? projectLabel : "not selected"}`,
-      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git. Whole-HOME searches also skip worktree copies (.worktrees, .claude/worktrees, .config/superpowers/worktrees, .treehouse).",
+      "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git. Folder searches also skip worktree copies (.worktrees, .claude/worktrees, .config/superpowers/worktrees, .treehouse).",
+      ...(choice === "pi" ? ["Settings and packages declared by these Pi profiles may point elsewhere under HOME; those configured paths are read too."] : []),
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
     "Search scope and exclusions",
@@ -476,13 +477,16 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
   indicator.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
   showSearchWarnings(discovery.warnings, roots.homeDir);
-  if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.map((excluded) => displayPath(excluded, homeDir)).join("\n"), "Excluded paths");
+  const worktreeCopies = discovery.excludedPaths.filter((excluded) => isWorktreeCopy(path.relative(homeDir || path.sep, excluded)));
+  const otherExcluded = discovery.excludedPaths.filter((excluded) => !worktreeCopies.includes(excluded));
+  if (worktreeCopies.length > 0) log.info(safeDisplay(`Skipped ${worktreeCopies.length} worktree copy folder(s).`));
+  if (otherExcluded.length > 0) note(otherExcluded.map((excluded) => displayPath(excluded, homeDir)).join("\n"), "Excluded paths");
   if (discovery.candidates.length === 0) {
     outro("No supported resources were found.");
     return;
   }
   const allSorted = sortCandidates(discovery.candidates);
-  const fingerprints = new Map(await Promise.all(allSorted.map(async (candidate) => [candidate.id, await contentFingerprint(candidate)] as const)));
+  const fingerprints = new Map(await mapWithLimit(allSorted, 16, async (candidate) => [candidate.id, await contentFingerprint(candidate)] as const));
   const { kept: sortedCandidates, copies: identicalCopies } = collapseIdenticalCandidates(allSorted, fingerprints, homeDir);
   const merged = allSorted.length - sortedCandidates.length;
   if (merged > 0) log.info(safeDisplay(`Merged ${merged} identical copies; ${sortedCandidates.length} distinct resource(s) to choose from.`));

@@ -190,20 +190,31 @@ export function pendingNameError(name: string | undefined, taken: ReadonlySet<st
 /** Bar message for the HOME search: `14/36  ~/Library`, or just the count between directories. */
 export function formatSearchProgress(progress: { done: number; total: number; current?: string }, home: string): string {
   const count = `${progress.done}/${progress.total}`;
-  return progress.current === undefined ? `${count}  Searching HOME` : `${count}  ${displayPath(progress.current, home)}`;
+  return progress.current === undefined ? `${count}  Searching` : `${count}  ${displayPath(progress.current, home)}`;
 }
 
 const fingerprintMaxFiles = 2000;
 const fingerprintMaxBytes = 50 * 1024 * 1024;
 
 /**
- * SHA-256 over a candidate's copyable content: the file's bytes, or for a directory every regular file
- * (relative path + bytes, sorted, same exclusions as discovery). `undefined` when unreadable or too large to compare.
+ * SHA-256 over what saving would copy: for a file its mode and bytes, for a directory every regular file's
+ * relative path, mode and bytes (sorted, same exclusions as discovery), each field length-prefixed.
+ * `undefined` (never merged) when unreadable, too large, or containing a symlink, which saving refuses.
  */
 export async function contentFingerprint(c: ResourceCandidate): Promise<string | undefined> {
   try {
+    const field = (hash: ReturnType<typeof createHash>, value: string | Buffer) => {
+      const bytes = typeof value === "string" ? Buffer.from(value) : value;
+      hash.update(`${bytes.length}:`).update(bytes);
+    };
     const stat = await lstat(c.sourcePath);
-    if (stat.isFile()) return createHash("sha256").update(await readFile(c.sourcePath)).digest("hex");
+    if (stat.isFile()) {
+      if (stat.size > fingerprintMaxBytes) return undefined;
+      const hash = createHash("sha256");
+      field(hash, (stat.mode & 0o777).toString(8));
+      field(hash, await readFile(c.sourcePath));
+      return hash.digest("hex");
+    }
     if (!stat.isDirectory()) return undefined;
     const files: string[] = [];
     let bytes = 0;
@@ -211,7 +222,8 @@ export async function contentFingerprint(c: ResourceCandidate): Promise<string |
       for (const entry of await readdir(dir, { withFileTypes: true })) {
         const child = path.join(dir, entry.name);
         const relative = path.relative(c.sourcePath, child);
-        if (shouldExclude(relative) || entry.isSymbolicLink()) continue;
+        if (shouldExclude(relative)) continue;
+        if (entry.isSymbolicLink()) return false;
         if (entry.isDirectory()) { if (!(await visit(child))) return false; }
         else if (entry.isFile()) {
           files.push(relative);
@@ -223,7 +235,12 @@ export async function contentFingerprint(c: ResourceCandidate): Promise<string |
     };
     if (!(await visit(c.sourcePath))) return undefined;
     const hash = createHash("sha256");
-    for (const relative of files.sort()) hash.update(relative).update("\0").update(await readFile(path.join(c.sourcePath, relative))).update("\0");
+    for (const relative of files.sort()) {
+      const file = path.join(c.sourcePath, relative);
+      field(hash, relative);
+      field(hash, ((await lstat(file)).mode & 0o777).toString(8));
+      field(hash, await readFile(file));
+    }
     return hash.digest("hex");
   } catch {
     return undefined;
@@ -246,7 +263,7 @@ export function collapseIdenticalCandidates(
   const groups = new Map<string, ResourceCandidate[]>();
   for (const c of list) {
     const fingerprint = fingerprints.get(c.id);
-    const key = fingerprint === undefined ? `unique\0${c.id}` : `${c.kind}\0${nameKey(c.name)}\0${fingerprint}`;
+    const key = fingerprint === undefined ? `unique\0${c.id}` : JSON.stringify([c.kind, c.name, c.scope, c.destination, fingerprint]);
     groups.set(key, [...(groups.get(key) ?? []), c]);
   }
   const representative = new Map<string, ResourceCandidate>();
@@ -262,4 +279,18 @@ export function collapseIdenticalCandidates(
 
 export function identicalCopiesSuffix(count: number | undefined): string {
   return count ? ` (+${count} identical ${count === 1 ? "copy" : "copies"})` : "";
+}
+
+/** Map with at most `limit` operations in flight, preserving input order. */
+export async function mapWithLimit<T, R>(items: readonly T[], limit: number, operation: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await operation(items[index]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }

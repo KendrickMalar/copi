@@ -455,3 +455,18 @@ test("whole-HOME search skips worktree checkout copies but keeps ordinary worktr
   const found = result.candidates.filter((candidate) => candidate.kind === "instruction").map((candidate) => path.relative(homeDir, candidate.sourcePath)).sort();
   assert.deepEqual(found, ["Code/app/AGENTS.md", "Code/worktrees/AGENTS.md"]);
 });
+
+test("piDirs scope never follows symlinked Pi directories and warns about them", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-pidirs-links-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  await put(agentDir, "agents/real.md", "---\nname: real\n---\n");
+  await put(root, "elsewhere/agents/linked.md", "---\nname: linked\n---\n");
+  await symlink(path.join(root, "elsewhere"), path.join(homeDir, ".pi", "agent-linked"));
+  await symlink(path.join(root, "elsewhere"), path.join(homeDir, ".agents"));
+  const result = await discoverResources({ homeDir, agentDir, projectDir: homeDir, scopes: { home: false, project: false, piDirs: true } });
+  assert.deepEqual(result.candidates.map((candidate) => candidate.name), ["real.md"]);
+  const skipped = result.warnings.filter((warning) => warning.code === "symlink-skipped").map((warning) => path.basename(warning.path)).sort();
+  assert.deepEqual(skipped, [".agents", "agent-linked"]);
+});

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress, collapseIdenticalCandidates, contentFingerprint, identicalCopiesSuffix } from "../src/setup-display.ts";
+import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress, collapseIdenticalCandidates, contentFingerprint, identicalCopiesSuffix, mapWithLimit } from "../src/setup-display.ts";
 import { nameKey } from "../src/names.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
@@ -169,7 +169,7 @@ test("#9 pendingNameError rejects empty names and names taken by the library or 
 
 test("formatSearchProgress shows count and the directory being searched", () => {
   assert.equal(formatSearchProgress({ done: 14, total: 36, current: "/Users/a/Library" }, "/Users/a"), "14/36  ~/Library");
-  assert.equal(formatSearchProgress({ done: 36, total: 36 }, "/Users/a"), "36/36  Searching HOME");
+  assert.equal(formatSearchProgress({ done: 36, total: 36 }, "/Users/a"), "36/36  Searching");
 });
 
 test("contentFingerprint matches identical files and directories and differs on content", async (t) => {
@@ -209,4 +209,49 @@ test("collapseIdenticalCandidates keeps one row per kind + name + content, prefe
   assert.equal(identicalCopiesSuffix(copies.get("p")), " (+2 identical copies)");
   assert.equal(identicalCopiesSuffix(1), " (+1 identical copy)");
   assert.equal(identicalCopiesSuffix(undefined), "");
+});
+
+test("contentFingerprint refuses symlinked content and separates modes and NUL-ambiguous layouts", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-fingerprint-edge-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fp = (p: string) => contentFingerprint(cand({ id: p, sourcePath: path.join(root, p) }));
+  await mkdir(path.join(root, "linked"), { recursive: true });
+  await writeFile(path.join(root, "linked", "SKILL.md"), "x\n");
+  await symlink(path.join(root, "linked", "SKILL.md"), path.join(root, "linked", "alias.md"));
+  assert.equal(await fp("linked"), undefined, "saving refuses symlinks, so such a candidate is never merged");
+  for (const dir of ["m1", "m2"]) {
+    await mkdir(path.join(root, dir), { recursive: true });
+    await writeFile(path.join(root, dir, "run.sh"), "echo hi\n");
+  }
+  await chmod(path.join(root, "m2", "run.sh"), 0o755);
+  assert.notEqual(await fp("m1"), await fp("m2"), "a mode difference is a content difference");
+  await mkdir(path.join(root, "n1"), { recursive: true });
+  await writeFile(path.join(root, "n1", "a"), "x\0b\0y");
+  await mkdir(path.join(root, "n2"), { recursive: true });
+  await writeFile(path.join(root, "n2", "a"), "x");
+  await writeFile(path.join(root, "n2", "b"), "y");
+  assert.notEqual(await fp("n1"), await fp("n2"));
+});
+
+test("collapseIdenticalCandidates never merges different exact names, scopes or destinations", () => {
+  const list = [
+    cand({ id: "a", kind: "instruction", name: "AGENTS.md", scope: "project", destination: { kind: "project", path: "AGENTS.md" }, sourcePath: "/Users/a/p1/AGENTS.md" }),
+    cand({ id: "b", kind: "instruction", name: "AGENTS.MD", scope: "project", destination: { kind: "project", path: "AGENTS.MD" }, sourcePath: "/Users/a/p2/AGENTS.MD" }),
+    cand({ id: "c", kind: "skill", name: "s", scope: "package", destination: { kind: "project", path: ".pi/skills/s" }, sourcePath: "/Users/a/pkg/s" }),
+    cand({ id: "d", kind: "skill", name: "s", scope: "user", destination: { kind: "project", path: ".pi/skills/s" }, sourcePath: "/Users/a/.pi/agent/skills/s" }),
+  ];
+  const fingerprints = new Map<string, string | undefined>(list.map((c) => [c.id, "same"]));
+  assert.deepEqual(collapseIdenticalCandidates(list, fingerprints, "/Users/a").kept.map((c) => c.id), ["a", "b", "c", "d"]);
+});
+
+test("mapWithLimit keeps order and never exceeds the limit", async () => {
+  let active = 0, peak = 0;
+  const out = await mapWithLimit([5, 1, 4, 2, 3], 2, async (n) => {
+    active += 1; peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, n));
+    active -= 1;
+    return n * 10;
+  });
+  assert.deepEqual(out, [50, 10, 40, 20, 30]);
+  assert.ok(peak <= 2);
 });
