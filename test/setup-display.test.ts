@@ -3,7 +3,8 @@ import test from "node:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { candidateHint, candidateLabel, candidateLabels, displayPath, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, sortCandidates, truncateMiddle } from "../src/setup-display.ts";
+import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle } from "../src/setup-display.ts";
+import { nameKey } from "../src/names.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
 test("displayPath replaces only the exact home prefix", () => {
@@ -123,4 +124,28 @@ test("directory with exactly the cap shows no plus", async () => {
     await writeFile(path.join(dir, "extra"), "");
     assert.equal((await gatherCandidateStats([cand({ id: "d", kind: "skill", sourcePath: dir })])).get("d")?.size, "1000+ files");
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#9 findSelectionConflicts groups 2+ candidates by nameKey across kinds, in input order", () => {
+  const list = [
+    cand({ id: "a", name: "Straße" }), cand({ id: "b", name: "solo" }), cand({ id: "c", kind: "skill", name: " STRASSE " }),
+    cand({ id: "d", name: "dup" }), cand({ id: "e", name: "DUP" }), cand({ id: "f", name: "dup" }),
+  ];
+  assert.deepEqual(findSelectionConflicts(list).map((group) => group.map((c) => c.id)), [["a", "c"], ["d", "e", "f"]]);
+  assert.deepEqual(findSelectionConflicts([cand({ id: "x" }), cand({ id: "y", name: "y" })]), []);
+});
+
+test("#9 defaultRenameName appends the grandparent dir of the source, falling back to the parent", () => {
+  assert.equal(defaultRenameName(cand({ name: "jandel.md", sourcePath: "/Users/a/Code/agent-rbx/agents/jandel.md" })), "jandel.md (agent-rbx)");
+  assert.equal(defaultRenameName(cand({ name: "dup", sourcePath: "/p/.pi/skills/set-0/dup" })), "dup (skills)");
+  assert.equal(defaultRenameName(cand({ name: "x.md", sourcePath: "/agents/x.md" })), "x.md (agents)");
+});
+
+test("#9 pendingNameError rejects empty names and names taken by the library or other pending names", () => {
+  const taken = new Set([nameKey("Known"), nameKey("Straße")]);
+  assert.equal(pendingNameError("fresh name", taken), undefined);
+  assert.match(pendingNameError("  ", taken) ?? "", /non-empty/);
+  assert.match(pendingNameError(undefined, taken) ?? "", /non-empty/);
+  assert.match(pendingNameError(" known ", taken) ?? "", /already used/);
+  assert.match(pendingNameError("STRASSE", taken) ?? "", /already used/);
 });

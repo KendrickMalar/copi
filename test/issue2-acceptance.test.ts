@@ -122,7 +122,7 @@ test("N1 rejected empty import and duplicate save do not create a previously abs
   await assert.rejects(lstat(box.library), { code: "ENOENT" });
 });
 
-test("N1 real CLI setup preflights conflicting selected batch before any catalog or snapshot creation", async () => {
+test("N1/#9 real CLI setup resolves a conflicting selected batch before review; no Duplicate item name after confirm", async () => {
   const box = await acceptanceBox();
   for (const [index, name] of ["Straße", "STRASSE"].entries()) {
     // Distinct parents are necessary on case-insensitive macOS filesystems.
@@ -135,15 +135,18 @@ test("N1 real CLI setup preflights conflicting selected batch before any catalog
     { waitFor: "Choose the locations", send: "\u001b[B\r" },
     { waitFor: "Authorize copi", send: "y" },
     { waitFor: "Select resources to review", send: "\t\u001b[B\t\r" },
+    { waitFor: "Keep all and rename the others", send: "\u001b[B\u001b[B\r" },
+    { waitFor: "New display name for STRASSE", send: "\r" },
     { waitFor: "Create the first resource group", send: "test-team\r" },
     { waitFor: "Assign", send: "\t\r" },
     { waitFor: "Assign", send: "\t\r" },
     { waitFor: "Save 2 copied resource(s)", send: "y" },
   ]);
-  assert.equal(result.code, 1, result.output);
-  assert.match(result.output, /Duplicate item name/);
-  assert.match(result.output, /PTY actions 7\/7/);
-  await assert.rejects(lstat(box.library), { code: "ENOENT" });
+  assert.equal(result.code, 0, result.output);
+  assert.ok(!result.output.includes("Duplicate item name"), result.output);
+  assert.ok(result.output.indexOf("Keep all and rename the others") < result.output.indexOf("Masked preview"));
+  assert.match(result.output, /PTY actions 9\/9/);
+  assert.deepEqual((await loadCatalog(box.library)).items.map((item) => item.name).sort(), ["STRASSE (skills)", "Straße"]);
   assert.deepEqual(await treeBytes(box.project), projectBefore);
 });
 

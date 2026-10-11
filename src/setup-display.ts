@@ -142,3 +142,27 @@ export async function gatherCandidateStats(list: readonly ResourceCandidate[]): 
   const entries = await Promise.all(list.map(async (c) => [c.id, await statOne(c)] as const));
   return new Map(entries);
 }
+
+/** Groups of 2+ selected candidates sharing a `nameKey` (any kind), each in input order; groups ordered by first member. */
+export function findSelectionConflicts(list: readonly ResourceCandidate[]): ResourceCandidate[][] {
+  const groups = new Map<string, ResourceCandidate[]>();
+  for (const c of list) {
+    const key = nameKey(c.name);
+    groups.set(key, [...(groups.get(key) ?? []), c]);
+  }
+  return [...groups.values()].filter((group) => group.length > 1);
+}
+
+/** `<name> (<grandparent dir of the source>)`, falling back to the parent dir, e.g. `jandel.md (agent-rbx)`. */
+export function defaultRenameName(c: ResourceCandidate): string {
+  const parent = path.dirname(c.sourcePath);
+  const segment = path.basename(path.dirname(parent)) || path.basename(parent);
+  return segment ? `${c.name} (${segment})` : c.name;
+}
+
+/** Validation message for a new display name, or undefined when it is non-empty and its `nameKey` is not taken. */
+export function pendingNameError(name: string | undefined, taken: ReadonlySet<string>): string | undefined {
+  let key: string;
+  try { key = nameKey(name ?? ""); } catch { return "Enter a non-empty display name."; }
+  return taken.has(key) ? "That name is already used by a saved or selected resource; choose another." : undefined;
+}

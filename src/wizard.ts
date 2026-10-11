@@ -4,7 +4,7 @@ import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { candidateHint, candidateLabels, displayPath, formatOutsideRootSummary, gatherCandidateStats, sortCandidates } from "./setup-display.ts";
+import { candidateHint, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -297,6 +297,85 @@ async function askForGroupName(message: string): Promise<string | undefined> {
   return isCancel(value) ? undefined : value.trim();
 }
 
+/**
+ * Resolve display-name conflicts right after selection (#9): within the selection first, one group at a time,
+ * then against saved library names. Returns the candidates to review (renamed ones are copies with a new
+ * display name only), "back" to re-show the list, or "cancel".
+ */
+async function resolveSelectedNames(
+  selection: readonly ResourceCandidate[],
+  library: StoredCatalog,
+  labels: ReadonlyMap<string, string>,
+  homeDir: string,
+): Promise<ResourceCandidate[] | "back" | "cancel"> {
+  let pending = [...selection];
+  const libraryKeys = new Set(library.items.map((item) => nameKey(item.name)));
+  const askNewName = async (candidate: ResourceCandidate): Promise<string | undefined> => {
+    // Taken: every saved name and every other pending name (assertNameAvailable semantics for the library).
+    const taken = new Set([...libraryKeys, ...pending.filter((other) => other.id !== candidate.id).map((other) => nameKey(other.name))]);
+    const value = await text({
+      message: `New display name for ${candidate.name} \u2014 ${displayPath(path.dirname(candidate.sourcePath), homeDir)} (display name only; files are not changed)`,
+      initialValue: defaultRenameName(candidate),
+      validate: (name) => {
+        const error = pendingNameError(name, taken);
+        if (error) return error;
+        try { assertNameAvailable(library, "item", name ?? ""); return undefined; }
+        catch { return "That name is already used by a saved or selected resource; choose another."; }
+      },
+    });
+    return isCancel(value) ? undefined : value.trim();
+  };
+  const rename = (candidate: ResourceCandidate, name: string) => {
+    pending = pending.map((entry) => (entry.id === candidate.id ? { ...entry, name } : entry));
+  };
+
+  for (const group of findSelectionConflicts(pending)) {
+    const choice = await select<string>({
+      message: `${group.length} selected resources share the name ${group[0]!.name}; choose what to save`,
+      options: [
+        ...group.map((candidate) => ({ value: `keep:${candidate.id}`, label: `Keep ${labels.get(candidate.id) ?? candidate.name}` })),
+        { value: "rename", label: "Keep all and rename the others" },
+        { value: "back", label: "Go back to the list" },
+      ],
+    });
+    if (isCancel(choice)) return "cancel";
+    if (choice === "back") return "back";
+    if (choice === "rename") {
+      for (const candidate of group.slice(1)) {
+        const name = await askNewName(pending.find((entry) => entry.id === candidate.id)!);
+        if (name === undefined) return "cancel";
+        rename(candidate, name);
+      }
+    } else {
+      const kept = choice.slice("keep:".length);
+      const dropped = new Set(group.filter((candidate) => candidate.id !== kept).map((candidate) => candidate.id));
+      pending = pending.filter((candidate) => !dropped.has(candidate.id));
+    }
+  }
+
+  for (const candidate of [...pending]) {
+    if (!libraryKeys.has(nameKey(candidate.name))) continue;
+    const choice = await select<"skip" | "rename" | "back">({
+      message: `${labels.get(candidate.id) ?? candidate.name}: a saved resource already uses this name. To update the saved copy, use Refresh in copi manage.`,
+      options: [
+        { value: "skip", label: "Skip (keep the saved copy)" },
+        { value: "rename", label: "Rename" },
+        { value: "back", label: "Go back to the list" },
+      ],
+    });
+    if (isCancel(choice)) return "cancel";
+    if (choice === "back") return "back";
+    if (choice === "skip") {
+      pending = pending.filter((entry) => entry.id !== candidate.id);
+      continue;
+    }
+    const name = await askNewName(candidate);
+    if (name === undefined) return "cancel";
+    rename(candidate, name);
+  }
+  return pending;
+}
+
 export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<void> {
   if (await handleNameConflicts(libraryDir)) return;
   const initial = await loadCatalog(libraryDir);
@@ -364,20 +443,38 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const candidateStats = await gatherCandidateStats(sortedCandidates);
   const savedNames = new Set(initial.items.map((item) => nameKey(item.name)));
   const candidateLabelMap = candidateLabels(sortedCandidates, homeDir, (candidate) => savedNames.has(nameKey(candidate.name)), process.stdout.columns);
-  const selectedIds = await autocompleteMultiselect({
-    message: "Select resources to review and save as copied snapshots",
-    options: sortedCandidates.map((candidate) => {
-      const label = candidateLabelMap.get(candidate.id)!;
-      return { value: candidate.id, label, hint: candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, process.stdout.columns, label.length) };
-    }),
-    required: false,
-    placeholder: "Filter resources...",
-  });
-  if (isCancel(selectedIds)) {
-    cancel("Setup cancelled; no resources were saved.");
-    return;
+  let previousSelection: string[] = [];
+  let resolvedCandidates: ResourceCandidate[];
+  while (true) {
+    const selectedIds = await autocompleteMultiselect({
+      message: "Select resources to review and save as copied snapshots",
+      options: sortedCandidates.map((candidate) => {
+        const label = candidateLabelMap.get(candidate.id)!;
+        return { value: candidate.id, label, hint: candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, process.stdout.columns, label.length) };
+      }),
+      required: false,
+      initialValues: previousSelection,
+      placeholder: "Filter resources...",
+    });
+    if (isCancel(selectedIds)) {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    if (selectedIds.length === 0) {
+      outro("No resources selected; nothing was saved.");
+      return;
+    }
+    previousSelection = selectedIds;
+    const outcome = await resolveSelectedNames(sortedCandidates.filter((candidate) => selectedIds.includes(candidate.id)), initial, candidateLabelMap, homeDir);
+    if (outcome === "cancel") {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    if (outcome === "back") continue;
+    resolvedCandidates = outcome;
+    break;
   }
-  if (selectedIds.length === 0) {
+  if (resolvedCandidates.length === 0) {
     outro("No resources selected; nothing was saved.");
     return;
   }
@@ -408,7 +505,9 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     }
   }
 
-  const selectedCandidates = discovery.candidates.filter((candidate) => selectedIds.includes(candidate.id));
+  // Keep discovery order for review; renamed copies replace their originals by id.
+  const resolvedById = new Map(resolvedCandidates.map((candidate) => [candidate.id, candidate]));
+  const selectedCandidates = discovery.candidates.flatMap((candidate) => resolvedById.get(candidate.id) ?? []);
   const approvedCandidates: Array<{ review: CandidateReview; groupIds: string[]; approvedSensitivePaths: string[] }> = [];
   for (const candidate of selectedCandidates) {
     const review = await prepareCandidateForReview(candidate);
