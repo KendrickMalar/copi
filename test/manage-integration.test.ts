@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { loadCatalog, readSnapshotFiles } from "../src/catalog.ts";
+import { displayPath } from "../src/setup-display.ts";
 import { addGroupSteps, at, choose, evidence, finish, hash, initialFiles, integrationBox, interactive, plain, registered,
   resource, runCli, setupSteps, sourceFiles, tree, type IntegrationBox, type Step } from "./helpers/manage-integration.ts";
 
@@ -178,8 +179,9 @@ test("setup location select: Enter right after start chooses HOME and reaches th
   assert.match(run, /Search not authorized/);
   assert.ok(!run.includes("No locations selected"));
   // The scope note proves HOME (not project-only) was chosen, and prints before the Authorize prompt.
-  assert.ok(run.includes(`HOME: ${b.home}`));
-  assert.ok(run.includes(`Pi agent directory: ${b.agent}`));
+  assert.match(run, /HOME: ~(?![\w/])/);
+  assert.ok(!run.includes(`HOME: ${b.home}`), "absolute HOME path is not printed");
+  assert.ok(run.includes(`Pi agent directory: ${displayPath(b.agent, b.home)}`));
   assert.ok(run.includes("Project: not selected"));
   assert.ok(run.indexOf("Project: not selected") < run.indexOf("Authorize copi to search only"));
 });

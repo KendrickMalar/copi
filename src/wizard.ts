@@ -391,6 +391,12 @@ async function resolveSelectedNames(
   return pending;
 }
 
+/** Quote for POSIX shells only when needed (single quotes, embedded quotes escaped as '\\''). */
+function shellQuote(value: string): string {
+  if (value === "<group>" || /^[A-Za-z0-9_.\/@%+=:,-]+$/.test(value)) return value;
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<void> {
   if (await handleNameConflicts(libraryDir)) return;
   const initial = await loadCatalog(libraryDir);
@@ -421,9 +427,9 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const searchOptions = buildSearchOptions(roots, scopes)!; // every non-cancel choice enables at least one scope
   note(
     [
-      `HOME: ${scopes.home ? roots.homeDir : "not selected"}`,
-      `Pi agent directory: ${scopes.home ? roots.agentDir : "not selected"}`,
-      `Project: ${scopes.project ? roots.projectDir : "not selected"}`,
+      `HOME: ${scopes.home ? displayPath(roots.homeDir, homeDir) : "not selected"}`,
+      `Pi agent directory: ${scopes.home ? displayPath(roots.agentDir, homeDir) : "not selected"}`,
+      `Project: ${scopes.project ? projectLabel : "not selected"}`,
       "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git.",
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
@@ -449,7 +455,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
   progress.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
   showSearchWarnings(discovery.warnings, roots.homeDir);
-  if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.join("\n"), "Excluded paths");
+  if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.map((excluded) => displayPath(excluded, homeDir)).join("\n"), "Excluded paths");
   if (discovery.candidates.length === 0) {
     outro("No supported resources were found.");
     return;
@@ -523,39 +529,37 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   // Decide the assignment mode once; "bulk" assigns every approved resource to bulkGroupIds.
   let bulkGroupIds: string[] | undefined;
   const count = selectedCandidates.length;
-  if (count >= 1) {
-    const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
-    let bulk = count === 1;
-    if (count >= 2) {
-      const mode = await select<"all" | "each">({
-        message: "How should these resources be grouped?",
-        options: [
-          { value: "all", label: onlyGroup ? `Put all ${count} resources in "${onlyGroup.name}"` : `Put all ${count} resources in the same groups` },
-          { value: "each", label: "Choose groups for each resource" },
-        ],
-        initialValue: "all",
+  const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
+  let bulk = count === 1;
+  if (count >= 2) {
+    const mode = await select<"all" | "each">({
+      message: "How should these resources be grouped?",
+      options: [
+        { value: "all", label: onlyGroup ? `Put all ${count} resources in "${onlyGroup.name}"` : `Put all ${count} resources in the same groups` },
+        { value: "each", label: "Choose groups for each resource" },
+      ],
+      initialValue: "all",
+    });
+    if (isCancel(mode)) {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
+    }
+    bulk = mode === "all";
+  }
+  if (bulk) {
+    if (onlyGroup) bulkGroupIds = [onlyGroup.id];
+    else {
+      const chosen = await autocompleteMultiselect({
+        message: count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`,
+        options: groupOptions(catalog.groups),
+        required: true,
+        placeholder: "Filter groups...",
       });
-      if (isCancel(mode)) {
+      if (isCancel(chosen)) {
         cancel("Setup cancelled; no resources were saved.");
         return;
       }
-      bulk = mode === "all";
-    }
-    if (bulk) {
-      if (onlyGroup) bulkGroupIds = [onlyGroup.id];
-      else {
-        const chosen = await autocompleteMultiselect({
-          message: count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`,
-          options: groupOptions(catalog.groups),
-          required: true,
-          placeholder: "Filter groups...",
-        });
-        if (isCancel(chosen)) {
-          cancel("Setup cancelled; no resources were saved.");
-          return;
-        }
-        bulkGroupIds = chosen;
-      }
+      bulkGroupIds = chosen;
     }
   }
   for (const [index, candidate] of selectedCandidates.entries()) {
@@ -640,10 +644,8 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
   const usedGroupIds = new Set(approvedCandidates.flatMap(({ groupIds }) => groupIds));
   const usedGroups = catalog.groups.filter((group) => usedGroupIds.has(group.id)).map((group) => group.name);
-  outro([
-    `Saved ${approvedCandidates.length} copied resource(s) in ${libraryLabel} (group: ${usedGroups.join(", ")}).`,
-    `Next: copi apply ${usedGroups[0] ?? "<group>"} <project> --dry-run   (edit or rename: copi manage)`,
-  ].join("\n"));
+  log.info(safeDisplay(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryLabel} (group: ${usedGroups.join(", ")}).`));
+  outro(`Next: copi apply ${shellQuote(usedGroups[0] ?? "<group>")} <project> --dry-run   (edit or rename: copi manage)`);
 }
 
 export async function runGroupManager(libraryDir: string): Promise<void> {
