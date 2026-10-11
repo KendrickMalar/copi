@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { displayPath, formatBytes, formatOutsideRootSummary, truncateMiddle } from "../src/setup-display.ts";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { candidateHint, candidateLabel, candidateLabels, displayPath, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, sortCandidates, truncateMiddle } from "../src/setup-display.ts";
+import type { ResourceCandidate } from "../src/types.ts";
 
 test("displayPath replaces only the exact home prefix", () => {
   assert.equal(displayPath("/Users/a", "/Users/a"), "~");
@@ -38,12 +42,6 @@ test("formatOutsideRootSummary shows title, ~ paths, first 5 and +N more", () =>
   assert.equal(many?.body, "~/p0\n~/p1\n~/p2\n~/p3\n~/p4\n+3 more");
   assert.equal(formatOutsideRootSummary(Array.from({ length: 5 }, (_, i) => `/h/p${i}`), "/h")?.body.includes("more"), false);
 });
-
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { candidateHint, candidateLabel, formatLocalDate, gatherCandidateStats, sortCandidates } from "../src/setup-display.ts";
-import type { ResourceCandidate } from "../src/types.ts";
 
 function cand(over: Partial<ResourceCandidate>): ResourceCandidate {
   return { id: "i", kind: "subagent", source: "s", scope: "user", sourceRoot: "/h", sourcePath: "/h/a/x.md", name: "x", destination: { kind: "global-only" }, ...over };
@@ -102,5 +100,27 @@ test("gatherCandidateStats reports file size, directory file count, and tolerate
     assert.equal(stats.get("d")?.size, "2 files");
     assert.ok(stats.get("f")?.mtime instanceof Date);
     assert.deepEqual(stats.get("m"), {});
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("candidateLabels keeps same-named rows distinct when dirs differ only in a truncated middle", () => {
+  const mk = (id: string, mid: string) => cand({ id, sourcePath: `/Users/a/${"p".repeat(40)}/${mid}/${"q".repeat(40)}/agents/x.md` });
+  const list = [mk("1", "alpha"), mk("2", "beta")];
+  assert.equal(candidateLabel(list[0]!, "/Users/a", false, 80), candidateLabel(list[1]!, "/Users/a", false, 80));
+  const labels = candidateLabels(list, "/Users/a", () => false, 80);
+  assert.notEqual(labels.get("1"), labels.get("2"));
+  assert.match(labels.get("1")!, /alpha/);
+  assert.match(labels.get("2")!, /beta/);
+  const solo = candidateLabels([list[0]!], "/Users/a", () => true, 80);
+  assert.equal(solo.get("1"), candidateLabel(list[0]!, "/Users/a", true, 80));
+});
+
+test("directory with exactly the cap shows no plus", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "copi-cap-"));
+  try {
+    await Promise.all(Array.from({ length: 1000 }, (_, i) => writeFile(path.join(dir, `f${i}`), "")));
+    assert.equal((await gatherCandidateStats([cand({ id: "d", kind: "skill", sourcePath: dir })])).get("d")?.size, "1000 files");
+    await writeFile(path.join(dir, "extra"), "");
+    assert.equal((await gatherCandidateStats([cand({ id: "d", kind: "skill", sourcePath: dir })])).get("d")?.size, "1000+ files");
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

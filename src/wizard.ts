@@ -4,7 +4,7 @@ import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { candidateHint, candidateLabel, displayPath, formatOutsideRootSummary, gatherCandidateStats, sortCandidates } from "./setup-display.ts";
+import { candidateHint, candidateLabels, displayPath, formatOutsideRootSummary, gatherCandidateStats, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -363,10 +363,11 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const sortedCandidates = sortCandidates(discovery.candidates);
   const candidateStats = await gatherCandidateStats(sortedCandidates);
   const savedNames = new Set(initial.items.map((item) => nameKey(item.name)));
+  const candidateLabelMap = candidateLabels(sortedCandidates, homeDir, (candidate) => savedNames.has(nameKey(candidate.name)), process.stdout.columns);
   const selectedIds = await autocompleteMultiselect({
     message: "Select resources to review and save as copied snapshots",
     options: sortedCandidates.map((candidate) => {
-      const label = candidateLabel(candidate, homeDir, savedNames.has(nameKey(candidate.name)), process.stdout.columns);
+      const label = candidateLabelMap.get(candidate.id)!;
       return { value: candidate.id, label, hint: candidateHint(candidate, candidateStats.get(candidate.id) ?? {}, homeDir, process.stdout.columns, label.length) };
     }),
     required: false,

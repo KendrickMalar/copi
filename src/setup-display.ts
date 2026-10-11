@@ -47,8 +47,39 @@ export function candidateLabel(c: ResourceCandidate, home: string, alreadySaved:
   const head = `[${c.kind}] ${c.name} \u2014 `;
   const tail = alreadySaved ? " (already saved)" : "";
   let dir = displayPath(path.dirname(c.sourcePath), home);
-  if (columns !== undefined && Number.isFinite(columns)) dir = truncateMiddle(dir, Math.max(columns - head.length - tail.length - 6, 24));
+  if (columns !== undefined && Number.isFinite(columns)) dir = truncateMiddle(dir, Math.max(columns - head.length - tail.length - 6, 8));
   return `${head}${dir}${tail}`;
+}
+
+/**
+ * Labels for a whole list. Rows sharing kind + nameKey must stay distinguishable: when truncation makes their
+ * source labels collide, that group falls back to whole trailing segments (`…/a/b`), widened until they differ.
+ */
+export function candidateLabels(list: readonly ResourceCandidate[], home: string, isSaved: (c: ResourceCandidate) => boolean, columns?: number): Map<string, string> {
+  const out = new Map<string, string>();
+  const groups = new Map<string, ResourceCandidate[]>();
+  for (const c of list) {
+    out.set(c.id, candidateLabel(c, home, isSaved(c), columns));
+    const key = `${c.kind}\0${nameKey(c.name)}`;
+    groups.set(key, [...(groups.get(key) ?? []), c]);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const labels = group.map((c) => out.get(c.id)!);
+    if (new Set(labels).size === labels.length) continue;
+    const dirs = group.map((c) => displayPath(path.dirname(c.sourcePath), home));
+    const segs = dirs.map((d) => d.split(path.sep));
+    const max = Math.max(...segs.map((x) => x.length));
+    for (let k = 1; k <= max; k += 1) {
+      const cut = segs.map((x, i) => (x.length <= k ? dirs[i]! : `\u2026${path.sep}${x.slice(-k).join(path.sep)}`));
+      const rendered = group.map((c, i) => `[${c.kind}] ${c.name} \u2014 ${cut[i]}${isSaved(c) ? " (already saved)" : ""}`);
+      if (new Set(rendered).size === rendered.length || k === max) {
+        group.forEach((c, i) => out.set(c.id, rendered[i]!));
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 /** Sort by kind, then nameKey, then source path (new array). */
@@ -85,6 +116,12 @@ async function countFiles(dir: string, budget: { left: number }): Promise<void> 
   }
 }
 
+async function hasMoreFiles(dir: string, cap: number): Promise<boolean> {
+  const budget = { left: cap + 1 };
+  await countFiles(dir, budget);
+  return budget.left <= 0;
+}
+
 async function statOne(c: ResourceCandidate): Promise<CandidateStats> {
   try {
     const st = await lstat(c.sourcePath);
@@ -92,7 +129,7 @@ async function statOne(c: ResourceCandidate): Promise<CandidateStats> {
       const budget = { left: countCap };
       await countFiles(c.sourcePath, budget);
       const n = countCap - budget.left;
-      return { size: n >= countCap ? `${countCap}+ files` : `${n} file${n === 1 ? "" : "s"}`, mtime: st.mtime };
+      return { size: budget.left <= 0 && (await hasMoreFiles(c.sourcePath, countCap)) ? `${countCap}+ files` : `${n} file${n === 1 ? "" : "s"}`, mtime: st.mtime };
     }
     return { size: formatBytes(st.size), mtime: st.mtime };
   } catch {
