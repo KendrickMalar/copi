@@ -282,13 +282,18 @@ async function handleNameConflicts(libraryDir: string): Promise<boolean> {
   }
 }
 
-function groupOptions(groups: Group[]) {
-  return groups.map((group) => ({ value: group.id, label: group.name, hint: `${group.itemIds.length} saved resources` }));
+function groupOptions(groups: Group[], pendingCounts?: ReadonlyMap<string, number>) {
+  return groups.map((group) => ({
+    value: group.id,
+    label: group.name,
+    hint: pendingCounts ? `${group.itemIds.length} saved \u00b7 ${pendingCounts.get(group.id) ?? 0} pending` : `${group.itemIds.length} saved resources`,
+  }));
 }
 
-async function askForGroupName(message: string): Promise<string | undefined> {
+async function askForGroupName(message: string, placeholder?: string): Promise<string | undefined> {
   const value = await text({
     message,
+    ...(placeholder !== undefined ? { placeholder } : {}),
     validate: (name) => {
       try { nameKey(name ?? ""); return undefined; }
       catch { return "Enter a non-empty group name."; }
@@ -488,7 +493,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const catalog = await loadCatalog(libraryDir);
   assertModernCatalog(catalog);
   if (catalog.groups.length === 0) {
-    const name = await askForGroupName("Create the first resource group");
+    const name = await askForGroupName("Create the first resource group \u2014 used later with: copi apply <group>", "e.g. game-review");
     if (name === undefined) {
       cancel("Setup cancelled; no resources were saved.");
       return;
@@ -515,6 +520,46 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const resolvedById = new Map(resolvedCandidates.map((candidate) => [candidate.id, candidate]));
   const selectedCandidates = discovery.candidates.flatMap((candidate) => resolvedById.get(candidate.id) ?? []);
   const approvedCandidates: Array<{ review: CandidateReview; groupIds: string[]; approvedSensitivePaths: string[] }> = [];
+  // Decide the assignment mode once; "bulk" assigns every approved resource to bulkGroupIds.
+  let bulkGroupIds: string[] | undefined;
+  const count = selectedCandidates.length;
+  if (catalog.groups.length === 1 && count === 1) {
+    bulkGroupIds = [catalog.groups[0]!.id];
+  } else if (count >= 1) {
+    const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
+    let bulk = count === 1;
+    if (count >= 2) {
+      const mode = await select<"all" | "each">({
+        message: "How should these resources be grouped?",
+        options: [
+          { value: "all", label: onlyGroup ? `Put all ${count} resources in "${onlyGroup.name}"` : `Put all ${count} resources in the same groups` },
+          { value: "each", label: "Choose groups for each resource" },
+        ],
+        initialValue: "all",
+      });
+      if (isCancel(mode)) {
+        cancel("Setup cancelled; no resources were saved.");
+        return;
+      }
+      bulk = mode === "all";
+    }
+    if (bulk) {
+      if (onlyGroup) bulkGroupIds = [onlyGroup.id];
+      else {
+        const chosen = await autocompleteMultiselect({
+          message: count === 1 ? "Assign the resource to one or more groups" : `Put all ${count} resources in these groups`,
+          options: groupOptions(catalog.groups),
+          required: true,
+          placeholder: "Filter groups...",
+        });
+        if (isCancel(chosen)) {
+          cancel("Setup cancelled; no resources were saved.");
+          return;
+        }
+        bulkGroupIds = chosen;
+      }
+    }
+  }
   for (const candidate of selectedCandidates) {
     const review = await prepareCandidateForReview(candidate);
     note(review.preview.length > 0 ? review.preview.join("\n\n") : "No previewable files.", `Masked preview: ${review.candidate.name}`);
@@ -540,9 +585,15 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       log.warn(safeDisplay(`${review.candidate.name} was not selected for saving because a suspected sensitive file was not approved.`));
       continue;
     }
+    if (bulkGroupIds) {
+      approvedCandidates.push({ review, groupIds: bulkGroupIds, approvedSensitivePaths });
+      continue;
+    }
+    const pendingCounts = new Map<string, number>();
+    for (const approved of approvedCandidates) for (const id of approved.groupIds) pendingCounts.set(id, (pendingCounts.get(id) ?? 0) + 1);
     const groupIds = await autocompleteMultiselect({
       message: `Assign ${review.candidate.name} to one or more groups`,
-      options: groupOptions(catalog.groups),
+      options: groupOptions(catalog.groups, pendingCounts),
       required: true,
       placeholder: "Filter groups...",
     });

@@ -207,7 +207,7 @@ test("setup and group prompts show the Tab key hint and a search progress indica
   const setup = plain((await interactive(b, "key-hint-setup", "setup", setupSteps())).output);
   assert.ok(setup.includes("Choose the locations copi may inspect"));
   assert.ok(!setup.includes("Choose the locations copi may inspect (Tab"));
-  for (const prompt of ["Select resources to review and save as copied snapshots", "Assign original to one or more groups"]) {
+  for (const prompt of ["Select resources to review and save as copied snapshots"]) {
     assert.ok(setup.includes(`${prompt} (Tab: select, Enter: confirm)`), prompt);
   }
   // The spinner draws its first frame after 80 ms; this tiny fixture finishes sooner, so only the stop line is observable.

@@ -84,7 +84,7 @@ export function setupSteps(secret = true): Step[] {
   return [answer("Choose the locations copi may inspect", `${down}\r`), answer("Authorize copi to search only the selected locations"),
     answer("Select resources to review and save", "\t\r"), answer("Create the first resource group", "Alpha 日本\r"),
     ...(secret ? [answer("Save suspected sensitive file a.md"), answer("Save suspected sensitive file SKILL.md")] : []),
-    answer("Assign MapKit to one or more groups", "\t\r"), answer("Save 1 copied resource(s)")];
+    answer("Save 1 copied resource(s)")];
 }
 export async function observe(b: Fixture, label: string, extra: unknown = {}) {
   const catalog = await loadCatalog(b.library);

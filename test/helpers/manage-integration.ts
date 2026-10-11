@@ -76,7 +76,7 @@ export function setupSteps(): Step[] {
   return [at("Choose the locations copi may inspect", `${down}\r`), at("Authorize copi to search only", "y\r"),
     at("Select resources to review", "\t\r"), at("Create the first resource group", "First bundle\r"),
     at("Save suspected sensitive file second.md", "y\r"), at("Save suspected sensitive file SKILL.md", "y\r"),
-    at("Assign original to one or more groups", "\t\r"), at("Save 1 copied resource(s)", "y\r")];
+    at("Save 1 copied resource(s)", "y\r")];
 }
 export function addGroupSteps(name: string, index: number): Step[] {
   return [choose("Manage saved resources", 1), choose("Manage saved groups"), at("New group name", `${name}\r`),
