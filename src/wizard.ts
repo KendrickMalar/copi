@@ -523,9 +523,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   // Decide the assignment mode once; "bulk" assigns every approved resource to bulkGroupIds.
   let bulkGroupIds: string[] | undefined;
   const count = selectedCandidates.length;
-  if (catalog.groups.length === 1 && count === 1) {
-    bulkGroupIds = [catalog.groups[0]!.id];
-  } else if (count >= 1) {
+  if (count >= 1) {
     const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
     let bulk = count === 1;
     if (count >= 2) {
@@ -547,7 +545,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       if (onlyGroup) bulkGroupIds = [onlyGroup.id];
       else {
         const chosen = await autocompleteMultiselect({
-          message: count === 1 ? "Assign the resource to one or more groups" : `Put all ${count} resources in these groups`,
+          message: count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`,
           options: groupOptions(catalog.groups),
           required: true,
           placeholder: "Filter groups...",
@@ -560,10 +558,12 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       }
     }
   }
-  for (const candidate of selectedCandidates) {
+  for (const [index, candidate] of selectedCandidates.entries()) {
     const review = await prepareCandidateForReview(candidate);
-    note(review.preview.length > 0 ? review.preview.join("\n\n") : "No previewable files.", `Masked preview: ${review.candidate.name}`);
-    showWarnings(review.inspection.warnings, `${review.candidate.name} inspection warnings`);
+    const previewTitle = `Masked preview (${index + 1}/${count}): ${review.candidate.name} \u2014 ${displayPath(path.dirname(candidate.sourcePath), homeDir)}`;
+    note(review.preview.length > 0 ? review.preview.join("\n\n") : "No previewable files.", previewTitle);
+    // The heuristic caveat is stated once in the scope note and the summary; per-resource it would only repeat.
+    showWarnings(review.inspection.warnings.filter((warning) => warning.code !== "secret-detection-limited"), `${review.candidate.name} inspection warnings`);
     if (review.inspection.excludedPaths.length > 0) {
       note(review.inspection.excludedPaths.join("\n"), `${review.candidate.name} excluded paths`);
     }
@@ -571,7 +571,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     const approvedSensitivePaths: string[] = [];
     for (const relativePath of review.inspection.sensitivePaths) {
       const approval = await confirm({
-        message: `Save suspected sensitive file ${relativePath} from ${review.candidate.name}? Detection is heuristic; the file content remains masked in previews.`,
+        message: `Save suspected sensitive file ${relativePath} from ${review.candidate.name}? Detection is heuristic; the file content remains masked in previews. No = ${review.candidate.name} will not be saved at all.`,
         initialValue: false,
       });
       if (isCancel(approval)) {
@@ -612,9 +612,10 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? "Unavailable group").join(", ");
     return `${review.candidate.name} → ${names}`;
   }).join("\n");
-  note(summary, "Resources ready to copy");
+  note(`${summary}\n\nSecret detection is heuristic and cannot guarantee completeness.`, "Resources ready to copy");
+  const libraryLabel = displayPath(libraryDir, homeDir);
   const save = await confirm({
-    message: `Save ${approvedCandidates.length} copied resource(s) in ${libraryDir}? Original files will not be changed.`,
+    message: `Save ${approvedCandidates.length} copied resource(s) in ${libraryLabel}? Original files will not be changed.`,
     initialValue: false,
   });
   if (isCancel(save) || !save) {
@@ -637,7 +638,12 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
     await saveReviewedCandidate(libraryDir, review, groupIds, approvedSensitivePaths, true);
   }
-  outro(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryDir}.`);
+  const usedGroupIds = new Set(approvedCandidates.flatMap(({ groupIds }) => groupIds));
+  const usedGroups = catalog.groups.filter((group) => usedGroupIds.has(group.id)).map((group) => group.name);
+  outro([
+    `Saved ${approvedCandidates.length} copied resource(s) in ${libraryLabel} (group: ${usedGroups.join(", ")}).`,
+    `Next: copi apply ${usedGroups[0] ?? "<group>"} <project> --dry-run   (edit or rename: copi manage)`,
+  ].join("\n"));
 }
 
 export async function runGroupManager(libraryDir: string): Promise<void> {

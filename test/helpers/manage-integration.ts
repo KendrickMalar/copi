@@ -113,7 +113,7 @@ export async function registered(b: IntegrationBox) {
   await sourceFiles(b);
   const before = await tree(b.source);
   const run = await interactive(b, "setup", "setup", setupSteps());
-  assert.match(plain(run.output), /Masked preview: original/);
+  assert.match(plain(run.output), /Masked preview \(1\/\d+\): original/);
   assert.match(plain(run.output), /Search scope and exclusions/);
   assert.ok(!run.output.includes("sk_live_setupFirst12345678"));
   assert.ok(!run.output.includes("setupSecond12345678"));

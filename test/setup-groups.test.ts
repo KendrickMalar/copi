@@ -43,7 +43,7 @@ test("#12 bulk default: 4 resources, one new group, no per-resource Assign promp
   assert.equal(result.code, 0, result.output);
   assert.ok(!result.output.includes("Assign "), "no per-resource group prompt");
   assert.equal(result.output.split("→ team").length - 1, 4, result.output);
-  assert.equal(result.output.split("Masked preview:").length - 1, 4);
+  assert.equal(result.output.split("Masked preview (").length - 1, 4);
   assert.match(result.output, /Choose groups for each resource/);
   const catalog = await loadStoredCatalog(box.library);
   assertModernCatalog(catalog);

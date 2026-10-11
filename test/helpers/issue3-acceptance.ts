@@ -113,7 +113,7 @@ export async function register(b: Fixture, files: Record<string, string | Buffer
   await source(b, files, modes);
   const before = await tree(b.source);
   const r = await run(b, "registration", ["setup"], setupSteps(sensitive));
-  assert.match(plain(r.output), /Masked preview: MapKit/);
+  assert.match(plain(r.output), /Masked preview \(1\/1\): MapKit/);
   assert.ok(!r.output.includes("sk_live_i3OriginalMap123456") && !r.output.includes("i3OriginalOther123456"));
   assert.deepEqual(await tree(b.source), before);
   const c = await loadCatalog(b.library);
