@@ -404,19 +404,27 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   assertModernCatalog(initial);
   assertNoNameConflicts(initial);
   intro("copi setup");
-  type LocationChoice = "pi" | "home" | "project" | "both" | "cancel";
+  note(
+    [
+      "Copi keeps private copies of your Pi resources",
+      `(skills, subagents, instructions, settings) in ${displayPath(libraryDir, roots.homeDir)}`,
+      "and applies them to projects by group.",
+      "setup: find \u2192 review masked previews \u2192 save to groups.",
+      "Later: copi apply <group> <project>.",
+      "Your original files are never changed.",
+    ].join("\n"),
+    "What copi does",
+  );
+  type LocationChoice = "pi" | "project" | "both" | "cancel";
   const homeDir = roots.homeDir;
   const projectLabel = displayPath(roots.projectDir, homeDir);
   const homeBase = homeDir.length > 1 && homeDir.endsWith(path.sep) ? homeDir.slice(0, -1) : homeDir;
   const projectIsHome = Boolean(homeDir) && roots.projectDir === homeBase;
-  const projectInsideHome = Boolean(homeDir) && !projectIsHome && roots.projectDir.startsWith(homeBase + path.sep);
   const locationOptions: Array<{ value: LocationChoice; label: string }> = [];
-  if (homeDir) {
-    locationOptions.push({ value: "pi", label: "Pi agent directories only \u2014 ~/.pi/agent, ~/.pi/agent-*, ~/.agents (fast)" });
-    locationOptions.push({ value: "home", label: "All of HOME \u2014 ~ (can take a minute or more; worktree copies skipped)" });
-  }
+  // Searching a project that is HOME itself would mean searching all of HOME, which setup no longer offers.
+  if (homeDir) locationOptions.push({ value: "pi", label: "Pi agent directories only \u2014 ~/.pi/agent, ~/.pi/agent-*, ~/.agents (fast)" });
   if (!projectIsHome) locationOptions.push({ value: "project", label: `This project only \u2014 ${projectLabel} (fast)` });
-  if (homeDir && !projectIsHome && !projectInsideHome) locationOptions.push({ value: "both", label: "Both" });
+  if (homeDir && !projectIsHome) locationOptions.push({ value: "both", label: "Both \u2014 Pi agent directories and this project" });
   locationOptions.push({ value: "cancel", label: "Cancel" });
   const choice = await select<LocationChoice>({
     message: "Choose the locations copi may inspect",
@@ -427,16 +435,16 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     cancel("Setup cancelled.");
     return;
   }
-  const scopes: SearchScopes = { home: choice === "home" || choice === "both", project: choice === "project" || choice === "both", ...(choice === "pi" ? { piDirs: true } : {}) };
-  const piDirectories = choice === "pi" ? (await piAgentDirectories(homeDir)).directories : [];
+  const searchesPiDirs = choice === "pi" || choice === "both";
+  const scopes: SearchScopes = { home: false, project: choice === "project" || choice === "both", ...(searchesPiDirs ? { piDirs: true } : {}) };
+  const piDirectories = searchesPiDirs ? (await piAgentDirectories(homeDir)).directories : [];
   const searchOptions = buildSearchOptions(roots, scopes)!; // every non-cancel choice enables at least one scope
   note(
     [
-      `HOME: ${scopes.home ? displayPath(roots.homeDir, homeDir) : "not selected"}`,
-      `Pi agent directory: ${scopes.home ? displayPath(roots.agentDir, homeDir) : choice === "pi" ? (piDirectories.map((dir) => displayPath(dir, homeDir)).join(", ") || "none found") : "not selected"}`,
+      `Pi agent directories: ${searchesPiDirs ? (piDirectories.map((dir) => displayPath(dir, homeDir)).join(", ") || "none found") : "not selected"}`,
       `Project: ${scopes.project ? projectLabel : "not selected"}`,
       "Always excluded: entire directories named auth (authentication-specific code may be missing), auth.json, mcp-auth.json, oauth.json, .env* paths, history, cache/caches, .cache, .npm, node_modules, and .git. Folder searches also skip worktree copies (.worktrees, .claude/worktrees, .config/superpowers/worktrees, .treehouse).",
-      ...(choice === "pi" ? ["Settings and packages declared by these Pi profiles may point elsewhere under HOME; those configured paths are read too."] : []),
+      ...(searchesPiDirs ? ["Settings and packages declared by these Pi profiles may point elsewhere under HOME; those configured paths are read too."] : []),
       "Secret detection is heuristic and cannot guarantee completeness. Preview text is masked by default.",
     ].join("\n"),
     "Search scope and exclusions",
@@ -452,7 +460,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
 
   // A spinner covers the quick phases; once HOME's top-level directories are known, a bar fills one step per directory.
   let indicator: ReturnType<typeof clackSpinner> = clackSpinner(inheritedSignal());
-  indicator.start("Searching selected locations (searching all of HOME can take a minute or more)");
+  indicator.start("Searching selected locations");
   let bar: ReturnType<typeof clackProgress> | undefined;
   let barDone = 0;
   const onProgress = (event: DiscoveryProgress) => {

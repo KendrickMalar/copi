@@ -179,25 +179,30 @@ test("setup location select: Enter right after start chooses the Pi agent direct
   assert.match(run, /Search not authorized/);
   assert.ok(!run.includes("No locations selected"));
   // The scope note proves the Pi-directories choice (neither whole HOME nor project) and prints before the Authorize prompt.
-  assert.ok(run.includes("HOME: not selected"));
-  assert.ok(run.includes(`Pi agent directory: ${displayPath(b.agent, b.home)}`));
-  assert.ok(!run.includes(`Pi agent directory: ${b.agent}`), "absolute agent path is not printed");
+  assert.ok(run.includes(`Pi agent directories: ${displayPath(b.agent, b.home)}`));
+  assert.ok(!run.includes(`Pi agent directories: ${b.agent}`), "absolute agent path is not printed");
+  assert.ok(!run.includes("HOME:"), "setup no longer offers a whole-HOME scope");
+  // The library explanation comes first, before the location prompt.
+  assert.ok(run.includes("What copi does"));
+  assert.ok(run.includes(`in ${displayPath(b.library, b.home)}`));
+  assert.ok(run.includes("Later: copi apply <group> <project>."));
+  assert.ok(run.indexOf("What copi does") < run.indexOf("Choose the locations copi may inspect"));
   assert.ok(run.includes("Project: not selected"));
   assert.ok(run.indexOf("Project: not selected") < run.indexOf("Authorize copi to search only"));
 });
 
 for (const [name, project, labels] of [
   ["project outside HOME", (b: IntegrationBox) => b.cwd, { project: true, both: true }],
-  ["project nested in HOME", (b: IntegrationBox) => path.join(b.home, "work"), { project: true, both: false }],
+  ["project nested in HOME", (b: IntegrationBox) => path.join(b.home, "work"), { project: true, both: true }],
   ["project equal to HOME", (b: IntegrationBox) => b.home, { project: false, both: false }],
 ] as const) test(`setup location options: ${name}; Cancel (last option) searches and saves nothing`, async () => {
   const b = await integrationBox(); const cwd = project(b); await mkdir(cwd, { recursive: true });
-  const downs = "\u001b[B".repeat(2 + Number(labels.project) + Number(labels.both));
+  const downs = "\u001b[B".repeat(1 + Number(labels.project) + Number(labels.both));
   const run = plain((await interactive({ ...b, cwd }, "location-options", "setup", [at("Choose the locations copi may inspect", `${downs}\r`)])).output);
   assert.ok(run.includes("Pi agent directories only \u2014 ~/.pi/agent, ~/.pi/agent-*, ~/.agents (fast)"));
-  assert.ok(run.includes("All of HOME \u2014 ~ (can take a minute or more; worktree copies skipped)"));
+  assert.ok(!run.includes("All of HOME"));
   assert.equal(run.includes("This project only \u2014 "), labels.project);
-  assert.equal(/\bBoth\b/.test(run), labels.both);
+  assert.equal(run.includes("Both \u2014 Pi agent directories and this project"), labels.both);
   assert.ok(run.includes("Cancel"));
   assert.ok(run.includes("Setup cancelled."));
   assert.ok(!run.includes("Authorize copi to search only") && !run.includes("Search scope and exclusions") && !run.includes("Search complete"));
