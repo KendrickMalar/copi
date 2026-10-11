@@ -145,6 +145,11 @@ async function canonicalDirectory(directory: string): Promise<string | undefined
   }
 }
 
+/** False only when the entry itself does not exist (lstat ENOENT); dangling symlinks count as existing. */
+async function exists(target: string): Promise<boolean> {
+  return lstat(target).then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
+}
+
 export async function discoverResources(options: DiscoveryOptions): Promise<DiscoveryResult> {
   const scopes = options.scopes ?? inferSearchScopes(options);
   if (!scopes.home && !scopes.project) return { candidates: [], warnings: [], excludedPaths: [] };
@@ -166,6 +171,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
   if (project) roots.push({ path: project, scope: "project", source: "project", destinationRoot: ".pi/skills", destinationKind: "project" });
 
   const addCandidate = async (kind: ResourceKind, root: string, sourcePath: string, name: string, scope: ResourceScope, source: string, destination: ResourceDestination): Promise<void> => {
+    if (!(await exists(sourcePath))) return;
     const canonicalSource = await realpath(sourcePath).catch(() => undefined);
     const canonicalRoot = await realpath(root).catch(() => undefined);
     if (!canonicalSource || !canonicalRoot || !isWithin(canonicalRoot, canonicalSource)) {
@@ -227,6 +233,7 @@ export async function discoverResources(options: DiscoveryOptions): Promise<Disc
     };
     const canonicalStart = await realpath(startPath).catch(() => undefined);
     if (!canonicalStart || !isWithin(canonicalRoot, canonicalStart)) {
+      if (!(await exists(startPath))) return;
       addWarning(warnings, "resource-outside-root", startPath, "A configured resource root resolves outside its allowed search root.");
       return;
     }

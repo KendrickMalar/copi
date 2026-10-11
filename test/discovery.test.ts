@@ -365,3 +365,19 @@ test("project-only discovery never reads an unselected agent package cache", asy
   assert.ok(approvedNames.has("unselected-npm"));
   assert.ok(approvedNames.has("unselected-git"));
 });
+
+test("does not warn for configured files that do not exist, but warns for dangling symlinks", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-missing-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const homeDir = path.join(root, "home");
+  const agentDir = path.join(homeDir, ".pi", "agent");
+  const projectDir = path.join(homeDir, "project");
+  await Promise.all([mkdir(agentDir, { recursive: true }), mkdir(projectDir, { recursive: true })]);
+
+  const missing = await discoverResources({ homeDir, agentDir, projectDir });
+  assert.deepEqual(missing.warnings.filter((warning) => warning.code === "resource-outside-root"), []);
+
+  await symlink(path.join(root, "nowhere.json"), path.join(agentDir, "models.json"));
+  const dangling = await discoverResources({ homeDir, agentDir, projectDir });
+  assert.equal(dangling.warnings.filter((warning) => warning.code === "resource-outside-root").length, 1);
+});

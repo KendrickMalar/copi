@@ -4,6 +4,7 @@ import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, type DiscoveryOptions } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
+import { formatOutsideRootSummary } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -147,6 +148,12 @@ export async function saveReviewedCandidate(
     inspection: review.inspection,
     approvedSensitivePaths,
   });
+}
+
+function showSearchWarnings(warnings: readonly { code: string; path?: string; message: string }[], home: string): void {
+  const summary = formatOutsideRootSummary(warnings.filter((warning) => warning.code === "resource-outside-root" && warning.path !== undefined).map((warning) => warning.path as string), home);
+  if (summary) note(summary.body, summary.title);
+  showWarnings(warnings.filter((warning) => warning.code !== "resource-outside-root" || warning.path === undefined), "Search warnings");
 }
 
 function showWarnings(warnings: readonly { code: string; path?: string; message: string }[], title: string): void {
@@ -350,7 +357,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     throw error;
   }
   progress.stop(`Search complete: ${discovery.candidates.length} supported resource(s) found`);
-  showWarnings(discovery.warnings, "Search warnings");
+  showSearchWarnings(discovery.warnings, roots.homeDir);
   if (discovery.excludedPaths.length > 0) note(discovery.excludedPaths.join("\n"), "Excluded paths");
   if (discovery.candidates.length === 0) {
     outro("No supported resources were found.");
