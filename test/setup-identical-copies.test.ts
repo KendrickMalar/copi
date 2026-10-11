@@ -23,3 +23,21 @@ test("setup merges identical same-named candidates into one row and keeps differ
   assert.equal((screen.match(/\[skill\] dup —/g) ?? []).length, 2);
   assert.equal((screen.match(/\(\+1 identical copy\)/g) ?? []).length, 1);
 });
+
+test("the resource list is introduced by an explanation that nothing is saved before the final confirmation", async () => {
+  const box = await acceptanceBox();
+  const folder = path.join(box.project, ".pi", "skills", "only");
+  await mkdir(folder, { recursive: true });
+  await writeFile(path.join(folder, "SKILL.md"), "# only\n");
+  const result = await realPty(box, [process.execPath, cli, "setup"], [
+    { waitFor: "Choose the locations", send: "\u001b[B\r" },
+    { waitFor: "Authorize copi", send: "y" },
+    { waitFor: "Select resources to review", send: "\u0003" },
+  ]);
+  const screen = flat(result.output);
+  assert.match(screen, /Choosing resources/);
+  assert.match(screen, /Pick candidates to review\. Nothing is saved yet\./);
+  assert.match(screen, /only if you answer Yes at the final confirmation/);
+  assert.match(screen, /Ctrl-C at any point saves nothing/);
+  assert.ok(screen.indexOf("Choosing resources") < screen.lastIndexOf("Select resources to review"));
+});
