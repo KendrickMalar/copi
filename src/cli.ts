@@ -162,7 +162,16 @@ export async function main(
   }
   if (command === "add") {
     const options = parseAddArgs(rest);
-    const { outcomes, exitCode } = await runAdd(libraryDir, cwd, options);
+    let result: Awaited<ReturnType<typeof runAdd>>;
+    try {
+      result = await runAdd(libraryDir, cwd, options);
+    } catch (error) {
+      // Library-level failures (legacy catalog, unresolved names, locks) still answer in JSON for agents.
+      if (!options.json) throw error;
+      process.stdout.write(`${JSON.stringify({ group: options.group, dryRun: options.dryRun, error: error instanceof Error ? error.message : String(error), results: [] }, null, 2)}\n`);
+      return 1;
+    }
+    const { outcomes, exitCode } = result;
     if (options.json) {
       process.stdout.write(`${JSON.stringify({ group: options.group, dryRun: options.dryRun, results: outcomes }, null, 2)}\n`);
     } else {

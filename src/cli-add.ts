@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, readdir } from "node:fs/promises";
+import { lstat, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, saveCatalog } from "./catalog.ts";
 import { shouldExclude } from "./discovery.ts";
@@ -88,8 +88,12 @@ export async function candidateForPath(requested: string, kindOverride: Resource
   if (!(await lstat(requested).catch(() => undefined))) return "path does not exist";
   let sourcePath: string;
   try { sourcePath = await resolveRefreshPath(requested); } catch { return "symbolic links (in the path or its parent directories) are not followed"; }
-  const relativeToLibrary = path.relative(libraryDir, sourcePath);
-  if (relativeToLibrary === "" || (!relativeToLibrary.startsWith("..") && !path.isAbsolute(relativeToLibrary))) return "paths inside the copi library cannot be added";
+  const physicalLibrary = await realpath(libraryDir).catch(() => path.resolve(libraryDir));
+  for (const library of new Set([path.resolve(libraryDir), physicalLibrary])) {
+    const relativeToLibrary = path.relative(library, sourcePath);
+    const inside = relativeToLibrary === "" || (relativeToLibrary !== ".." && !relativeToLibrary.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeToLibrary));
+    if (inside) return "paths inside the copi library cannot be added";
+  }
   if (shouldExclude(sourcePath.slice(path.parse(sourcePath).root.length))) return "this path is in an excluded location (auth, .env*, caches, history, sessions, .git, node_modules)";
   const stat = await lstat(sourcePath);
   const base = path.basename(sourcePath);
@@ -143,7 +147,12 @@ export async function runAdd(libraryDir: string, cwd: string, options: AddOption
   const pendingNames = new Set<string>();
   for (const raw of options.paths) {
     const sourcePath = path.resolve(cwd, raw);
-    const candidate = await candidateForPath(sourcePath, options.kind, options.name, libraryDir);
+    let candidate: ResourceCandidate | string;
+    try {
+      candidate = await candidateForPath(sourcePath, options.kind, options.name, libraryDir);
+    } catch (error) {
+      candidate = `cannot be inspected: ${error instanceof Error ? error.message : String(error)}`;
+    }
     if (typeof candidate === "string") { outcomes.push({ path: sourcePath, status: "refused", reason: candidate }); continue; }
     const outcome: AddOutcome = { path: sourcePath, status: options.dryRun ? "would-add" : "added", name: candidate.name, kind: candidate.kind };
     try {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -149,4 +149,24 @@ test("parseAddArgs rejects empty names and repeated options and supports --", ()
   assert.throws(() => parseAddArgs(["a", "--group", "g", "--name", " "]), /--name must not be empty/);
   assert.throws(() => parseAddArgs(["a", "--group", "g", "--group", "h"]), /--group was given twice/);
   assert.deepEqual(parseAddArgs(["--group", "g", "--", "--weird-name.md"]).paths, ["--weird-name.md"]);
+});
+
+test("add refuses an unreadable skill per path, refuses library paths, and answers JSON on library-level errors", async (t) => {
+  const b = await box(t);
+  await put(path.join(b.project, "skills", "locked", "SKILL.md"), "# locked\n");
+  await put(path.join(b.project, "skills", "locked", "private", "x.md"), "x\n");
+  await chmod(path.join(b.project, "skills", "locked", "private"), 0o000);
+  await put(path.join(b.project, "AGENTS.md"), "# rules\n");
+  const result = add(b, ["skills/locked", "AGENTS.md", "--group", "g", "--json"]);
+  await chmod(path.join(b.project, "skills", "locked", "private"), 0o755); // before cleanup can remove it
+  assert.equal(result.status, 1);
+  assert.match(result.json.results[0].reason, /^cannot be inspected|^cannot be read for saving/);
+  assert.equal(result.json.results[1].status, "added");
+  const inside = add(b, [path.join(b.library, "catalog.json"), "--kind", "instruction", "--group", "g", "--json"]);
+  assert.equal(inside.json.results[0].status, "refused");
+  await writeFile(path.join(b.library, "catalog.json"), "not json");
+  const broken = add(b, ["AGENTS.md", "--group", "g", "--json"]);
+  assert.equal(broken.status, 1);
+  assert.equal(typeof broken.json.error, "string");
+  assert.deepEqual(broken.json.results, []);
 });
