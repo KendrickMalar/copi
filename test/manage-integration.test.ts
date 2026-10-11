@@ -169,3 +169,16 @@ for (const stage of ["second-secret-No", "final-No", "stale-catalog", "stale-con
     assert.deepEqual(after.snapshots, before.snapshots);
   }
 });
+
+test("setup and group prompts show the Tab key hint and a search progress indicator", async () => {
+  const b = await integrationBox();
+  await sourceFiles(b);
+  const setup = plain((await interactive(b, "key-hint-setup", "setup", setupSteps())).output);
+  for (const prompt of ["Choose the locations copi may inspect", "Select resources to review and save as copied snapshots", "Assign original to one or more groups"]) {
+    assert.ok(setup.includes(`${prompt} (Tab: select, Enter: confirm)`), prompt);
+  }
+  // The spinner draws its first frame after 80 ms; this tiny fixture finishes sooner, so only the stop line is observable.
+  assert.match(setup, /Search complete: \d+ supported resource\(s\) found/);
+  const groups = plain((await interactive(b, "key-hint-groups", "manage", addGroupSteps("Hint bundle", 1))).output);
+  assert.ok(groups.includes("Select resources in Hint bundle (Tab: select, Enter: confirm)"));
+});
