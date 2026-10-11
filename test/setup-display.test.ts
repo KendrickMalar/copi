@@ -141,6 +141,23 @@ test("#9 defaultRenameName appends the grandparent dir of the source, falling ba
   assert.equal(defaultRenameName(cand({ name: "x.md", sourcePath: "/agents/x.md" })), "x.md (agents)");
 });
 
+test("#9 defaultRenameName uses the nearest ancestor dir that differs within the conflict group", () => {
+  const a = cand({ id: "a", name: "jandel.md", sourcePath: "/Users/a/Code/agent-rbx/agents/jandel.md" });
+  const b = cand({ id: "b", name: "jandel.md", sourcePath: "/Users/a/Code/agent/agents/jandel.md" });
+  assert.equal(defaultRenameName(a, [a, b]), "jandel.md (agent-rbx)");
+  assert.equal(defaultRenameName(b, [a, b]), "jandel.md (agent)");
+  // Two same-named skills under different roots: the folders' parents are both "skills"; the roots differ higher up.
+  const s1 = cand({ id: "s1", kind: "skill", name: "dup", sourcePath: "/h/proj-a/.pi/skills/dup" });
+  const s2 = cand({ id: "s2", kind: "skill", name: "dup", sourcePath: "/h/proj-b/.pi/skills/dup" });
+  assert.equal(defaultRenameName(s2, [s1, s2]), "dup (proj-b)");
+  // Three same-named skills in sibling folders.
+  const group = ["set-0", "set-1", "set-2"].map((dir) => cand({ id: dir, kind: "skill", name: "dup", sourcePath: `/p/.pi/skills/${dir}/dup` }));
+  assert.deepEqual(group.map((c) => defaultRenameName(c, group)), ["dup (set-0)", "dup (set-1)", "dup (set-2)"]);
+  // Nothing differs (same parent chain): fall back to the single-candidate rule.
+  const twin = cand({ id: "t", name: "x", sourcePath: "/h/a/b/x.md" });
+  assert.equal(defaultRenameName(twin, [twin, { ...twin, id: "u" }]), "x (a)");
+});
+
 test("#9 pendingNameError rejects empty names and names taken by the library or other pending names", () => {
   const taken = new Set([nameKey("Known"), nameKey("Straße")]);
   assert.equal(pendingNameError("fresh name", taken), undefined);

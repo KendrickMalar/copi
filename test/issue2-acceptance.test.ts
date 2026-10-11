@@ -146,7 +146,7 @@ test("N1/#9 real CLI setup resolves a conflicting selected batch before review; 
   assert.ok(!result.output.includes("Duplicate item name"), result.output);
   assert.ok(result.output.indexOf("Keep all and rename the others") < result.output.indexOf("Masked preview"));
   assert.match(result.output, /PTY actions 9\/9/);
-  assert.deepEqual((await loadCatalog(box.library)).items.map((item) => item.name).sort(), ["STRASSE (skills)", "Straße"]);
+  assert.deepEqual((await loadCatalog(box.library)).items.map((item) => item.name).sort(), ["STRASSE (set-1)", "Straße"]);
   assert.deepEqual(await treeBytes(box.project), projectBefore);
 });
 

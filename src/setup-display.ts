@@ -153,10 +153,28 @@ export function findSelectionConflicts(list: readonly ResourceCandidate[]): Reso
   return [...groups.values()].filter((group) => group.length > 1);
 }
 
-/** `<name> (<grandparent dir of the source>)`, falling back to the parent dir, e.g. `jandel.md (agent-rbx)`. */
-export function defaultRenameName(c: ResourceCandidate): string {
-  const parent = path.dirname(c.sourcePath);
-  const segment = path.basename(path.dirname(parent)) || path.basename(parent);
+/**
+ * Suggested rename `<name> (<segment>)`. Within a conflict group the segment is the nearest ancestor directory
+ * (walking up from the source's parent) whose name tells this member apart from the others — unique if possible,
+ * otherwise the first level where the members differ at all. Without such a level (or alone), the segment is the
+ * grandparent of the source, falling back to its parent, e.g. `jandel.md (agent-rbx)`.
+ */
+export function defaultRenameName(c: ResourceCandidate, group: readonly ResourceCandidate[] = [c]): string {
+  const ancestors = (x: ResourceCandidate) => {
+    const out: string[] = [];
+    for (let dir = path.dirname(x.sourcePath); path.basename(dir); dir = path.dirname(dir)) out.push(path.basename(dir));
+    return out;
+  };
+  const mine = ancestors(c);
+  const others = group.filter((x) => x.id !== c.id).map(ancestors);
+  let segment: string | undefined;
+  if (others.length > 0) {
+    const unique = mine.findIndex((name, level) => others.every((other) => other[level] !== name));
+    const differing = mine.findIndex((name, level) => others.some((other) => other[level] !== name));
+    const level = unique !== -1 ? unique : differing;
+    if (level !== -1) segment = mine[level];
+  }
+  segment ??= mine[1] ?? mine[0];
   return segment ? `${c.name} (${segment})` : c.name;
 }
 

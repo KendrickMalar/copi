@@ -298,6 +298,17 @@ async function askForGroupName(message: string): Promise<string | undefined> {
 }
 
 /**
+ * Rename prompt text. The suggestion is prefilled only when it renders unchanged through `safeDisplay`
+ * (`initialValue` is echoed raw); otherwise the field stays empty and the masked suggestion is shown in the message.
+ */
+export function renamePrompt(name: string, sourceDir: string, suggestion: string): { message: string; initialValue?: string } {
+  const message = `New display name for ${name} \u2014 ${sourceDir} (display name only; files are not changed)`;
+  return safeDisplay(suggestion) === suggestion
+    ? { message, initialValue: suggestion }
+    : { message: `${message}. Suggestion: ${suggestion}` };
+}
+
+/**
  * Resolve display-name conflicts right after selection (#9): within the selection first, one group at a time,
  * then against saved library names. Returns the candidates to review (renamed ones are copies with a new
  * display name only), "back" to re-show the list, or "cancel".
@@ -310,12 +321,11 @@ async function resolveSelectedNames(
 ): Promise<ResourceCandidate[] | "back" | "cancel"> {
   let pending = [...selection];
   const libraryKeys = new Set(library.items.map((item) => nameKey(item.name)));
-  const askNewName = async (candidate: ResourceCandidate): Promise<string | undefined> => {
+  const askNewName = async (candidate: ResourceCandidate, group: readonly ResourceCandidate[] = [candidate]): Promise<string | undefined> => {
     // Taken: every saved name and every other pending name (assertNameAvailable semantics for the library).
     const taken = new Set([...libraryKeys, ...pending.filter((other) => other.id !== candidate.id).map((other) => nameKey(other.name))]);
     const value = await text({
-      message: `New display name for ${candidate.name} \u2014 ${displayPath(path.dirname(candidate.sourcePath), homeDir)} (display name only; files are not changed)`,
-      initialValue: defaultRenameName(candidate),
+      ...renamePrompt(candidate.name, displayPath(path.dirname(candidate.sourcePath), homeDir), defaultRenameName(candidate, group)),
       validate: (name) => {
         const error = pendingNameError(name, taken);
         if (error) return error;
@@ -342,7 +352,7 @@ async function resolveSelectedNames(
     if (choice === "back") return "back";
     if (choice === "rename") {
       for (const candidate of group.slice(1)) {
-        const name = await askNewName(pending.find((entry) => entry.id === candidate.id)!);
+        const name = await askNewName(pending.find((entry) => entry.id === candidate.id)!, group);
         if (name === undefined) return "cancel";
         rename(candidate, name);
       }
@@ -356,7 +366,7 @@ async function resolveSelectedNames(
   for (const candidate of [...pending]) {
     if (!libraryKeys.has(nameKey(candidate.name))) continue;
     const choice = await select<"skip" | "rename" | "back">({
-      message: `${labels.get(candidate.id) ?? candidate.name}: a saved resource already uses this name. To update the saved copy, use Refresh in copi manage.`,
+      message: `${candidate.name} \u2014 ${displayPath(path.dirname(candidate.sourcePath), homeDir)}: a saved resource already uses this name. To update the saved copy, use Refresh in copi manage.`,
       options: [
         { value: "skip", label: "Skip (keep the saved copy)" },
         { value: "rename", label: "Rename" },
@@ -458,10 +468,6 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     });
     if (isCancel(selectedIds)) {
       cancel("Setup cancelled; no resources were saved.");
-      return;
-    }
-    if (selectedIds.length === 0) {
-      outro("No resources selected; nothing was saved.");
       return;
     }
     previousSelection = selectedIds;
