@@ -41,6 +41,7 @@ test("#9 keep one: choosing a single candidate saves only that one, before any p
     ...start, selectFirstTwo,
     { waitFor: conflict, send: `${down}\r` },
     { waitFor: "Create the first resource group", send: "team\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -67,6 +68,7 @@ test("#9 rename: only the display name changes; validation rejects taken names; 
     { waitFor: "already used", send: "\u0015dup copy\r" },
     { waitFor: "Create the first resource group", send: "team\r" },
     { waitFor: "Put all 2 resources", send: "\r" },
+    { waitFor: "Put all 2 resources in these groups", send: "\r" },
     { waitFor: "Save 2 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -91,6 +93,7 @@ test("#9 library conflict skip keeps the saved copy untouched and saves the rest
     ...start, selectFirstTwo,
     { waitFor: "Skip (keep the saved copy)", send: "\r" },
     { waitFor: "Create the first resource group", send: "team\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -128,6 +131,7 @@ test("#9 library conflict Rename saves under the new name and leaves the saved i
     { waitFor: "Skip (keep the saved copy)", send: `${down}\r` },
     { waitFor: "New display name for Known", send: "\u0015Known local\r" },
     { waitFor: "Create the first resource group", send: "team\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -151,6 +155,7 @@ test("#9 rename prompt never echoes raw control bytes and is not prefilled with 
     { waitFor: "Enter a non-empty display name", send: "clean name\r" },
     { waitFor: "Create the first resource group", send: "team\r" },
     { waitFor: "Put all 2 resources", send: "\r" },
+    { waitFor: "Put all 2 resources in these groups", send: "\r" },
     { waitFor: "Save 2 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -171,6 +176,7 @@ test("#9 go back re-shows the list with the previous selection, then resolves", 
     // Both rows are preselected and the cursor starts on the first row (set-0): move to set-1 and un-select it.
     { waitFor: "Select resources to review", send: `${down}\t\r` },
     { waitFor: "Create the first resource group", send: "team\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);

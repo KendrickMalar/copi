@@ -249,7 +249,7 @@ test("U2 manage group manager saves membership/name through the existing revisio
     {waitFor:"Manage saved resources",send:`${down}\r`},
     {waitFor:"Manage saved groups",send:`${down}\r`}, {waitFor:"Select group",send:"\r"},
     {waitFor:"New name for",send:"Renamed group\r"},
-    {waitFor:"Manage saved groups",send:`${down.repeat(3)}\r`}, {waitFor:"Save these group changes",send:"y\r"},finish,
+    {waitFor:"Manage saved groups",send:`${down.repeat(4)}\r`}, {waitFor:"Save these group changes",send:"y\r"},finish,
   ]);
   assert.equal(run.code,0,run.output);
   const group = (await loadCatalog(box.libraryDir)).groups[0]!;

@@ -37,7 +37,8 @@ test("#12 bulk default: 4 resources, one new group, no per-resource Assign promp
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     ...start, selectFour,
     { waitFor: "Create the first resource group", send: "team\r" },
-    { waitFor: "Put all 4 resources in \"team\"", send: "\r" },
+    { waitFor: "Put all 4 resources in the same groups", send: "\r" },
+    { waitFor: "Put all 4 resources in these groups", send: "\r" },
     { waitFor: "Save 4 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);

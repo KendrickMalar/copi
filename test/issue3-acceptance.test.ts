@@ -102,9 +102,9 @@ for (const stage of ["search-No", "secret-one-No", "secret-two-No", "final-No"] 
   const b = await box(); await source(b); const before = await observe(b, "setup-before");
   let steps = setupSteps();
   if (stage === "search-No") steps = [steps[0]!, answer("Authorize copi to search only", "n\r")];
-  if (stage === "secret-one-No") steps = [...steps.slice(0, 4), answer("Save suspected sensitive file a.md", "n\r"), answer("Save suspected sensitive file SKILL.md")];
-  if (stage === "secret-two-No") steps = [...steps.slice(0, 5), answer("Save suspected sensitive file SKILL.md", "n\r")];
-  if (stage === "final-No") steps[6] = answer("Save 1 copied resource(s)", "n\r");
+  if (stage === "secret-one-No") steps = [...steps.slice(0, 5), answer("Save suspected sensitive file a.md", "n\r"), answer("Save suspected sensitive file SKILL.md")];
+  if (stage === "secret-two-No") steps = [...steps.slice(0, 6), answer("Save suspected sensitive file SKILL.md", "n\r")];
+  if (stage === "final-No") steps[7] = answer("Save 1 copied resource(s)", "n\r");
   const r = await run(b, stage, ["setup"], steps); masked(r.output, oldSecrets);
   assert.match(plain(r.output), /not authorized|No resources were approved|Nothing was saved/);
   await unchanged(b, before, "setup-after");

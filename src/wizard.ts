@@ -3,7 +3,8 @@ import { lstat } from "node:fs/promises";
 import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, isWorktreeCopy, piAgentDirectories, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
-import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
+import { createGroup, deleteGroup, renameGroup, setGroupItems } from "./groups.ts";
+import { groupPicker } from "./group-picker.ts";
 import { candidateHint, candidateLabels, collapseIdenticalCandidates, contentFingerprint, defaultRenameName, displayPath, findSelectionConflicts, formatPiProgress, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, identicalCopiesSuffix, mapWithLimit, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
@@ -293,10 +294,88 @@ function groupOptions(groups: Group[], pendingCounts?: ReadonlyMap<string, numbe
   }));
 }
 
-async function askForGroupName(message: string, placeholder?: string): Promise<string | undefined> {
+/**
+ * The setup assignment list: pick groups, or create, rename and delete groups in place and come back with the
+ * selection kept. Deleting also drops the group from resources already assigned in this setup.
+ * Returns undefined when the person cancels the list itself.
+ */
+async function chooseGroups(
+  catalog: Catalog,
+  message: string,
+  initialValues: string[],
+  assigned: ReadonlyArray<{ groupIds: string[] }>,
+): Promise<string[] | undefined> {
+  let selection = initialValues;
+  while (true) {
+    const pendingCounts = new Map<string, number>();
+    for (const entry of assigned) for (const id of entry.groupIds) pendingCounts.set(id, (pendingCounts.get(id) ?? 0) + 1);
+    const result = await groupPicker({
+      message: `${safeDisplay(message)} ${multiselectKeyHint}`,
+      groups: groupOptions(catalog.groups, pendingCounts).map((option) => ({ id: option.value, label: safeDisplay(option.label), hint: safeDisplay(option.hint) })),
+      initialValues: selection,
+      ...inheritedSignal(),
+    });
+    if (isCancel(result)) return undefined;
+    if (result.kind === "assign") return result.groupIds;
+    selection = result.groupIds;
+    if (result.kind === "new") {
+      // Esc at the name goes back to the list rather than ending setup.
+      // Typing a name that matches nothing and pressing Enter lands on "New group" with that text as the name.
+      const name = await askForGroupName("New group name (Esc: back to the list)", undefined, result.filter);
+      if (name === undefined) continue;
+      try {
+        selection = [...selection, createGroup(catalog, name).id];
+      } catch (error) {
+        log.warn(safeDisplay(error instanceof Error ? error.message : String(error)));
+      }
+      continue;
+    }
+    const groupId = await select<string>({
+      message: "Which group?",
+      options: [...groupOptions(catalog.groups, pendingCounts), { value: "", label: "Back to the list" }],
+    });
+    if (isCancel(groupId) || groupId === "") continue;
+    const group = catalog.groups.find((entry) => entry.id === groupId);
+    if (!group) continue;
+    const action = await select<"rename" | "delete" | "back">({
+      message: `${group.name}: what do you want to do?`,
+      options: [
+        { value: "rename", label: "Rename" },
+        { value: "delete", label: "Delete" },
+        { value: "back", label: "Back to the list" },
+      ],
+    });
+    if (isCancel(action) || action === "back") continue;
+    if (action === "rename") {
+      const name = await askForGroupName(`New name for ${group.name} (Esc: back to the list)`);
+      if (name === undefined) continue;
+      try {
+        renameGroup(catalog, group.id, name);
+      } catch (error) {
+        log.warn(safeDisplay(error instanceof Error ? error.message : String(error)));
+      }
+      continue;
+    }
+    const pending = pendingCounts.get(group.id) ?? 0;
+    if (group.itemIds.length > 0 || pending > 0) {
+      const effects = [
+        group.itemIds.length > 0 ? `its ${group.itemIds.length} saved resource(s) stay in the library but leave this group` : "",
+        pending > 0 ? `${pending} resource(s) already assigned in this setup lose this group` : "",
+      ].filter(Boolean).join("; ");
+      const sure = await confirm({ message: `Delete group ${group.name}? ${effects}. Takes effect only if you save at the end.`, initialValue: false });
+      if (isCancel(sure) || !sure) continue;
+    }
+    deleteGroup(catalog, group.id);
+    for (const entry of assigned) entry.groupIds = entry.groupIds.filter((id) => id !== group.id);
+    selection = selection.filter((id) => id !== group.id);
+  }
+}
+
+async function askForGroupName(message: string, placeholder?: string, initialValue?: string): Promise<string | undefined> {
   const value = await text({
     message,
     ...(placeholder !== undefined ? { placeholder } : {}),
+    ...(initialValue ? { initialValue } : {}),
     validate: (name) => {
       try { nameKey(name ?? ""); return undefined; }
       catch { return "Enter a non-empty group name."; }
@@ -597,6 +676,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
 
   const catalog = await loadCatalog(libraryDir);
   assertModernCatalog(catalog);
+  const groupsAtStart = catalog.groups.map((group) => ({ id: group.id, name: group.name, saved: group.itemIds.length }));
   if (catalog.groups.length === 0) {
     const name = await askForGroupName("Create the first resource group \u2014 used later with: copi apply <group>", "e.g. game-review");
     if (name === undefined) {
@@ -604,21 +684,6 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       return;
     }
     createGroup(catalog, name);
-  } else {
-    while (true) {
-      const add = await confirm({ message: "Create another group before assigning resources?", initialValue: false });
-      if (isCancel(add)) {
-        cancel("Setup cancelled; no resources were saved.");
-        return;
-      }
-      if (!add) break;
-      const name = await askForGroupName("New group name");
-      if (name === undefined) {
-        cancel("Setup cancelled; no resources were saved.");
-        return;
-      }
-      createGroup(catalog, name);
-    }
   }
 
   // Keep discovery order for review; renamed copies replace their originals by id.
@@ -629,12 +694,14 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   let bulkGroupIds: string[] | undefined;
   const count = selectedCandidates.length;
   const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
+  // Groups can be created, renamed and deleted from the assignment list; nothing reaches disk before the final Yes.
+  const pickGroups = (message: string, initialValues: string[]) => chooseGroups(catalog, message, initialValues, approvedCandidates);
   let bulk = count === 1;
   if (count >= 2) {
     const mode = await select<"all" | "each">({
       message: "How should these resources be grouped?",
       options: [
-        { value: "all", label: onlyGroup ? `Put all ${count} resources in "${onlyGroup.name}"` : `Put all ${count} resources in the same groups` },
+        { value: "all", label: `Put all ${count} resources in the same groups` },
         { value: "each", label: "Choose groups for each resource" },
       ],
       initialValue: "all",
@@ -646,20 +713,12 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     bulk = mode === "all";
   }
   if (bulk) {
-    if (onlyGroup) bulkGroupIds = [onlyGroup.id];
-    else {
-      const chosen = await autocompleteMultiselect({
-        message: count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`,
-        options: groupOptions(catalog.groups),
-        required: true,
-        placeholder: "Filter groups...",
-      });
-      if (isCancel(chosen)) {
-        cancel("Setup cancelled; no resources were saved.");
-        return;
-      }
-      bulkGroupIds = chosen;
+    const chosen = await pickGroups(count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`, onlyGroup ? [onlyGroup.id] : []);
+    if (chosen === undefined) {
+      cancel("Setup cancelled; no resources were saved.");
+      return;
     }
+    bulkGroupIds = chosen;
   }
   for (const [index, candidate] of selectedCandidates.entries()) {
     const review = await prepareCandidateForReview(candidate);
@@ -692,15 +751,8 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       approvedCandidates.push({ review, groupIds: bulkGroupIds, approvedSensitivePaths });
       continue;
     }
-    const pendingCounts = new Map<string, number>();
-    for (const approved of approvedCandidates) for (const id of approved.groupIds) pendingCounts.set(id, (pendingCounts.get(id) ?? 0) + 1);
-    const groupIds = await autocompleteMultiselect({
-      message: `Assign ${review.candidate.name} to one or more groups`,
-      options: groupOptions(catalog.groups, pendingCounts),
-      required: true,
-      placeholder: "Filter groups...",
-    });
-    if (isCancel(groupIds)) {
+    const groupIds = await pickGroups(`Assign ${review.candidate.name} to one or more groups`, []);
+    if (groupIds === undefined) {
       cancel("Setup cancelled; nothing was saved.");
       return;
     }
@@ -713,9 +765,18 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
   const summary = approvedCandidates.map(({ review, groupIds }) => {
     const names = groupIds.map((id) => catalog.groups.find((group) => group.id === id)?.name ?? "Unavailable group").join(", ");
-    return `${review.candidate.name} → ${names}`;
+    return `${review.candidate.name} → ${names || "no group"}`;
   }).join("\n");
-  note(`${summary}\n\nSecret detection is heuristic and cannot guarantee completeness.`, "Resources ready to copy");
+  // Deletions and renames of saved groups happen at the same final Yes, so show them here too.
+  const groupChanges = [
+    ...catalog.groups.filter((group) => !groupsAtStart.some((start) => start.id === group.id)).map((group) => `created ${group.name}`),
+    ...groupsAtStart.flatMap((start) => {
+      const now = catalog.groups.find((group) => group.id === start.id);
+      if (!now) return [`deleted ${start.name}${start.saved > 0 ? ` (its ${start.saved} saved resource(s) stay in the library)` : ""}`];
+      return now.name === start.name ? [] : [`renamed ${start.name} → ${now.name}`];
+    }),
+  ];
+  note(`${summary}${groupChanges.length > 0 ? `\n\nGroup changes: ${groupChanges.join("; ")}` : ""}\n\nSecret detection is heuristic and cannot guarantee completeness.`, "Resources ready to copy");
   const libraryLabel = displayPath(libraryDir, homeDir);
   const save = await confirm({
     message: `Save ${approvedCandidates.length} copied resource(s) in ${libraryLabel}? Original files will not be changed.`,
@@ -738,13 +799,25 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
     pendingItemNames.add(candidateName);
   }
   await saveCatalog(libraryDir, catalog);
-  for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
-    await saveReviewedCandidate(libraryDir, review, groupIds, approvedSensitivePaths, true);
+  let savedCount = 0;
+  try {
+    for (const { review, groupIds, approvedSensitivePaths } of approvedCandidates) {
+      await saveReviewedCandidate(libraryDir, review, groupIds, approvedSensitivePaths, true);
+      savedCount += 1;
+    }
+  } catch (error) {
+    log.error(safeDisplay(`Group changes were saved; ${savedCount} of ${approvedCandidates.length} resource(s) were saved before this error.`));
+    throw error;
   }
   const usedGroupIds = new Set(approvedCandidates.flatMap(({ groupIds }) => groupIds));
   const usedGroups = catalog.groups.filter((group) => usedGroupIds.has(group.id)).map((group) => group.name);
+  if (usedGroups.length === 0) {
+    log.info(safeDisplay(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryLabel}, not in any group.`));
+    outro("Next: add them to a group with copi manage, then copi apply <group> <project> --dry-run");
+    return;
+  }
   log.info(safeDisplay(`Saved ${approvedCandidates.length} copied resource(s) in ${libraryLabel} (group: ${usedGroups.join(", ")}).`));
-  outro(`Next: copi apply ${shellQuote(usedGroups[0] ?? "<group>")} <project> --dry-run   (edit or rename: copi manage)`);
+  outro(`Next: copi apply ${shellQuote(usedGroups[0]!)} <project> --dry-run   (edit or rename: copi manage)`);
 }
 
 export async function runGroupManager(libraryDir: string): Promise<void> {
@@ -765,6 +838,7 @@ export async function runGroupManager(libraryDir: string): Promise<void> {
         ...(catalog.groups.length > 0 ? [
           { value: "rename", label: "Rename group" },
           { value: "assign", label: "Edit group membership" },
+          { value: "delete", label: "Delete group" },
         ] : []),
         { value: "done", label: "Finish" },
       ],
@@ -788,6 +862,20 @@ export async function runGroupManager(libraryDir: string): Promise<void> {
     if (isCancel(groupId)) {
       cancel("Group changes were not saved.");
       return;
+    }
+    if (action === "delete") {
+      const group = catalog.groups.find((entry) => entry.id === groupId);
+      if (!group) throw new Error("Selected group is no longer available.");
+      const sure = await confirm({
+        message: `Delete group ${group.name}?${group.itemIds.length > 0 ? ` Its ${group.itemIds.length} saved resource(s) stay in the library; they only leave this group.` : ""}`,
+        initialValue: false,
+      });
+      if (isCancel(sure)) {
+        cancel("Group changes were not saved.");
+        return;
+      }
+      if (sure) deleteGroup(catalog, groupId);
+      continue;
     }
     if (action === "rename") {
       const group = catalog.groups.find((entry) => entry.id === groupId);

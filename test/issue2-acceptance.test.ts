@@ -139,12 +139,13 @@ test("N1/#9 real CLI setup resolves a conflicting selected batch before review; 
     { waitFor: "New display name for STRASSE", send: "\r" },
     { waitFor: "Create the first resource group", send: "test-team\r" },
     { waitFor: "Put all 2 resources", send: "\r" },
+    { waitFor: "Put all 2 resources in these groups", send: "\r" },
     { waitFor: "Save 2 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
   assert.ok(!result.output.includes("Duplicate item name"), result.output);
   assert.ok(result.output.indexOf("Keep all and rename the others") < result.output.indexOf("Masked preview"));
-  assert.match(result.output, /PTY actions 8\/8/);
+  assert.match(result.output, /PTY actions 9\/9/);
   assert.deepEqual((await loadCatalog(box.library)).items.map((item) => item.name).sort(), ["STRASSE (set-1)", "Straße"]);
   assert.deepEqual(await treeBytes(box.project), projectBefore);
 });
@@ -361,7 +362,7 @@ for (const corruption of ["none", "checksum", "file symlink"] as const) {
       { waitFor: "Manage saved groups", send: "\u001b[B\r" },
       { waitFor: "Select group", send: "\r" },
       { waitFor: "New name for", send: "Explicit new team\r" },
-      { waitFor: "Manage saved groups", send: "\u001b[B\u001b[B\u001b[B\r" },
+      { waitFor: "Manage saved groups", send: "\u001b[B\u001b[B\u001b[B\u001b[B\r" },
       { waitFor: "Save these group changes", send: "y" },
     ]);
     if (corruption !== "file symlink") {

@@ -596,10 +596,14 @@ function validateCatalogOnlyTransition(previous: Catalog, next: Catalog): void {
       throw new Error("A catalog-only transaction may change only item names and legal destinations; source metadata, descriptors, and content are fixed.");
     }
   }
-  if (next.groups.length < previous.groups.length) throw new Error("A catalog-only transaction cannot remove groups.");
-  for (const [index, oldGroup] of previous.groups.entries()) {
-    const nextGroup = next.groups[index];
-    if (!nextGroup || nextGroup.id !== oldGroup.id) throw new Error("A catalog-only transaction must preserve existing group order and identity.");
+  // Groups may be deleted (their items stay); surviving groups keep their order and identity, new ones are appended.
+  const previousIds = new Set(previous.groups.map((group) => group.id));
+  const survivors = next.groups.filter((group) => previousIds.has(group.id)).map((group) => group.id);
+  const survivorSet = new Set(survivors);
+  const expected = previous.groups.map((group) => group.id).filter((id) => survivorSet.has(id));
+  const firstNew = next.groups.findIndex((group) => !previousIds.has(group.id));
+  if (JSON.stringify(survivors) !== JSON.stringify(expected) || (firstNew >= 0 && next.groups.slice(firstNew).some((group) => previousIds.has(group.id)))) {
+    throw new Error("A catalog-only transaction must preserve existing group order and identity.");
   }
 }
 
