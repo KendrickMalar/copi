@@ -36,3 +36,9 @@ export function setGroupItems(catalog: Catalog, groupId: string, itemIds: string
   if (itemIds.some((id) => !knownItems.has(id))) throw new Error("Group membership references an unknown saved item.");
   group.itemIds = [...itemIds];
 }
+
+/** Remove a group. Its saved resources stay in the library; they only leave this group. */
+export function deleteGroup(catalog: Catalog, groupId: string): void {
+  const group = findGroup(catalog, groupId);
+  catalog.groups = catalog.groups.filter((entry) => entry !== group);
+}

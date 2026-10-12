@@ -38,6 +38,7 @@ test("#13/#15 clean review: progress title, no inspection warnings note, summary
     ...start,
     { waitFor: "Select resources to review", send: "\t\r" },
     { waitFor: "Create the first resource group", send: "team\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -58,6 +59,7 @@ test("#13 progress counts resources reviewed", async () => {
     ...start, selectTwo,
     { waitFor: "Create the first resource group", send: "team\r" },
     { waitFor: "Put all 2 resources", send: "\r" },
+    { waitFor: "Put all 2 resources in these groups", send: "\r" },
     { waitFor: "Save 2 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -73,6 +75,7 @@ test("#13 sensitive confirm states that declining drops the whole resource", asy
     ...start,
     { waitFor: "Select resources to review", send: "\t\r" },
     { waitFor: "Create the first resource group", send: "team\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save suspected sensitive file", send: "\u0003" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -92,7 +95,6 @@ test("#12 follow-up: two groups, two resources -> mode select, then one multisel
   await seedGroups(box, ["aa", "bb"]);
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     ...start, selectTwo,
-    { waitFor: "Create another group", send: "n" },
     { waitFor: "How should these resources be grouped?", send: "\r" },
     { waitFor: "Put all 2 resources in these groups", send: "\t\r" },
     { waitFor: "Save 2 copied resource(s)", send: "y" },
@@ -112,7 +114,6 @@ test("#12 follow-up: two groups, one resource -> direct multiselect naming the r
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     ...start,
     { waitFor: "Select resources to review", send: "\t\r" },
-    { waitFor: "Create another group", send: "n" },
     { waitFor: "Assign alpha to one or more groups", send: "\t\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
@@ -130,7 +131,6 @@ test("#12 follow-up: Ctrl-C on the mode select saves nothing", async () => {
   const before = await treeBytes(box.library);
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     ...start, selectTwo,
-    { waitFor: "Create another group", send: "n" },
     { waitFor: "How should these resources be grouped?", send: "\u0003" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -145,6 +145,7 @@ test("#15 outro keeps the frame and quotes a group name with spaces in the next 
     ...start,
     { waitFor: "Select resources to review", send: "\t\r" },
     { waitFor: "Create the first resource group", send: "Alpha 日本\r" },
+    { waitFor: "to one or more groups", send: "\r" },
     { waitFor: "Save 1 copied resource(s)", send: "y" },
   ]);
   assert.equal(result.code, 0, result.output);
@@ -191,7 +192,6 @@ test("#12 follow-up: Ctrl-C at the bulk groups multiselect saves nothing", async
   const before = await treeBytes(box.library);
   const result = await realPty(box, [process.execPath, cli, "setup"], [
     ...start, selectTwo,
-    { waitFor: "Create another group", send: "n" },
     { waitFor: "How should these resources be grouped?", send: "\r" },
     { waitFor: "Put all 2 resources in these groups", send: "\u0003" },
   ]);

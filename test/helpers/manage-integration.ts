@@ -74,14 +74,14 @@ export const finish = choose("Manage saved resources", 4);
 export const resource = (index: number): Step[] => [choose("Manage saved resources"), choose("Select saved resource"), choose("Resource action", index)];
 export function setupSteps(): Step[] {
   return [at("Choose the locations copi may inspect", `${down}\r`), at("Authorize copi to search only", "y\r"),
-    at("Select resources to review", "\t\r"), at("Create the first resource group", "First bundle\r"),
+    at("Select resources to review", "\t\r"), at("Create the first resource group", "First bundle\r"), at("to one or more groups", "\r"),
     at("Save suspected sensitive file second.md", "y\r"), at("Save suspected sensitive file SKILL.md", "y\r"),
     at("Save 1 copied resource(s)", "y\r")];
 }
 export function addGroupSteps(name: string, index: number): Step[] {
   return [choose("Manage saved resources", 1), choose("Manage saved groups"), at("New group name", `${name}\r`),
     choose("Manage saved groups", 2), choose("Select group", index), at(`Select resources in ${name}`, "\t\r"),
-    choose("Manage saved groups", 3), at("Save these group changes"), finish];
+    choose("Manage saved groups", 4), at("Save these group changes"), finish];
 }
 export async function interactive(b: IntegrationBox, label: string, command: "setup" | "manage", steps: Step[], expectedCode = 0) {
   for (const step of steps) {

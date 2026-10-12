@@ -119,7 +119,7 @@ test("I1/I2 real setup → name edit → rename → fixed refresh → all groups
 
 test("I3 real setup two concrete secret approvals: second No cannot register an incompletely approved resource", async () => {
   const b = await integrationBox(); await sourceFiles(b); const before = await evidence(b, "setup-denial-before");
-  const steps = setupSteps().slice(0, 6); steps[5] = at("Save suspected sensitive file SKILL.md", "n\r");
+  const steps = setupSteps().slice(0, 7); steps[6] = at("Save suspected sensitive file SKILL.md", "n\r");
   const run = await interactive(b, "setup-second-secret-no", "setup", steps);
   assert.match(plain(run.output), /No resources were approved/);
   const after = await evidence(b, "setup-denial-after");

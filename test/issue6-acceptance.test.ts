@@ -28,7 +28,7 @@ test("U1 independent real name routes: view, confirmed rename and separate place
 
 for (const operation of ["rename", "destination", "group"] as const) test(`U1/U2 ${operation} explicit No preserves full raw filesystem`, async () => {
   const b = await fixture(), before = await custody(b);
-  const steps: Step[] = operation === "group" ? [choose("Manage saved resources", 1), choose("Manage saved groups"), { wait: "New group name", text: "Not saved\r" }, choose("Manage saved groups", 3), { wait: "Save these group changes", text: "n\r" }] :
+  const steps: Step[] = operation === "group" ? [choose("Manage saved resources", 1), choose("Manage saved groups"), { wait: "New group name", text: "Not saved\r" }, choose("Manage saved groups", 4), { wait: "Save these group changes", text: "n\r" }] :
     [choose("Manage saved resources"), choose("Select saved resource"), choose("Resource action", operation === "rename" ? 2 : 3), ...(operation === "rename" ? [{ wait: "New display name", text: "Abandoned\r" }, { wait: "Save display name", text: "n\r" }] : [choose("Destination kind"), { wait: "New project-relative destination", text: ".pi/skills/abandoned\r" }, { wait: "Save destination", text: "n\r" }])];
   const run = await manage(b, [...steps, finish]); success(run); assert.deepEqual(await custody(b), before); noIds(run.output, [b.item.id, b.group.id]);
 });
@@ -48,7 +48,7 @@ test("U1 legacy Unicode duplicates allow masked view/explicit resolution only; c
 test("U2 actual group membership then target apply keeps originals and saved bytes, without UUID input", async () => {
   const b = await fixture(), second = await add(b, { "SKILL.md": "backup route\n" }, "Spare itinerary", ".pi/skills/spare");
   const before = await custody(b), target = path.join(b.cwd, "chosen-target"); await mkdir(target);
-  const run = await manage(b, [choose("Manage saved resources", 1), choose("Manage saved groups", 2), choose("Select group"), { wait: "Select resources in", text: `${down} \r` }, choose("Manage saved groups", 3), { wait: "Save these group changes", text: "y\r" },
+  const run = await manage(b, [choose("Manage saved resources", 1), choose("Manage saved groups", 2), choose("Select group"), { wait: "Select resources in", text: `${down} \r` }, choose("Manage saved groups", 4), { wait: "Save these group changes", text: "y\r" },
     choose("Manage saved resources", 2), choose("Select group to apply"), { wait: "Apply target directory", text: `\x01\x0b${target}\r` }, { wait: "Apply the selected snapshots", text: "y\r" }, finish]);
   success(run); noIds(run.output, [b.item.id, second.item.id, b.group.id]);
   assert.deepEqual((await loadCatalog(b.library)).groups[0]!.itemIds, [b.item.id, second.item.id]);
@@ -257,7 +257,7 @@ for (const operation of ["rename", "placement", "group"] as const) test(`U1/U2/U
   if (operation === "placement") external.items[0]!.destination = { kind: "project", path: ".pi/skills/external-placement" };
   if (operation === "group") external.groups[0]!.name = "External user group";
   const externalBytes = `${JSON.stringify(external, null, 2)}\n`;
-  const staged: Step[] = operation === "group" ? [choose("Manage saved resources", 1), choose("Manage saved groups", 1), choose("Select group"), { wait: "New name for", text: "Local pending group\r" }, choose("Manage saved groups", 3)] :
+  const staged: Step[] = operation === "group" ? [choose("Manage saved resources", 1), choose("Manage saved groups", 1), choose("Select group"), { wait: "New name for", text: "Local pending group\r" }, choose("Manage saved groups", 4)] :
     [choose("Manage saved resources"), choose("Select saved resource"), choose("Resource action", operation === "rename" ? 2 : 3), ...(operation === "rename" ? [{ wait: "New display name", text: "Local pending rename\r" }] : [choose("Destination kind"), { wait: "New project-relative destination", text: ".pi/skills/local-pending\r" }])];
   const confirmation = operation === "rename" ? "Save display name only" : operation === "placement" ? "Save destination only" : "Save these group changes";
   const run = await manage(b, [...staged, { wait: confirmation, replace: { path: catalogPath, text: externalBytes }, text: "y\r" }, finish]);

@@ -82,7 +82,7 @@ export async function source(b: Fixture, files: Record<string, string | Buffer> 
 }
 export function setupSteps(secret = true): Step[] {
   return [answer("Choose the locations copi may inspect", `${down}\r`), answer("Authorize copi to search only the selected locations"),
-    answer("Select resources to review and save", "\t\r"), answer("Create the first resource group", "Alpha 日本\r"),
+    answer("Select resources to review and save", "\t\r"), answer("Create the first resource group", "Alpha 日本\r"), answer("to one or more groups", "\r"),
     ...(secret ? [answer("Save suspected sensitive file a.md"), answer("Save suspected sensitive file SKILL.md")] : []),
     answer("Save 1 copied resource(s)")];
 }
@@ -147,7 +147,7 @@ export async function snapshot(b: Fixture, expected: Record<string, string | Buf
 export function groupSteps(name: string, index: number): Step[] {
   return [select("Manage saved resources", 1), select("Manage saved groups"), answer("New group name", `${name}\r`),
     select("Manage saved groups", 2), select("Select group", index), answer(`Select resources in ${name}`, "\t\r"),
-    select("Manage saved groups", 3), answer("Save these group changes"), finish];
+    select("Manage saved groups", 4), answer("Save these group changes"), finish];
 }
 export const refreshRoute = () => [...route(4), answer("Authorize reading only this selected source file or directory tree now?")];
 export function refreshApprovals(): Step[] {
