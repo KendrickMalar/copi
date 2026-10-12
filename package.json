@@ -1,6 +1,6 @@
 {
   "name": "@papillon6814/copi",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Collect and organize reusable Pi coding-agent resources",
   "license": "MIT",
   "type": "module",

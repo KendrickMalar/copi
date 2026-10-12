@@ -136,7 +136,7 @@ function runPi(command: string, prompt: string, timeoutMs: number, signal?: Abor
 /** Ask Pi (no tools, masked excerpts only) for keep/skip suggestions, in chunks of 40 candidates. */
 export async function askPiForSuggestions(
   candidates: readonly ResourceCandidate[],
-  options: { command: string; timeoutMs?: number; signal?: AbortSignal },
+  options: { command: string; timeoutMs?: number; signal?: AbortSignal; onProgress?: (done: number, total: number) => void },
 ): Promise<SuggestionResult> {
   const suggestions = new Map<string, Suggestion>();
   for (let offset = 0; offset < candidates.length; offset += chunkSize) {
@@ -149,6 +149,7 @@ export async function askPiForSuggestions(
       const suggestion = parsed.get(item.id);
       if (suggestion) suggestions.set(item.candidate.id, suggestion);
     }
+    options.onProgress?.(offset + chunk.length, candidates.length);
   }
   return { ok: true, suggestions };
 }

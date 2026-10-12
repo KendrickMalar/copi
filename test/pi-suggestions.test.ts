@@ -63,6 +63,19 @@ test("askPiForSuggestions runs Pi isolated and maps verdicts back to candidates"
   for (const flag of isolatedPiFlags) assert.ok(args.includes(flag), `pi runs with ${flag}`);
 });
 
+test("askPiForSuggestions reports progress once per chunk of 40", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "copi-suggest-progress-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "a"), { recursive: true });
+  await writeFile(path.join(root, "a", "SKILL.md"), "# a\n");
+  const pi = await fakePi(root, "echo '[]'");
+  const list = Array.from({ length: 45 }, (_, index) => cand(`c${index}`, path.join(root, "a")));
+  const events: Array<[number, number]> = [];
+  const result = await askPiForSuggestions(list, { command: pi.command, onProgress: (done, total) => events.push([done, total]) });
+  assert.ok(result.ok);
+  assert.deepEqual(events, [[40, 45], [45, 45]]);
+});
+
 test("askPiForSuggestions reports failures instead of throwing: exit code, garbage, timeout", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "copi-suggest-fail-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -116,6 +129,7 @@ test("setup: suggestions are opt-in (default No never runs Pi) and keep-verdicts
     { waitFor: "1 items selected", send: "\u0003" },
   ]);
   const screen = flat(accepted.output);
+  assert.match(screen, /Asking Pi\s+0\/2 resources · \d+s/, "a bar with count and elapsed time while Pi answers");
   assert.match(screen, /★ \[skill\] keeper/);
   assert.match(screen, /· \[skill\] dropper/);
   assert.match(screen, /Pi: skip — near empty/);

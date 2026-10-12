@@ -193,6 +193,17 @@ export function formatSearchProgress(progress: { done: number; total: number; cu
   return progress.current === undefined ? `${count}  Searching` : `${count}  ${displayPath(progress.current, home)}`;
 }
 
+/** Elapsed time as `42s` or `1m05s`. */
+export function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/** Bar text while Pi reviews candidates: `40/77 resources · 1m05s`. */
+export function formatPiProgress(done: number, total: number, elapsedMs: number): string {
+  return `${done}/${total} resources \u00b7 ${formatElapsed(elapsedMs)}`;
+}
+
 const fingerprintMaxFiles = 2000;
 const fingerprintMaxBytes = 50 * 1024 * 1024;
 

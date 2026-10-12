@@ -4,7 +4,7 @@ import path from "node:path";
 import { assertModernCatalog, importPreparedResource, loadCatalog, prepareResource, readPreparedResource, readSnapshotFiles, saveCatalog, saveNameChanges, type PreparedFile, type PreparedInspection, type PreparedResource } from "./catalog.ts";
 import { discoverResources, isWorktreeCopy, piAgentDirectories, type DiscoveryOptions, type DiscoveryProgress } from "./discovery.ts";
 import { createGroup, renameGroup, setGroupItems } from "./groups.ts";
-import { candidateHint, candidateLabels, collapseIdenticalCandidates, contentFingerprint, defaultRenameName, displayPath, findSelectionConflicts, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, identicalCopiesSuffix, mapWithLimit, pendingNameError, sortCandidates } from "./setup-display.ts";
+import { candidateHint, candidateLabels, collapseIdenticalCandidates, contentFingerprint, defaultRenameName, displayPath, findSelectionConflicts, formatPiProgress, formatSearchProgress, formatOutsideRootSummary, gatherCandidateStats, identicalCopiesSuffix, mapWithLimit, pendingNameError, sortCandidates } from "./setup-display.ts";
 import { inspectPreparedResource, maskSensitiveText } from "./inspect.ts";
 import { assertNameAvailable, assertNoNameConflicts, findNameConflicts, nameKey } from "./names.ts";
 import type { ApplyDecisions, ApplyFileOption, ApplyPlan } from "./apply.ts";
@@ -526,9 +526,28 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       return;
     }
     if (ask) {
-      const asking = clackSpinner(inheritedSignal());
-      asking.start(`Asking Pi about ${sortedCandidates.length} resource(s)`);
-      const answer = await askPiForSuggestions(sortedCandidates, { command: piCommand, ...inheritedSignal() });
+      // Pi answers a whole chunk at once, so the bar moves per chunk; the elapsed time keeps ticking in between.
+      const total = sortedCandidates.length;
+      const asking = clackProgress({ ...inheritedSignal(), max: total });
+      const startedAt = Date.now();
+      let answered = 0;
+      const label = () => `Asking Pi  ${formatPiProgress(answered, total, Date.now() - startedAt)}`;
+      asking.start(label());
+      const ticker = setInterval(() => asking.message(label()), 1000);
+      let answer: Awaited<ReturnType<typeof askPiForSuggestions>>;
+      try {
+        answer = await askPiForSuggestions(sortedCandidates, {
+          command: piCommand,
+          ...inheritedSignal(),
+          onProgress: (done) => {
+            const step = done - answered;
+            answered = done;
+            asking.advance(step, label());
+          },
+        });
+      } finally {
+        clearInterval(ticker);
+      }
       if (answer.ok) {
         suggestions = answer.suggestions;
         const kept = [...suggestions.values()].filter((suggestion) => suggestion.keep).length;
