@@ -13,22 +13,25 @@ export interface GroupRow {
 }
 
 /** `groupIds` is always the current selection, so an action can return to the list with it intact. */
-export type GroupPickerResult = { kind: "assign" | "new" | "edit"; groupIds: string[]; filter: string };
+export type GroupPickerResult = { kind: "assign" | "new" | "edit" | "skip"; groupIds: string[]; filter: string };
 
 export interface GroupPickerOptions {
   /** Already safe for display. */
   message: string;
   groups: readonly GroupRow[];
   initialValues?: readonly string[];
+  /** Adds a last row that skips this resource (it is not saved). */
+  allowSkip?: boolean;
   signal?: AbortSignal;
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
 }
 
-type Row = { kind: "group"; group: GroupRow } | { kind: "new" } | { kind: "edit" };
+type Row = { kind: "group"; group: GroupRow } | { kind: "new" } | { kind: "edit" } | { kind: "skip" };
 
 export const newGroupLabel = "＋ New group…";
 export const editGroupsLabel = "✎ Rename or delete groups…";
+export const skipLabel = "↷ Skip \u2014 don't save this resource";
 
 /**
  * Multi-select of groups with two action rows at the end. ↑/↓ move, Tab or Space toggles, typing filters groups,
@@ -62,6 +65,7 @@ export class GroupPickerPrompt extends Prompt<GroupPickerResult> {
       ...groups.map((group) => ({ kind: "group" as const, group })),
       { kind: "new" as const },
       ...(this.options.groups.length > 0 ? [{ kind: "edit" as const }] : []),
+      ...(this.options.allowSkip ? [{ kind: "skip" as const }] : []),
     ];
   }
 
@@ -97,7 +101,7 @@ export class GroupPickerPrompt extends Prompt<GroupPickerResult> {
     const title = `${symbol(this.state)}  ${this.options.message}`;
     const chosen = this.options.groups.filter((group) => this.selected.has(group.id)).map((group) => group.label).join(", ");
     if (this.state === "submit") {
-      const summary = this.value?.kind === "assign" ? chosen : this.value?.kind === "new" ? "New group" : "Rename or delete groups";
+      const summary = this.value?.kind === "assign" ? chosen : this.value?.kind === "new" ? "New group" : this.value?.kind === "skip" ? "Skipped" : "Rename or delete groups";
       return `${styleText("gray", S_BAR)}\n${title}\n${styleText("gray", S_BAR)}  ${styleText("dim", clip(summary, width))}`;
     }
     if (this.state === "cancel") return `${styleText("gray", S_BAR)}\n${title}\n${styleText("gray", S_BAR)}  ${styleText(["strikethrough", "dim"], clip(chosen || "Cancelled", width))}`;
@@ -120,7 +124,7 @@ export class GroupPickerPrompt extends Prompt<GroupPickerResult> {
         const room = width - 3 - stringWidth(label) - 1;
         lines.push(`${bar}  ${box} ${focused ? styleText("underline", label) : label}${room >= 4 ? ` ${styleText("dim", clip(hint, room))}` : ""}`);
       } else {
-        const label = row.kind === "new" ? newGroupLabel : editGroupsLabel;
+        const label = row.kind === "new" ? newGroupLabel : row.kind === "edit" ? editGroupsLabel : skipLabel;
         lines.push(`${bar}  ${focused ? styleText(["cyan", "underline"], label) : styleText("dim", label)}`);
       }
     }

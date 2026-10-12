@@ -197,3 +197,40 @@ test("assign list: deleting a group with saved resources asks, lists the change 
   const after = await loadStoredCatalog(box.library);
   assert.deepEqual(after.items.map((item) => item.name).sort(), ["alpha", "older"]);
 });
+
+test("per-resource assign shows n/N and how many are left, and Skip leaves a resource out", async () => {
+  const box = await acceptanceBox();
+  for (const name of ["alpha", "bravo", "charlie"]) await skill(box, name);
+  await seedGroups(box, ["aa"]);
+  const result = await realPty(box, [process.execPath, cli, "setup"], [
+    ...start,
+    { waitFor: "Select resources to review", send: `\t${down}\t${down}\t\r` },
+    { waitFor: "How should these resources be grouped?", send: `${down}\r` },
+    { waitFor: "Assign alpha to one or more groups (1/3 · 2 left)", send: "\t\r" },
+    // Rows: aa, + New group…, ✎ Rename or delete groups…, ↷ Skip
+    { waitFor: "Skip — don't save this resource", send: `${down.repeat(3)}\r` },
+    { waitFor: "Assign charlie to one or more groups (3/3 · 0 left)", send: "\t\r" },
+    { waitFor: "Save 2 copied resource(s)", send: "y" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  const text = flat(result.output);
+  assert.match(text, /Assign bravo to one or more groups \(2\/3 · 1 left\)/);
+  assert.match(text, /Skipped bravo; it will not be saved\./);
+  assert.ok(!/bravo →/.test(text), "a skipped resource is not in the final list");
+  const catalog = await loadStoredCatalog(box.library);
+  assert.deepEqual(catalog.items.map((item) => item.name).sort(), ["alpha", "charlie"]);
+});
+
+test("the bulk list has no Skip row", async () => {
+  const box = await acceptanceBox();
+  await skill(box, "alpha"); await skill(box, "bravo");
+  await seedGroups(box, ["aa"]);
+  const result = await realPty(box, [process.execPath, cli, "setup"], [
+    ...start,
+    { waitFor: "Select resources to review", send: `\t${down}\t\r` },
+    { waitFor: "How should these resources be grouped?", send: "\r" },
+    { waitFor: "Put all 2 resources in these groups", send: "\u0003" },
+  ]);
+  assert.equal(result.code, 0, result.output);
+  assert.ok(!result.output.includes("Skip — don't save"));
+});
