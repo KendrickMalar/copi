@@ -297,14 +297,15 @@ function groupOptions(groups: Group[], pendingCounts?: ReadonlyMap<string, numbe
 /**
  * The setup assignment list: pick groups, or create, rename and delete groups in place and come back with the
  * selection kept. Deleting also drops the group from resources already assigned in this setup.
- * Returns undefined when the person cancels the list itself.
+ * Returns undefined when the person cancels the list itself, "skip" when they skip the resource (allowSkip only).
  */
 async function chooseGroups(
   catalog: Catalog,
   message: string,
   initialValues: string[],
   assigned: ReadonlyArray<{ groupIds: string[] }>,
-): Promise<string[] | undefined> {
+  allowSkip = false,
+): Promise<string[] | "skip" | undefined> {
   let selection = initialValues;
   while (true) {
     const pendingCounts = new Map<string, number>();
@@ -313,10 +314,12 @@ async function chooseGroups(
       message: `${safeDisplay(message)} ${multiselectKeyHint}`,
       groups: groupOptions(catalog.groups, pendingCounts).map((option) => ({ id: option.value, label: safeDisplay(option.label), hint: safeDisplay(option.hint) })),
       initialValues: selection,
+      allowSkip,
       ...inheritedSignal(),
     });
     if (isCancel(result)) return undefined;
     if (result.kind === "assign") return result.groupIds;
+    if (result.kind === "skip") return "skip";
     selection = result.groupIds;
     if (result.kind === "new") {
       // Esc at the name goes back to the list rather than ending setup.
@@ -695,7 +698,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   const count = selectedCandidates.length;
   const onlyGroup = catalog.groups.length === 1 ? catalog.groups[0]! : undefined;
   // Groups can be created, renamed and deleted from the assignment list; nothing reaches disk before the final Yes.
-  const pickGroups = (message: string, initialValues: string[]) => chooseGroups(catalog, message, initialValues, approvedCandidates);
+  const pickGroups = (message: string, initialValues: string[], allowSkip = false) => chooseGroups(catalog, message, initialValues, approvedCandidates, allowSkip);
   let bulk = count === 1;
   if (count >= 2) {
     const mode = await select<"all" | "each">({
@@ -714,7 +717,7 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
   }
   if (bulk) {
     const chosen = await pickGroups(count === 1 ? `Assign ${selectedCandidates[0]!.name} to one or more groups` : `Put all ${count} resources in these groups`, onlyGroup ? [onlyGroup.id] : []);
-    if (chosen === undefined) {
+    if (chosen === undefined || chosen === "skip") {
       cancel("Setup cancelled; no resources were saved.");
       return;
     }
@@ -751,10 +754,15 @@ export async function runSetup(libraryDir: string, roots: SearchRoots): Promise<
       approvedCandidates.push({ review, groupIds: bulkGroupIds, approvedSensitivePaths });
       continue;
     }
-    const groupIds = await pickGroups(`Assign ${review.candidate.name} to one or more groups`, []);
+    const left = count - index - 1;
+    const groupIds = await pickGroups(`Assign ${review.candidate.name} to one or more groups (${index + 1}/${count} \u00b7 ${left} left)`, [], true);
     if (groupIds === undefined) {
       cancel("Setup cancelled; nothing was saved.");
       return;
+    }
+    if (groupIds === "skip") {
+      log.info(safeDisplay(`Skipped ${review.candidate.name}; it will not be saved.`));
+      continue;
     }
     approvedCandidates.push({ review, groupIds, approvedSensitivePaths });
   }
