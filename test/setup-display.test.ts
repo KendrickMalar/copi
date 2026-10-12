@@ -3,7 +3,7 @@ import test from "node:test";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress, collapseIdenticalCandidates, contentFingerprint, identicalCopiesSuffix, mapWithLimit } from "../src/setup-display.ts";
+import { candidateHint, candidateLabel, candidateLabels, defaultRenameName, displayPath, findSelectionConflicts, formatBytes, formatLocalDate, formatOutsideRootSummary, gatherCandidateStats, pendingNameError, sortCandidates, truncateMiddle, formatSearchProgress, formatElapsed, formatPiProgress, collapseIdenticalCandidates, contentFingerprint, identicalCopiesSuffix, mapWithLimit } from "../src/setup-display.ts";
 import { nameKey } from "../src/names.ts";
 import type { ResourceCandidate } from "../src/types.ts";
 
@@ -254,4 +254,10 @@ test("mapWithLimit keeps order and never exceeds the limit", async () => {
   });
   assert.deepEqual(out, [50, 10, 40, 20, 30]);
   assert.ok(peak <= 2);
+});
+
+test("formatPiProgress shows answered count and elapsed time", () => {
+  assert.equal(formatElapsed(42_900), "42s");
+  assert.equal(formatElapsed(65_000), "1m05s");
+  assert.equal(formatPiProgress(40, 77, 65_000), "40/77 resources \u00b7 1m05s");
 });
